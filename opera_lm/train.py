@@ -1,0 +1,657 @@
+"""Training loop, batching, LR schedule, eval and probe utilities."""
+import os
+import json
+import time
+import random
+import math
+import numpy as np
+import torch
+import torch.nn as nn
+
+from .model import OperaSpinorFenwickTree, count_params
+from .losses import lm_loss, train_lm_loss, msup_loss
+from .data import load_data
+
+def get_lr(step, warmup_steps, total_steps, max_lr, min_lr=1e-5):
+    if step < warmup_steps:
+        return max_lr * step / warmup_steps
+    progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+    return min_lr + 0.5 * (max_lr - min_lr) * (1 + math.cos(math.pi * progress))
+
+
+def curriculum_len(step, cur0, every, max_len):
+    """Length curriculum (v9, arm C): train at cur0 tokens, doubling every
+    `every` steps, capped at max_len. Deterministic in `step` only, so
+    --resume lands on the exact stage. Power-of-two stages keep every
+    shape static within a stage (one compile per stage; the Fenwick
+    index cache is keyed by T)."""
+    return min(cur0 << (step // every), max_len)
+
+
+def make_batch_full(sentences, max_len):
+    B = len(sentences)
+    token_ids = np.zeros((B, max_len), dtype=np.int64)
+    lengths = np.zeros(B, dtype=np.int64)
+    for b, s in enumerate(sentences):
+        n = min(len(s), max_len)
+        token_ids[b, :n] = s[:n]
+        lengths[b] = n
+    return torch.tensor(token_ids), torch.tensor(lengths)
+
+
+class GpuBatchSource:
+    """OPT: GPU-resident training set. One padded [N, max_len] tensor +
+    lengths live on-device; a batch is one randint + one gather -- no
+    per-step python sampling or host->device copy. A dedicated
+    torch.Generator drives sampling; its state is checkpointed so
+    --resume continues the EXACT batch stream."""
+
+    def __init__(self, train_data, max_len, device, seed):
+        N = len(train_data)
+        ids = np.zeros((N, max_len), dtype=np.int64)
+        lens = np.zeros(N, dtype=np.int64)
+        for i, s in enumerate(train_data):
+            n = min(len(s), max_len)
+            ids[i, :n] = s[:n]
+            lens[i] = n
+        self.ids = torch.from_numpy(ids).to(device)
+        self.lens = torch.from_numpy(lens).to(device)
+        self.N = N
+        self.gen = torch.Generator(device=device)
+        self.gen.manual_seed(seed)
+
+    def sample(self, batch):
+        idx = torch.randint(self.N, (batch,), generator=self.gen,
+                            device=self.ids.device)
+        return self.ids[idx], self.lens[idx]
+
+    def state_dict(self):
+        return self.gen.get_state().cpu()
+
+    def load_state_dict(self, st):
+        # torch.load(map_location=device) moves EVERY checkpoint tensor to
+        # the GPU -- including this saved RNG state -- but a CUDA
+        # generator's set_state() strictly requires a CPU ByteTensor
+        # (TypeError: RNG state must be a torch.ByteTensor). Coerce back.
+        # (Merna's fix, regressed in opt4b-opt7 during the v8.3 port;
+        # restored in opt7b with a selftest so it cannot regress again.)
+        if isinstance(st, torch.Tensor):
+            st = st.detach().to('cpu', torch.uint8)
+        self.gen.set_state(st)
+
+
+@torch.no_grad()
+def compute_perplexity(model, test_data, max_len, batch_size, device):
+    """Identical to v7.0: final-layer per-token PPL. Comparable across runs."""
+    model.eval()
+    total_loss, total_tokens = 0.0, 0
+    for i in range(0, len(test_data), batch_size):
+        batch = test_data[i:i + batch_size]
+        if not batch:
+            continue
+        # OPT: pad to a FIXED max_len (identical math -- padded positions
+        # never influence valid prefix states and are masked in the loss)
+        # so a compiled model sees ONE input shape for every batch.
+        token_ids, lengths = make_batch_full(batch, max_len)
+        token_ids, lengths = token_ids.to(device), lengths.to(device)
+        all_logits = model(token_ids, lengths, head_last_only=True)
+        _, final_sum, vcount = lm_loss(all_logits, token_ids, lengths)
+        total_loss += final_sum.item()
+        total_tokens += vcount.item()
+    model.train()
+    return math.exp(total_loss / max(total_tokens, 1))
+
+
+@torch.no_grad()
+def extrapolation_eval(model, test_long, train_max_len, eval_max_len, batch_size, device):
+    model.eval()
+    buckets = []
+    lo = train_max_len + 1
+    while lo <= eval_max_len:
+        hi = min(lo + train_max_len - 1, eval_max_len)
+        buckets.append((lo, hi))
+        lo = hi + 1
+    results = {}
+    _oom = (getattr(torch, 'OutOfMemoryError', RuntimeError), RuntimeError)
+    for (lo, hi) in buckets:
+        sents = [s for s in test_long if lo <= len(s) <= hi]
+        if len(sents) < 10:
+            results[f"{lo}-{hi}"] = (None, len(sents))
+            continue
+        # opt7: activation memory per sequence scales ~linearly with T
+        # (the fold's gathered tensor is B x T x S x d), so a batch tuned
+        # at train_max_len OOMs at 4x that length. Scale batch inversely
+        # with the bucket ceiling and halve on OOM as a backstop.
+        eff = max(1, (batch_size * train_max_len) // hi)
+        while True:
+            try:
+                if device == 'cuda':
+                    torch.cuda.empty_cache()
+                ppl = compute_perplexity(model, sents, hi, eff, device)
+                break
+            except _oom as e:
+                if 'out of memory' not in str(e).lower():
+                    raise
+                if device == 'cuda':
+                    torch.cuda.empty_cache()
+                if eff == 1:
+                    raise
+                eff = max(1, eff // 2)
+                print(f"    (OOM in bucket {lo}-{hi}; retrying at "
+                      f"batch {eff})", flush=True)
+        results[f"{lo}-{hi}"] = (ppl, len(sents))
+    model.train()
+    return results
+
+
+# ============================================================================
+# RMT DIAGNOSTIC (fixed: spectrum of prefix-STATE covariance, CPU eig)
+# ============================================================================
+
+@torch.no_grad()
+def rmt_states_diagnostic(model, test_data, batch_size, device, num_sentences=500):
+    """Marchenko-Pastur analysis of final-layer prefix states.
+
+    Collect n token-level prefix states h in R^d, form the covariance of
+    the standardized states, and compare its spectrum to the MP law with
+    gamma = d/n. Eigenvalues above the MP edge indicate learned collective
+    structure (semantic/syntactic directions); a pure-MP spectrum would
+    mean the representation is statistically indistinguishable from noise.
+
+    Fixes vs v7.2: (1) operates on states (full-rank object), not on nb
+    rotation matrices flattened to R^9 whose Gram has rank <= 9;
+    (2) eigendecomposition on CPU (aten::_linalg_eigh has no MPS kernel).
+    """
+    model.eval()
+    print("\n=== RMT Diagnostic (prefix-state spectrum) ===", flush=True)
+
+    feats = []
+    n_collected = 0
+    for i in range(0, min(num_sentences, len(test_data)), batch_size):
+        batch = test_data[i:i + batch_size]
+        if not batch:
+            continue
+        bl = max(len(s) for s in batch)
+        token_ids, lengths = make_batch_full(batch, bl)
+        token_ids, lengths = token_ids.to(device), lengths.to(device)
+        out = model(token_ids, lengths, return_states=True)
+        all_logits, per_layer_prefix = out
+        h = per_layer_prefix[-1]                                  # [B, T, d]
+        for b in range(h.shape[0]):
+            L = int(lengths[b].item())
+            feats.append(h[b, :L, :].cpu())
+            n_collected += L
+    H = torch.cat(feats, dim=0).float()                           # [n, d] on CPU
+    n, d = H.shape
+    print(f"  collected {n} token states, d={d}", flush=True)
+
+    # Standardize per dimension, covariance, spectrum (all on CPU).
+    H = (H - H.mean(0, keepdim=True)) / (H.std(0, keepdim=True) + 1e-8)
+    C = (H.t() @ H) / n                                           # [d, d]
+    ev = torch.linalg.eigvalsh(C)                                 # ascending
+
+    gamma = d / n
+    mp_plus = (1 + math.sqrt(gamma)) ** 2
+    mp_minus = max(0.0, (1 - math.sqrt(gamma)) ** 2)
+    outliers = int((ev > mp_plus * 1.05).sum().item())
+    bulk = ev[(ev >= mp_minus) & (ev <= mp_plus)]
+    # participation ratio of the spectrum: effective number of directions
+    pr = (ev.sum() ** 2 / (ev ** 2).sum()).item()
+
+    print(f"  MP edge [{mp_minus:.3f}, {mp_plus:.3f}] (gamma={gamma:.4f})", flush=True)
+    print(f"  eigenvalues above MP edge (+5%): {outliers} / {d}", flush=True)
+    print(f"  top 5 eigenvalues: {[round(float(x), 2) for x in ev[-5:]]}", flush=True)
+    print(f"  fraction of spectrum inside MP bulk: {bulk.numel() / d:.3f}", flush=True)
+    print(f"  participation ratio (effective dims): {pr:.1f} / {d}", flush=True)
+    model.train()
+    return {
+        'n_states': n, 'd': d, 'gamma': gamma,
+        'mp_plus': mp_plus, 'mp_minus': mp_minus,
+        'outliers': outliers,
+        'top5': [float(x) for x in ev[-5:]],
+        'bulk_fraction': bulk.numel() / d,
+        'participation_ratio': pr,
+    }
+
+
+# ============================================================================
+# TREE INSPECTION (identical to v7.0)
+# ============================================================================
+
+def tree_to_str(levels, locks, words, level_idx, node_idx):
+    span_start = node_idx * (1 << level_idx)
+    if span_start >= len(words):
+        return ""
+    if level_idx == 0:
+        return words[span_start]
+    left = tree_to_str(levels, locks, words, level_idx - 1, 2 * node_idx)
+    right = tree_to_str(levels, locks, words, level_idx - 1, 2 * node_idx + 1)
+    if not right:
+        return left
+    lock_val = locks[level_idx - 1][0, node_idx].item()
+    return f"[{left} {right}](l={lock_val:.2f})"
+
+
+@torch.no_grad()
+def inspect_tree(model, sentences, idx2word, device, n=5):
+    model.eval()
+    if getattr(model, 'fold_mode', None) == 'scan':
+        # Scan mode builds no tree; keep the prediction sample only.
+        print("\n=== Scan mode: no tree to inspect (prediction sample) ===", flush=True)
+        for sent in sentences[:n]:
+            if len(sent) < 3:
+                continue
+            words = [idx2word.get(w, '<unk>') for w in sent]
+            T = len(sent)
+            token_ids, lengths = make_batch_full([sent], T)
+            token_ids, lengths = token_ids.to(device), lengths.to(device)
+            all_logits = model(token_ids, lengths)
+            pred_idx = all_logits[-1][0, T - 2].argmax().item()
+            pred_word = idx2word.get(pred_idx, '<unk>')
+            print(f"  Sentence: {' '.join(words)}", flush=True)
+            print(f"  Predict last word: {pred_word} (actual: {words[-1]})", flush=True)
+            print()
+        return
+    print("\n=== Spinor Tree (sample, layer 0; lock shown is diagnostic) ===", flush=True)
+    for sent in sentences[:n]:
+        if len(sent) < 3:
+            continue
+        words = [idx2word.get(w, '<unk>') for w in sent]
+        T = len(sent)
+        token_ids, lengths = make_batch_full([sent], T)
+        token_ids, lengths = token_ids.to(device), lengths.to(device)
+        all_logits, tree_info = model(token_ids, lengths, return_tree=True)
+        levels, locks = tree_info[0]
+        top = len(levels) - 1
+        tree_str = tree_to_str(levels, locks, words, top, 0)
+        pred_idx = all_logits[-1][0, T - 2].argmax().item()
+        pred_word = idx2word.get(pred_idx, '<unk>')
+        print(f"  Sentence: {' '.join(words)}", flush=True)
+        print(f"  Tree:     {tree_str}", flush=True)
+        print(f"  Predict last word: {pred_word} (actual: {words[-1]})", flush=True)
+        print()
+    model.train()
+
+
+
+# ============================================================================
+# TRAINING
+# ============================================================================
+
+def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
+          device='cpu', lock_mode='none', tie=False, dropout=0.0, msup=False,
+          msup_weight=0.1, pe_mode='sin', fold_mode='left',
+          fold_rotors='shared', fold_scale=False,
+          norm_mode='layer', act_mode='tanh', node_residual=False,
+          tree_drop=0.0, grad_checkpoint='', use_metal=False,
+          use_amp=True, use_foreach=True, rot_mode='so3', seed=42,
+          data_mode='sentences', docs_limit=100000, out_dir='.',
+          save_every=0, resume=False,
+          compile_mode='default', gpu_data=True, aux_frac=0.25,
+          max_lr=1e-3, warmup_steps=500,
+          oam_k=4, oam_charges='auto', oam_phi=0.7853981633974483,
+          oam_shared_gate=False, oam_combine='compose', oam_pair='seq',
+          rack_exitnorm=False, oam_transport='rack', oam_levelgate=False,
+          oam_chan_emb=False, scan_salience=False, scan_decay_bias=-3.0,
+          workspace=False, fold_gate_bias=None, curriculum=None):
+    tag = [f'pe-{pe_mode}']
+    assert not (msup and fold_mode == 'scan'), \
+        "--msup reads tree levels; --fold scan builds no tree"
+    if curriculum is not None:
+        assert 8 <= curriculum[0] <= max_len and curriculum[1] >= 1, \
+            "--curriculum T0:EVERY needs 8 <= T0 <= max_len, EVERY >= 1"
+    if data_mode != 'sentences': tag.append(f'data-{data_mode}')
+    if data_mode == 'docs-en' and docs_limit != 100000:
+        tag.append(f'lim{docs_limit}')
+    if rot_mode != 'so3': tag.append('rotfree')
+    if seed != 42: tag.append(f'seed{seed}')
+    if norm_mode != 'layer': tag.append(norm_mode)
+    if act_mode != 'tanh': tag.append('linact')
+    if node_residual: tag.append('noderes')
+    if tree_drop > 0: tag.append(f'tdrop{tree_drop}')
+    if grad_checkpoint: tag.append(f'ckpt-{grad_checkpoint}')
+    if use_metal: tag.append('metal')
+    if use_amp: tag.append('amp')
+    if use_foreach: tag.append('foreach')
+    if compile_mode != 'off': tag.append(f'cmp-{compile_mode}')
+    if gpu_data: tag.append('gpudata')
+    if aux_frac != 1.0: tag.append(f'aux{aux_frac}')
+    if max_lr != 1e-3: tag.append(f'lr{max_lr}')
+    if warmup_steps != 500: tag.append(f'wu{warmup_steps}')
+    if fold_mode != 'left': tag.append(f'fold-{fold_mode}')
+    if fold_mode == 'oam':
+        tag.append(f'k{oam_k}')
+        if oam_charges != 'auto': tag.append('chgX')
+        if float(oam_phi) == 0.0: tag.append('nocharge')
+        if oam_shared_gate: tag.append('shgate')
+        if oam_combine != 'compose': tag.append(f'comb-{oam_combine}')
+        if oam_levelgate: tag.append('lvgate')
+        if oam_chan_emb: tag.append('chanemb')
+        if oam_pair != 'seq': tag.append(f'pair-{oam_pair}')
+        if oam_transport != 'rack': tag.append(f'tr-{oam_transport}')
+    if fold_mode == 'rack' and rack_exitnorm: tag.append('exitnorm')
+    if fold_mode == 'scan' and scan_salience: tag.append('salience')
+    if fold_mode == 'scan' and workspace: tag.append('ws')
+    if fold_mode == 'scan' and scan_decay_bias != -3.0:
+        tag.append(f'db{scan_decay_bias}')
+    if fold_rotors != 'shared': tag.append('foldrot')
+    if fold_scale: tag.append('foldscale')
+    if fold_gate_bias is not None:
+        tag.append('gb' + ','.join(str(float(x)) for x in fold_gate_bias))
+    if curriculum is not None:
+        tag.append(f'cur{curriculum[0]}x{curriculum[1]}')
+    if tie: tag.append('tie')
+    if dropout > 0: tag.append(f'drop{dropout}')
+    if msup: tag.append('msup')
+    if lock_mode != 'none': tag.append(lock_mode)
+    tag = '+'.join(tag)
+
+    print(f"=== OPERA-LM v9.0 (Spinor Tree, tree-training line) [{tag}] ===", flush=True)
+    print(f"  steps={steps}, batch={batch}, train max_len={max_len}, eval_max_len={eval_max_len}", flush=True)
+    print(f"  d={d}, nb={nb}, num_layers={num_layers}, lock={lock_mode}, device={device}", flush=True)
+    print(f"  pe={pe_mode}, fold={fold_mode}, fold_rotors={fold_rotors}, "
+          f"fold_scale={fold_scale}", flush=True)
+    print(f"  norm={norm_mode}, act={act_mode}, node_residual={node_residual}", flush=True)
+    print(f"  rot={rot_mode}, seed={seed}, data={data_mode}", flush=True)
+    print(f"  out={out_dir}, save_every={save_every}, resume={resume}", flush=True)
+    print(f"  tie={tie}, dropout={dropout}, msup={msup} (weight {msup_weight})", flush=True)
+    print(f"  OPT: compile={compile_mode}, gpu_data={gpu_data}, "
+          f"aux_frac={aux_frac}, amp={use_amp}, foreach={use_foreach}", flush=True)
+    print(f"  References (train<=20, 4L): OPERA pe-none 70.92 / 1.65x / 1.68x;"
+          f" RoPE transformer 70.71 / 1.60x / 1.68x", flush=True)
+    mw, cw, _ = fold_work_counts(max_len)
+    print(f"  Fold work @T={max_len}: {cw} row-composes/layer "
+          f"(v7.7 masked: {mw}; {mw/cw:.2f}x less)", flush=True)
+
+    os.makedirs(out_dir, exist_ok=True)
+    train_data, test_short, test_long, vocab, word2idx, idx2word = load_data(
+        vocab_size, max_len, eval_max_len, data_mode=data_mode,
+        docs_limit=docs_limit)
+    actual_vocab_size = len(vocab)
+
+    # Variation seed (r15): init + batch sampling only. Applied AFTER
+    # load_data so the train/test split (seeded 42 internally) is
+    # identical across seeds -- arms must share the exact same data.
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    model = OperaSpinorFenwickTree(actual_vocab_size, d=d, nb=nb,
+                                   num_layers=num_layers, lock_mode=lock_mode,
+                                   tie=tie, dropout=dropout, pe_mode=pe_mode,
+                                   fold_mode=fold_mode, fold_rotors=fold_rotors,
+                                   fold_scale=fold_scale, norm_mode=norm_mode,
+                                   act_mode=act_mode,
+                                   node_residual=node_residual,
+                                   tree_drop=tree_drop,
+                                   grad_checkpoint=grad_checkpoint,
+                                   use_metal=use_metal,
+                                   rot_mode=rot_mode, oam_k=oam_k,
+                                   oam_charges=oam_charges, oam_phi=oam_phi,
+                                   oam_shared_gate=oam_shared_gate,
+                                   oam_combine=oam_combine, oam_pair=oam_pair,
+                                   rack_exitnorm=rack_exitnorm,
+                                   oam_transport=oam_transport,
+                                   oam_levelgate=oam_levelgate,
+                                   oam_chan_emb=oam_chan_emb,
+                                   scan_salience=scan_salience,
+                                   scan_decay_bias=scan_decay_bias,
+                                   workspace=workspace,
+                                   fold_gate_bias=fold_gate_bias).to(device)
+    npar = count_params(model)
+    print(f"  Model params: {npar:,}", flush=True)
+
+    # OPT: torch.compile. The fold is compile-safe by construction (static
+    # cached Fenwick indices; loop trip counts depend only on T). Eval is
+    # padded to fixed T so one graph serves train and eval. Checkpoints
+    # always save the RAW module (model), never the compiled wrapper.
+    # v8.8: compile is now also enabled on MPS for --fold scan ONLY
+    # (measured 2.12x step-time speedup, fwd err 6e-6; other folds on MPS
+    # stay eager as before -- untested, out of scope).
+    model_c = model
+    _compile_ok = (compile_mode != 'off'
+                   and (device == 'cuda'
+                        or (device == 'mps' and fold_mode == 'scan')))
+    if _compile_ok:
+        # _layer_body specializes per layer_idx (num_layers) x per calling
+        # context (train+autocast+grad vs eval+no_grad, plus kwarg variants),
+        # which exhausts the DEFAULT recompile limit of 8 -- dynamo then
+        # SILENTLY falls back to eager for the rest of the run (observed:
+        # "hit config.recompile_limit (8)" 6 min in, zero speedup). Raise it.
+        import torch._dynamo as _dynamo
+        _dynamo.config.recompile_limit = 64
+        kw = {'dynamic': False}
+        if compile_mode != 'default':
+            kw['mode'] = compile_mode
+        model_c = torch.compile(model, **kw)
+        print(f"  torch.compile enabled (mode={compile_mode}, "
+              f"recompile_limit=64)", flush=True)
+    elif compile_mode != 'off':
+        print(f"  torch.compile skipped on {device}; running eager", flush=True)
+
+    # OPT: GPU-resident training data (exact batch-stream resume via a
+    # dedicated generator whose state rides in the checkpoint).
+    batch_source = None
+    if gpu_data:
+        try:
+            batch_source = GpuBatchSource(train_data, max_len, device, seed)
+            print(f"  GPU batch source: {batch_source.N:,} sequences on "
+                  f"{device} ({batch_source.ids.numel() * 8 / 2**20:.0f} MiB)",
+                  flush=True)
+        except Exception as e:
+            print(f"  WARNING: gpu_data failed ({e}); CPU sampling", flush=True)
+            batch_source = None
+
+    warmup = warmup_steps
+    if use_foreach:
+        # AdamW(foreach=True): fused multi-tensor step. weight_decay=0.0
+        # keeps the math equal to Adam so the recipe is unchanged.
+        opt = torch.optim.AdamW(model.parameters(), lr=max_lr,
+                                weight_decay=0.0, foreach=True)
+    else:
+        opt = torch.optim.Adam(model.parameters(), lr=max_lr)
+    # OPT: half dtype must be NATIVE to the GPU. bf16 is only fast on
+    # Ampere+ (A100/RTX30xx); Turing (T4) and older emulate it. Fall back
+    # to fp16 (+GradScaler, below) where bf16 is unsupported.
+    # MPS (v8.8, measured 2026-07-21, scan arm d=640 nb=160 L=4 vocab 10k):
+    # autocast buys NO speed on MPS (fp32 1009 / fp16 1006 / bf16 1023
+    # ms/step -- the model is kernel-launch-bound), but fp16 badly breaks
+    # loss-trajectory parity with fp32 (max dev 0.57 over 50 seeded steps
+    # vs bf16's 0.05; loss@20 6.32 vs 4.65 fp32). bf16: same speed as
+    # fp32, near-fp32 numerics (fp32 exponent range), no GradScaler.
+    if device == 'mps':
+        amp_dtype = torch.bfloat16
+    elif device == 'cuda':
+        # NOTE: torch.cuda.is_bf16_supported() returns True on some torch
+        # versions even when bf16 is only EMULATED (T4/Turing) -- and
+        # emulated bf16 breaks inductor graphs ("does not support bfloat16
+        # compilation natively, skipping") and runs slow. Gate on compute
+        # capability instead: bf16 is native on Ampere+ (sm_80) only.
+        cap = torch.cuda.get_device_capability()
+        amp_dtype = torch.bfloat16 if cap[0] >= 8 else torch.float16
+    else:
+        amp_dtype = torch.bfloat16
+    if use_amp:
+        print(f"  AMP dtype: {amp_dtype}", flush=True)
+    scaler = None
+    if use_amp and amp_dtype == torch.float16:
+        try:
+            scaler = torch.amp.GradScaler(device)
+        except Exception:
+            scaler = None
+            print("  (no GradScaler on this backend; fp16 without scaling)", flush=True)
+    import contextlib
+    def amp_ctx():
+        if use_amp:
+            return torch.autocast(device_type=device, dtype=amp_dtype)
+        return contextlib.nullcontext()
+
+    # Colab checkpointing (v8.0): resume from a mid-training checkpoint.
+    # RNG states are saved/restored so the batch stream continues exactly.
+    train_ckpt = os.path.join(out_dir, f'opera_v8_0_{tag.replace("+","_")}_train_ckpt.pt')
+    start_step = 0
+    if resume and os.path.exists(train_ckpt):
+        # weights_only=False: the checkpoint stores RNG states (numpy
+        # objects) and is self-produced/trusted. Required on torch >= 2.6
+        # where weights_only defaults to True.
+        st = torch.load(train_ckpt, map_location=device, weights_only=False)
+        model.load_state_dict(st['model'])
+        opt.load_state_dict(st['opt'])
+        start_step = st['step'] + 1
+        random.setstate(st['py_rng'])
+        np.random.set_state(st['np_rng'])
+        torch.set_rng_state(st['torch_rng'].cpu())
+        if device == 'cuda' and st.get('cuda_rng') is not None:
+            torch.cuda.set_rng_state(st['cuda_rng'].cpu())
+        if batch_source is not None and st.get('gpu_rng') is not None:
+            batch_source.load_state_dict(st['gpu_rng'])
+        print(f"  RESUMED from {train_ckpt} at step {start_step}", flush=True)
+
+    init_ppl = compute_perplexity(model_c, test_short[:200], max_len, 32, device)
+    print(f"  Initial per-token perplexity: {init_ppl:.2f} (chance ~ {actual_vocab_size}; "
+          f"if this is >> chance, STOP - init is broken)", flush=True)
+
+    t0 = time.time()
+    for step in range(start_step, steps):
+        lr = get_lr(step, warmup, steps, max_lr)
+        for g in opt.param_groups:
+            g['lr'] = lr
+
+        if batch_source is not None:
+            token_ids, lengths = batch_source.sample(batch)
+        else:
+            batch_sents = random.sample(train_data, min(batch, len(train_data)))
+            token_ids, lengths = make_batch_full(batch_sents, max_len)
+            token_ids, lengths = token_ids.to(device), lengths.to(device)
+
+        # v9 arm C: LENGTH CURRICULUM. Slice the sampled batch to the
+        # current stage length. Exact for stream data (a truncated doc
+        # chunk is a valid sequence) and causal-exact: supervised
+        # positions (< t_cur) see only tokens <= their position, so the
+        # loss is bitwise the loss of a natively short batch (selftested).
+        t_cur = None
+        if curriculum is not None:
+            t_cur = curriculum_len(step, curriculum[0], curriculum[1],
+                                   max_len)
+            if t_cur < token_ids.shape[1]:
+                token_ids = token_ids[:, :t_cur]
+                lengths = lengths.clamp(max=t_cur)
+
+        with amp_ctx():
+            if msup:
+                all_logits, levels = model_c(token_ids, lengths, return_levels=True)
+                loss, _, _ = lm_loss(all_logits, token_ids, lengths)
+                loss = loss + msup_weight * msup_loss(model, levels, token_ids, lengths)
+            else:
+                # OPT: final-layer head inside the compiled graph; aux
+                # layers' head computed on aux_frac of positions only.
+                all_logits, states = model_c(
+                    token_ids, lengths, return_states=True, head_last_only=True)
+                loss, _, _ = train_lm_loss(
+                    model_c, states, token_ids, lengths,
+                    aux_frac=aux_frac, final_logits=all_logits[0])
+
+        opt.zero_grad()
+        if scaler is not None:
+            scaler.scale(loss).backward()
+            scaler.unscale_(opt)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(opt)
+            scaler.update()
+        else:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+
+        if step % 200 == 0 or step == steps - 1:
+            elapsed = time.time() - t0
+            done = step - start_step + 1
+            cur_txt = f"  T_cur {t_cur}" if t_cur is not None else ""
+            print(f"  step {step:5d}  loss {loss.item():.4f}  lr {lr:.5f}  "
+                  f"({elapsed:.1f}s, {elapsed/done:.2f}s/step){cur_txt}", flush=True)
+
+        if save_every and step > 0 and step % save_every == 0:
+            torch.save({
+                'model': model.state_dict(), 'opt': opt.state_dict(),
+                'step': step, 'tag': tag,
+                'py_rng': random.getstate(), 'np_rng': np.random.get_state(),
+                'torch_rng': torch.get_rng_state(),
+                'cuda_rng': (torch.cuda.get_rng_state()
+                             if device == 'cuda' else None),
+                'gpu_rng': (batch_source.state_dict()
+                            if batch_source is not None else None),
+            }, train_ckpt)
+            print(f"    checkpoint -> {train_ckpt}", flush=True)
+
+        if step % 1000 == 0 and step > 0:
+            ppl = compute_perplexity(model_c, test_short[:200], max_len, 32, device)
+            print(f"    per-token perplexity: {ppl:.2f}", flush=True)
+
+    print(f"\n=== Final Evaluation ===", flush=True)
+    ppl_1k = compute_perplexity(model_c, test_short[:1000], max_len, 32, device)
+    ppl = compute_perplexity(model_c, test_short[:5000], max_len, 32, device)
+    print(f"  In-length per-token PPL (<= {max_len}): {ppl:.2f} on 5k test sentences", flush=True)
+    print(f"  (legacy 1k-sentence eval for comparison with older runs: {ppl_1k:.2f})", flush=True)
+    print(f"  NOTE: single-run differences under ~1.5 PPL are within seed+eval noise.", flush=True)
+
+    print(f"\n=== Length Extrapolation (train <= {max_len}) ===", flush=True)
+    extrap = extrapolation_eval(model, test_long, max_len, eval_max_len, 16, device)  # eager: one-off shapes
+    for bucket, (bppl, n) in extrap.items():
+        if bppl is None:
+            print(f"  len {bucket}: insufficient data (n={n})", flush=True)
+        else:
+            ratio = bppl / ppl
+            print(f"  len {bucket}: PPL {bppl:.2f}  (n={n}, {ratio:.2f}x in-length)", flush=True)
+
+    inspect_tree(model, test_short[:10], idx2word, device, n=5)
+
+    rmt = rmt_states_diagnostic(model, test_short, 32, device, num_sentences=500)
+
+    ckpt_path = os.path.join(out_dir, f'opera_v8_0_{tag.replace("+", "_")}.pt')
+    torch.save(model.state_dict(), ckpt_path)
+    print(f"\nCheckpoint saved to {ckpt_path}", flush=True)
+
+    results = {
+        'model': 'opera_v9_tree', 'config': tag, 'pe': pe_mode,
+        'rot': rot_mode, 'seed': seed, 'data': data_mode,
+        'docs_limit': (docs_limit if data_mode == 'docs-en' else None),
+        'fold': fold_mode, 'fold_rotors': fold_rotors, 'fold_scale': fold_scale,
+        'norm': norm_mode, 'act': act_mode, 'node_residual': node_residual,
+        'tree_drop': tree_drop,
+        'lock_mode': lock_mode, 'tie': tie, 'dropout': dropout, 'msup': msup,
+        'params': npar, 'd': d, 'nb': nb, 'num_layers': num_layers,
+        'vocab_size': actual_vocab_size, 'max_len': max_len,
+        'eval_max_len': eval_max_len, 'steps': steps,
+        'final_loss': loss.item(),
+        'test_perplexity_in_length': ppl, 'test_perplexity_1k_legacy': ppl_1k,
+        'extrapolation': {k: v[0] for k, v in extrap.items()},
+        'init_perplexity': init_ppl,
+        'rmt': rmt,
+        'opt': {'compile': compile_mode, 'gpu_data': gpu_data,
+                'aux_frac': aux_frac, 'amp': use_amp,
+                'lr': max_lr, 'warmup': warmup_steps,
+                'foreach': use_foreach,
+                'oam': {'k': oam_k, 'charges': str(oam_charges),
+                        'phi': oam_phi, 'shared_gate': oam_shared_gate,
+                        'combine': oam_combine,
+                        'pair': oam_pair,
+                        'transport': oam_transport,
+                        'levelgate': oam_levelgate,
+                        'chan_emb': oam_chan_emb} if fold_mode == 'oam' else None,
+                'rack_exitnorm': (rack_exitnorm
+                                  if fold_mode == 'rack' else None),
+                'salience': (scan_salience
+                             if fold_mode == 'scan' else None),
+                'workspace': (workspace
+                              if fold_mode == 'scan' else None),
+                'gate_bias': (list(fold_gate_bias)
+                              if fold_gate_bias is not None else None),
+                'curriculum': (list(curriculum)
+                               if curriculum is not None else None)},
+    }
+    results_path = os.path.join(out_dir, 'opera_v8_0_results.jsonl')
+    with open(results_path, 'a') as f:
+        f.write(json.dumps(results) + '\n')
+    print(f"Saved to {results_path}", flush=True)
+    return results
+

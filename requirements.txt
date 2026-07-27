@@ -1,0 +1,5 @@
+# Core dependencies (same as pyproject.toml [project.dependencies]).
+# For the full training pipeline (opera_lm.train, load_data) also install
+# the optional extra: pip install -e ".[data]"  (or requirements-dev.txt)
+torch>=2.0
+numpy

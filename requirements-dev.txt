@@ -1,0 +1,4 @@
+# Development / full-pipeline dependencies on top of requirements.txt
+-r requirements.txt
+datasets        # HuggingFace data loading (opera_lm.data, opera_lm.train)
+pytest          # test suite (tests/, python -m opera_lm.selftest needs only torch)

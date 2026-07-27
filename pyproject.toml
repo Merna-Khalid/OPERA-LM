@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "opera-lm"
+version = "0.9.0"
+description = "OPERA: spinor (Cl(3)) Fenwick-tree language model with no positional encodings"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Merna Hafez" }]
+dependencies = [
+    "torch>=2.0",
+    "numpy",
+]
+
+[project.optional-dependencies]
+data = ["datasets"]
+
+[project.urls]
+Homepage = "https://github.com/MernaKhaled-safa/opera-lm"
+Repository = "https://github.com/MernaKhaled-safa/opera-lm"
+
+[tool.setuptools.packages.find]
+include = ["opera_lm*"]
