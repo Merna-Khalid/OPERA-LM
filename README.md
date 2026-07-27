@@ -243,7 +243,7 @@ writing (`docs/` contains the pre-registrations):
   title = {OPERA-LM: Spinor Fenwick-Tree Language Modeling with No
            Positional Encodings},
   year = {2026},
-  url = {https://github.com/MernaKhaled-safa/opera-lm}
+  url = {https://github.com/Merna-Khalid/OPERA-LM}
 }
 ```
 
