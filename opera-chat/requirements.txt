@@ -1,0 +1,5 @@
+torch
+tokenizers
+gradio>=6
+huggingface_hub
+numpy

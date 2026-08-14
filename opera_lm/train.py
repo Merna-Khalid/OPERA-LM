@@ -21,6 +21,32 @@ def _eval_batch(base, max_len, ref=256):
     return max(1, base * ref // max_len)
 
 
+def _oom_backstop(fn, batch_size, device):
+    """Call fn(batch_size), halving batch_size and retrying on GPU OOM.
+    _eval_batch above only scales for max_len; it has no way to know the
+    model's own size (d, num_layers), so a batch tuned for one config
+    (e.g. the README's 20M-param reference) can still OOM on a much
+    larger one. This is the same halving backstop extrapolation_eval
+    already uses per-bucket, generalized to every other eval/diagnostic
+    call site."""
+    oom_types = (getattr(torch, 'OutOfMemoryError', RuntimeError), RuntimeError)
+    eff = max(1, batch_size)
+    while True:
+        try:
+            if device == 'cuda':
+                torch.cuda.empty_cache()
+            return fn(eff)
+        except oom_types as e:
+            if 'out of memory' not in str(e).lower():
+                raise
+            if device == 'cuda':
+                torch.cuda.empty_cache()
+            if eff == 1:
+                raise
+            eff = max(1, eff // 2)
+            print(f"    (OOM; retrying at batch {eff})", flush=True)
+
+
 def get_lr(step, warmup_steps, total_steps, max_lr, min_lr=1e-5):
     if step < warmup_steps:
         return max_lr * step / warmup_steps
@@ -569,7 +595,9 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
             batch_source.load_state_dict(st['gpu_rng'])
         print(f"  RESUMED from {train_ckpt} at step {start_step}", flush=True)
 
-    init_ppl = compute_perplexity(model_c, test_short[:200], max_len, 32, device)
+    init_ppl = _oom_backstop(
+        lambda b: compute_perplexity(model_c, test_short[:200], max_len, b, device),
+        32, device)
     print(f"  Initial per-token perplexity: {init_ppl:.2f} (chance ~ {actual_vocab_size}; "
           f"if this is >> chance, STOP - init is broken)", flush=True)
 
@@ -651,15 +679,18 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
             print(f"    checkpoint -> {train_ckpt}", flush=True)
 
         if step % 1000 == 0 and step > 0:
-            ppl = compute_perplexity(model_c, test_short[:200], max_len,
-                                     _eval_batch(32, max_len), device)
+            ppl = _oom_backstop(
+                lambda b: compute_perplexity(model_c, test_short[:200], max_len, b, device),
+                _eval_batch(32, max_len), device)
             print(f"    per-token perplexity: {ppl:.2f}", flush=True)
 
     print(f"\n=== Final Evaluation ===", flush=True)
-    ppl_1k = compute_perplexity(model_c, test_short[:1000], max_len,
-                                _eval_batch(32, max_len), device)
-    ppl = compute_perplexity(model_c, test_short[:5000], max_len,
-                             _eval_batch(32, max_len), device)
+    ppl_1k = _oom_backstop(
+        lambda b: compute_perplexity(model_c, test_short[:1000], max_len, b, device),
+        _eval_batch(32, max_len), device)
+    ppl = _oom_backstop(
+        lambda b: compute_perplexity(model_c, test_short[:5000], max_len, b, device),
+        _eval_batch(32, max_len), device)
     print(f"  In-length per-token PPL (<= {max_len}): {ppl:.2f} on 5k test sentences", flush=True)
     print(f"  (legacy 1k-sentence eval for comparison with older runs: {ppl_1k:.2f})", flush=True)
     print(f"  NOTE: single-run differences under ~1.5 PPL are within seed+eval noise.", flush=True)
@@ -676,7 +707,9 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
     if idx2word is not None:
         inspect_tree(model, test_short[:10], idx2word, device, n=5)
 
-    rmt = rmt_states_diagnostic(model, test_short, 32, device, num_sentences=500)
+    rmt = _oom_backstop(
+        lambda b: rmt_states_diagnostic(model, test_short, b, device, num_sentences=500),
+        32, device)
 
     ckpt_path = os.path.join(out_dir, f'opera_v8_0_{tag.replace("+", "_")}.pt')
     torch.save(model.state_dict(), ckpt_path)
