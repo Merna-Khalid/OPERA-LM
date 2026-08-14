@@ -325,8 +325,9 @@ kernel void NAME(                                                          \
     device FTYPE*       dg   [[buffer(9)]],                                \
     device float*       dv0o [[buffer(10)]],                               \
     device float*       dv1o [[buffer(11)]],                               \
-    constant uint&      total [[buffer(12)]],                              \
-    constant uint&      nb   [[buffer(13)]],                               \
+    device float*       fvo  [[buffer(12)]],                               \
+    constant uint&      total [[buffer(13)]],                              \
+    constant uint&      nb   [[buffer(14)]],                               \
     uint tid [[thread_position_in_grid]],                                  \
     uint gsz [[threads_per_grid]])                                         \
 {                                                                          \
@@ -350,6 +351,7 @@ kernel void NAME(                                                          \
     float g0 = float(g[(n*3 + 0)*nb + b]);                                 \
     float g1 = float(g[(n*3 + 1)*nb + b]);                                 \
     float g2 = float(g[(n*3 + 2)*nb + b]);                                 \
+    float3 fv = g0*v0 + g1*v1 + g2*gv;                                     \
     float ds_out = float(gout[base+0]);                                    \
     float3 dov = float3(gout[base+1], gout[base+2], gout[base+3]);         \
     float3 dfv = float3(R_O[rb+0]*dov.x + R_O[rb+3]*dov.y + R_O[rb+6]*dov.z,\
@@ -380,6 +382,7 @@ kernel void NAME(                                                          \
     uint b3 = t * 3;                                                       \
     dv0o[b3+0] = dv0.x; dv0o[b3+1] = dv0.y; dv0o[b3+2] = dv0.z;            \
     dv1o[b3+0] = dv1.x; dv1o[b3+1] = dv1.y; dv1o[b3+2] = dv1.z;            \
+    fvo[b3+0] = fv.x; fvo[b3+1] = fv.y; fvo[b3+2] = fv.z;                  \
   }                                                                        \
 }
 
@@ -509,14 +512,17 @@ class FusedNode(torch.autograd.Function):
                 threads=min(N * nb, GRID_CAP))
         else:
             out = _node_fwd_reference(h_l, h_r, R_L, R_R, R_O, g)
-        # save output too: fv is recovered as R_O^T @ out.v in backward
-        # (rotations are orthogonal), dropping the fv/dv0/dv1 aux buffers.
-        ctx.save_for_backward(h_l, h_r, R_L, R_R, R_O, g, out)
+        # dv0/dv1 (needed for dR_L/dR_R) come free from the backward
+        # kernel's in-register recompute; fv (needed for dR_O) is NOT
+        # saved by the kernel, so it must be reconstructed on the Python
+        # side in backward() -- see the note there on why it's
+        # recomputed from inputs rather than recovered via R_O^{-1}.
+        ctx.save_for_backward(h_l, h_r, R_L, R_R, R_O, g)
         return out
 
     @staticmethod
     def backward(ctx, gout):
-        h_l, h_r, R_L, R_R, R_O, g, out = ctx.saved_tensors
+        h_l, h_r, R_L, R_R, R_O, g = ctx.saved_tensors
         if metal_available() and h_l.device.type == 'mps':
             N, nb, _ = h_l.shape
             lib = _get_lib_v2()
@@ -528,17 +534,23 @@ class FusedNode(torch.autograd.Function):
                 gout = gout.to(h_l.dtype)
             dv0 = torch.empty(N, nb, 3, device=h_l.device, dtype=torch.float32)
             dv1 = torch.empty(N, nb, 3, device=h_l.device, dtype=torch.float32)
+            fv = torch.empty(N, nb, 3, device=h_l.device, dtype=torch.float32)
             bwd(h_l.contiguous(), h_r.contiguous(),
                 R_L.reshape(nb, 9).float().contiguous(),
                 R_R.reshape(nb, 9).float().contiguous(),
                 R_O.reshape(nb, 9).float().contiguous(),
                 g.contiguous(), gout.contiguous(),
-                dh_l, dh_r, dg, dv0, dv1, N * nb, nb,
+                dh_l, dh_r, dg, dv0, dv1, fv, N * nb, nb,
                 threads=min(N * nb, GRID_CAP))
-            # dv0/dv1 written from registers in-kernel (free); only fv is
-            # recovered eagerly, from the SAVED FORWARD OUTPUT (retained
-            # by the norm's autograd anyway): fv = R_O^T @ out.v
-            fv = torch.einsum('kji,nkj->nki', R_O, out[..., 1:].float())
+            # dv0/dv1/fv all written from registers in-kernel (free) --
+            # NOT recovered via R_O^{-1} @ out.v (that trick needed
+            # R_O^{-1} == R_O^T, true only for orthogonal R_O). The
+            # kernel already has v0/v1/gv in registers while computing
+            # dv0/dv1, so emitting fv = g0*v0+g1*v1+g2*gv cost 3 extra
+            # FMAs there; doing the equivalent in eager PyTorch (as a
+            # prior version of this fix did) cost 2 full [nb,3,3]
+            # einsums and profiled at ~35% of backward's wall time.
+            # No inversion, so this is correct for ANY R_O, not just so3.
             dR_L = torch.einsum('nki,nkj->kij', dv0, h_l[..., 1:].float())
             dR_R = torch.einsum('nki,nkj->kij', dv1, h_r[..., 1:].float())
             dR_O = torch.einsum('nki,nkj->kij', gout[..., 1:].float(), fv)
@@ -711,6 +723,39 @@ def _test():
         assert e7 < 1e-4 and e8 < 1e-3
     else:
         print("  (6) SKIPPED: V2 Metal check runs on your Mac")
+
+    # (6b) V2 Metal vs fallback with a NON-ORTHOGONAL R_O (rot_mode
+    # 'free'): the case the old fv-recovery trick (R_O^{-1} == R_O^T)
+    # got wrong. R_O here is an arbitrary 3x3, deliberately far from
+    # orthogonal (R_O^T @ R_O has off-diagonal entries ~O(1), not ~0).
+    if metal_available():
+        R_O_free = (R_L + 0.7 * torch.randn(2, nb, 3, 3, dtype=torch.float64)[0]).float().to('mps')
+        ortho_err = (R_O_free.cpu().double().mT @ R_O_free.cpu().double()
+                     - torch.eye(3, dtype=torch.float64)).abs().max().item()
+        assert ortho_err > 0.1, "R_O_free accidentally close to orthogonal"
+        h32l = torch.randn(N, nb, 4, device='mps', requires_grad=True)
+        h32r = torch.randn(N, nb, 4, device='mps', requires_grad=True)
+        g32 = torch.rand(N, 3, nb, device='mps', requires_grad=True)
+        R_O_g = R_O_free.clone().requires_grad_(True)
+        RL32 = R_L.float().to('mps'); RR32 = R_R.float().to('mps')
+        out_m = fused_node(h32l, h32r, RL32, RR32, R_O_g, g32)
+        (out_m * 1.3).sum().backward()
+        gm = (h32l.grad.cpu().clone(), h32r.grad.cpu().clone(),
+              g32.grad.cpu().clone(), R_O_g.grad.cpu().clone())
+        hl_c = h32l.detach().cpu().requires_grad_(True)
+        hr_c = h32r.detach().cpu().requires_grad_(True)
+        g_c = g32.detach().cpu().requires_grad_(True)
+        R_O_c = R_O_free.detach().cpu().requires_grad_(True)
+        out_f = _node_fwd_reference(hl_c, hr_c, RL32.cpu(), RR32.cpu(), R_O_c, g_c)
+        (out_f * 1.3).sum().backward()
+        e6b_fwd = (out_m.detach().cpu() - out_f.detach()).abs().max().item()
+        e6b_bwd = max((a - b.grad).abs().max().item()
+                      for a, b in zip(gm, (hl_c, hr_c, g_c, R_O_c)))
+        print(f"  (6b) V2 Metal fwd vs fallback, NON-ORTHOGONAL R_O: "
+              f"fwd err {e6b_fwd:.2e}; bwd err {e6b_bwd:.2e} (incl. dR_O)")
+        assert e6b_fwd < 1e-4 and e6b_bwd < 1e-3
+    else:
+        print("  (6b) SKIPPED: non-orthogonal R_O check runs on your Mac")
 
     # (7) V3: fused act fwd/bwd vs eager
     x = torch.randn(500, dtype=torch.float64, requires_grad=True)

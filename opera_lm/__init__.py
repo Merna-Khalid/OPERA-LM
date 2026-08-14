@@ -4,6 +4,8 @@ Spinor states in Cl(3), balanced binary tree composition, Fenwick prefix
 readout. No positional encodings -- position is structure.
 """
 from .model import OperaSpinorFenwickTree, count_params, fenwick_blocks
+from .incremental import OperaDecoder, fenwick_blocks_of
+from .muon import Muon, split_muon_params, zeropower_via_newtonschulz5
 from .losses import lm_loss, train_lm_loss, msup_loss
 from .train import (curriculum_len, get_lr, make_batch_full, GpuBatchSource,
                     train, compute_perplexity, extrapolation_eval)
@@ -13,6 +15,11 @@ __version__ = "0.9.0"
 
 __all__ = [
     "OperaSpinorFenwickTree",
+    "OperaDecoder",
+    "fenwick_blocks_of",
+    "Muon",
+    "split_muon_params",
+    "zeropower_via_newtonschulz5",
     "count_params",
     "fenwick_blocks",
     "lm_loss",

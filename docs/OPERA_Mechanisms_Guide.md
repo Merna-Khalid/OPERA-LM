@@ -215,7 +215,31 @@ like a tree. Four consecutive readout-side nulls plus the probe verdict
   on a random fraction of positions, rescaled to stay unbiased; the
   final-layer term (reported PPL) is never subsampled.
 
-## 6. Standing advice for new arms
+## 6. Inference and optimizer arms (post-v9)
+
+- **`OperaDecoder` (opera_lm.incremental) — Fenwick-incremental
+  decoding.** The naive sampler re-runs the full forward per token
+  (O(L·T log T) compose nodes). The decoder caches per-layer trees and
+  pays O(L log T) per token: tree nodes cover fixed spans and are
+  append-only (appending a token ADDS ≤ log T ancestors, never mutates),
+  prefix states are causal, cross-layer mixing is position-wise — so the
+  incremental path is *exact* (selftest: per-position logits match the
+  full forward to 2e-6 over T=33, both the incumbent and so3+sin+
+  fold-scale stacks). Measured on CPU (M4, d=640/L=4, ~20M tied):
+  ~315 tok/s at ctx 256–512, flat in context length, vs ~26 tok/s
+  naive. Scope: `fold_mode='left'`, shared fold rotors, eager. This is
+  the serving path of the opera-chat demo.
+- **`optimizer='muon'` (opera_lm.muon) — the T0.1 recipe arm.** Muon
+  (Newton-Schulz-5 orthogonalized momentum) on matrix-shaped parameters,
+  AdamW on embeddings/gates/gains/scalars (`split_muon_params`; one
+  optimizer object, resume untouched). Newton-Schulz runs batched over
+  leading dims, so each of `rot_free`'s per-block 3×3 maps is
+  orthogonalized individually. Status: **validated at the toy rung**
+  (pre-registered gate: 2000 steps, seed 1, docs) — Muon lr 0.02:
+  186.45 PPL vs AdamW 224.88 (**+38.4**); lr 0.05: 221.99; lr 0.10:
+  diverges. Single seed; adopted at lr 0.02 for the opera-chat run.
+
+## 7. Standing advice for new arms
 
 1. One variable per run. 2. Same-session incumbent. 3. Pre-register the
 gate before the run. 4. Zero-init or deterministic-init new parameters so

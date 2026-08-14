@@ -241,7 +241,9 @@ class OperaSpinorFenwickTree(nn.Module):
                  oam_combine='compose', oam_pair='seq', rack_exitnorm=False,
                  oam_transport='rack', oam_levelgate=False,
                  oam_chan_emb=False, scan_salience=False, scan_decay_bias=-3.0,
-                 workspace=False, fold_gate_bias=None):
+                 workspace=False, fold_gate_bias=None,
+                 readout_mode='none', readout_max_slots=16,
+                 mem_mode='none', mem_dim=128):
         super().__init__()
         assert d == 4 * nb, f"d must equal 4*nb (got d={d}, nb={nb})"
         assert lock_mode in ('none', 'interference')
@@ -288,11 +290,10 @@ class OperaSpinorFenwickTree(nn.Module):
         self.grad_checkpoint = grad_checkpoint
         self.use_metal = use_metal
         if use_metal:
-            # FusedNode.backward recovers fv = R_O^T @ out.v, which is only
-            # valid for ORTHOGONAL R_O. Under --rot free the rotations are
-            # unconstrained 3x3, so dR_O would be silently wrong.
-            assert rot_mode == 'so3', \
-                "--metal requires --rot so3 (fused-node backward assumes orthogonal R_O)"
+            # FusedNode.backward recomputes fv from the saved inputs
+            # (metal_kernel.py) rather than recovering it via R_O^{-1},
+            # so it no longer requires R_O to be orthogonal -- both
+            # 'so3' and 'free' rotations are supported.
             from .metal_kernel import metal_available
             if not metal_available():
                 print("WARNING: --metal requested but torch.mps.compile_shader"
@@ -763,6 +764,65 @@ class OperaSpinorFenwickTree(nn.Module):
             self.fold_gate_bias = nn.Parameter(gb_init)
         else:
             self.fold_gate_bias = None
+
+        # T0.4 (roadmap): MULTI-STATE GEOMETRIC READOUT. The head reads
+        # the prefix's raw Fenwick block states (plus the attend fold's
+        # deterministic level encoding) through a FIXED learned reduction
+        # (per-slot gates + zero-init output projection, added residually
+        # to the fold state). No routing, no softmax, no pairwise
+        # interaction. Zero-init output => flags-on is the incumbent at
+        # init (standing rule). Slot gates use small random init: zero
+        # would dead-lock against the zero-init projection (no gradient
+        # to either). Created after every other parameter (RNG-stream
+        # rule), so shared params are bitwise the incumbent's.
+        self.readout_mode = readout_mode
+        if readout_mode == 'multistate':
+            assert fold_mode == 'left', \
+                "readout_mode='multistate' is implemented for the left fold"
+            self.readout_max_slots = readout_max_slots
+            self.readout_gate = nn.Parameter(
+                0.02 * torch.randn(num_layers, readout_max_slots, d))
+            self.readout_out = nn.ModuleList(
+                [nn.Linear(d, d, bias=False) for _ in range(num_layers)])
+            for ro in self.readout_out:
+                nn.init.zeros_(ro.weight)
+        else:
+            assert readout_mode == 'none', readout_mode
+            self.readout_gate = None
+            self.readout_out = None
+
+        # T1.4 (roadmap): DELTA-RULE MEMORY CHANNEL. A parallel matrix
+        # memory alongside the fold, written recurrently with the
+        # error-correcting delta rule and read by content query from the
+        # fold state -- content-addressable retrieval with no token-token
+        # score matrix and no softmax. mem_out is zero-init => flags-on
+        # is the incumbent at init. Created last (RNG-stream rule).
+        self.mem_mode = mem_mode
+        if mem_mode == 'delta':
+            assert fold_mode != 'scan', \
+                "mem_mode='delta' reads tree/fold states; scan builds none"
+            self.mem_dim = mem_dim
+            self.mem_k = nn.ModuleList(
+                [nn.Linear(d, mem_dim, bias=False)
+                 for _ in range(num_layers)])
+            self.mem_v = nn.ModuleList(
+                [nn.Linear(d, mem_dim, bias=False)
+                 for _ in range(num_layers)])
+            self.mem_q = nn.ModuleList(
+                [nn.Linear(d, mem_dim, bias=False)
+                 for _ in range(num_layers)])
+            self.mem_beta = nn.ModuleList(
+                [nn.Linear(d, 1) for _ in range(num_layers)])
+            self.mem_gate = nn.ModuleList(
+                [nn.Linear(d + mem_dim, d) for _ in range(num_layers)])
+            self.mem_out = nn.ModuleList(
+                [nn.Linear(mem_dim, d, bias=False)
+                 for _ in range(num_layers)])
+            for mo in self.mem_out:
+                nn.init.zeros_(mo.weight)
+        else:
+            assert mem_mode == 'none', mem_mode
+            self.mem_dim = 0
 
     def apply_head(self, h):
         logits = self.head(h)
@@ -1414,6 +1474,9 @@ class OperaSpinorFenwickTree(nn.Module):
                     a.reshape(B * m, d), nxt.reshape(B * m, d),
                     layer_idx, R_L, R_R, R_O, gate_bias=fgb)
                 acc = acc.index_copy(1, act, composed.reshape(B, m, d))
+            if self.readout_mode == 'multistate':
+                acc = acc + self._multistate_readout(gathered, lvl, count,
+                                                     layer_idx)
             return acc
 
         if self.fold_mode == 'left-masked':
@@ -1466,6 +1529,107 @@ class OperaSpinorFenwickTree(nn.Module):
             slots, valid = merged, new_valid
             S = slots.shape[2]
         return slots[:, :, 0, :]
+
+    def _multistate_readout(self, gathered, lvl, count, layer_idx):
+        """T0.4 (roadmap): the head ALSO reads the prefix's <= log T + 1
+        raw Fenwick block states, each carrying the attend fold's
+        deterministic, extrapolation-safe level encoding, reduced by a
+        FIXED learned reduction (static per-slot gates + a zero-init
+        output projection). No routing, no softmax, no pairwise
+        interaction -- a pure test of whether the mid-band ceiling is a
+        width-of-readout problem. Slots beyond the training popcount keep
+        their never-trained small random gates; their contribution at
+        extrapolated lengths is O(0.02)-scale by construction."""
+        B, T, S, d = gathered.shape
+        le = level_sin_enc(lvl, d).to(gathered.dtype)            # [T,S,d]
+        g = self.readout_gate[layer_idx, :S]                     # [S,d]
+        valid = (torch.arange(S, device=gathered.device)[None, :]
+                 < count[:, None]).to(gathered.dtype)            # [T,S]
+        red = (g * (gathered + le) * valid[None, :, :, None]).sum(dim=2)
+        return self.readout_out[layer_idx](red)                  # zero-init
+
+    def _delta_memory(self, h, prefix, layer_idx):
+        """T1.4 (roadmap): delta-rule matrix memory alongside the fold.
+        M_t = M_{t-1}(I - beta_t k_t k_t^T) + beta_t v_t k_t^T -- the
+        error-correcting write (the old association is removed before the
+        new one is written), with keys normalized as in DeltaNet. The
+        fold's prefix state queries by content (y_t = M_t q_t); a learned
+        gate mixes the zero-init-projected retrieval into the head state.
+        Writes/reads are rank-one updates and matvecs: no token-token
+        score matrix, no softmax anywhere. The scan runs in fp32 for
+        recurrence stability. Padded positions only affect their own
+        row's later pad positions, which the loss masks -- masking and
+        causality are both safe. Keys/values/beta come from the layer's
+        token states h; the query comes from the fold's prefix state.
+
+        TRAINING path: chunkwise WY form (DeltaNet, Yang et al. 2024,
+        arXiv:2406.06484): S_t = sum_i u_i k_i^T with pseudo-values
+        U = (I+A)^{-1} (beta*V), A[t,i] = beta_t (k_i . k_t) strictly
+        lower -- one triangular solve per chunk instead of T sequential
+        rank-one updates. Numerically equivalent to the recurrent form
+        (_delta_memory_naive; selftest cross-checks the two)."""
+        k = F.normalize(self.mem_k[layer_idx](h), dim=-1).float()
+        v = self.mem_v[layer_idx](h).float()
+        beta = torch.sigmoid(self.mem_beta[layer_idx](h)).float()
+        q = self.mem_q[layer_idx](prefix).float()
+        y = self._chunk_delta(k, v, beta, q)
+        y = y.to(prefix.dtype)
+        g = torch.sigmoid(self.mem_gate[layer_idx](
+            torch.cat([prefix, y], dim=-1)))
+        return g * self.mem_out[layer_idx](y)     # zero-init projection
+
+    def _chunk_delta(self, k, v, beta, q, chunk_size=64):
+        """Chunkwise delta rule. k,q: [B,T,dk]; v: [B,T,dv]; beta: [B,T,1].
+        Returns y: [B,T,dv] with y_t = S_t q_t (post-write state).
+        Inter-chunk state S0 [B,dv,dk] is additive: S0 += U^T K."""
+        B, T, dk = k.shape
+        S0 = k.new_zeros(B, v.shape[-1], dk)
+        ys = []
+        for s in range(0, T, chunk_size):
+            K, V = k[:, s:s + chunk_size], v[:, s:s + chunk_size]
+            Q, Bt = q[:, s:s + chunk_size], beta[:, s:s + chunk_size]
+            C = K.shape[1]
+            # A[t,i] = beta_t (k_i . k_t), strictly lower (i < t)
+            A = (K @ K.transpose(-1, -2)) * Bt
+            A = A.tril(-1)
+            # U = (I + A)^{-1} (beta * V): one triangular solve
+            eye = torch.eye(C, device=k.device, dtype=k.dtype).expand(
+                B, C, C)
+            U = torch.linalg.solve_triangular(
+                eye + A, Bt * V, upper=False, unitriangular=True)
+            # y = Q S0^T + (tril(Q K^T)) U
+            causal = torch.tril(
+                torch.ones(C, C, device=k.device, dtype=torch.bool))
+            y = Q @ S0.transpose(-1, -2) + (Q @ K.transpose(-1, -2)
+                                            * causal) @ U
+            S0 = S0 + U.transpose(-1, -2) @ K
+            ys.append(y)
+        return torch.cat(ys, dim=1)
+
+    def _delta_memory_naive(self, h, prefix, layer_idx):
+        """Reference recurrent form of _delta_memory (the original
+        sequential scan, 2026-08-04). Kept for the chunked-form
+        equivalence selftest; inference (OperaDecoder) uses this form
+        too, where it is optimal -- one rank-one update per token."""
+        B, T, _ = h.shape
+        dm = self.mem_dim
+        k = F.normalize(self.mem_k[layer_idx](h), dim=-1).float()
+        v = self.mem_v[layer_idx](h).float()
+        beta = torch.sigmoid(self.mem_beta[layer_idx](h)).float()
+        q = self.mem_q[layer_idx](prefix).float()
+        M = torch.zeros(B, dm, dm, device=h.device, dtype=torch.float32)
+        ys = []
+        for t in range(T):
+            kt = k[:, t].unsqueeze(-1)                           # [B,dm,1]
+            bt = beta[:, t].unsqueeze(-1)                        # [B,1,1]
+            # M + beta * (v - M k) k^T  ==  M(I - beta k k^T) + beta v k^T
+            M = M + bt * ((v[:, t].unsqueeze(-1) - M @ kt)
+                          @ kt.transpose(-1, -2))
+            ys.append((M @ q[:, t].unsqueeze(-1)).squeeze(-1))   # [B,dm]
+        y = torch.stack(ys, dim=1).to(prefix.dtype)              # [B,T,dm]
+        g = torch.sigmoid(self.mem_gate[layer_idx](
+            torch.cat([prefix, y], dim=-1)))
+        return g * self.mem_out[layer_idx](y)     # zero-init projection
 
     def _ws_masks(self, T, device):
         """Workspace chunk masks, host-computed once per (T, device) and
@@ -1631,6 +1795,11 @@ class OperaSpinorFenwickTree(nn.Module):
             R_L, R_R, R_O = self.get_rotations(layer_idx)
             levels, locks = self.build_tree(current, layer_idx, R_L, R_R, R_O)
             prefix = self.prefix_states(levels, T, layer_idx, R_L, R_R, R_O)
+            if self.mem_mode == 'delta':
+                # T1.4: the memory reads the layer's token states, the
+                # fold's prefix state queries it by content.
+                prefix = prefix + self._delta_memory(current, prefix,
+                                                     layer_idx)
             return prefix, levels, locks
 
         current = states

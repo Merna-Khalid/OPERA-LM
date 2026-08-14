@@ -51,6 +51,13 @@ python examples/train_toy.py    # trains on random tokens, no download
 - **`opera_lm.model`** — `OperaSpinorFenwickTree`, the complete model (all
   arms below), plus the functional helpers (`fenwick_blocks`, quaternion
   ops, `geometric_product`, `associative_scan`, `count_params`).
+- **`opera_lm.incremental`** — `OperaDecoder`: Fenwick-incremental
+  decoding at O(L log T) compose nodes per token (vs O(L T log T) for a
+  full re-forward; ~13× faster at T=128, growing with T). Exact vs the
+  full forward (selftested, atol 1e-5); `fold_mode='left'` only.
+- **`opera_lm.muon`** — `Muon` (Newton-Schulz orthogonalized momentum,
+  batched per 3×3 map for `rot_free`) + `split_muon_params`: the T0.1
+  optimizer arm, toy-gate validated (+38.4 PPL over AdamW at lr 0.02).
 - **`opera_lm.losses`** — `lm_loss`, `train_lm_loss` (with unbiased
   auxiliary-position subsampling), `msup_loss`.
 - **`opera_lm.train`** — the full research training loop (`train()`),
@@ -154,8 +161,21 @@ train(steps=20000, batch=16, max_len=256, vocab_size=10000,
       msup=True, msup_weight=0.1,                 # arm B
       fold_gate_bias=(2.0, 0.0, -2.0),            # arm A
       curriculum=(64, 2000),                      # arm C
+      optimizer='muon', muon_lr=0.02,             # T0.1: Muon on matrix
+                                                  # params (rot_free's
+                                                  # per-block 3x3 maps,
+                                                  # cross_mlp, head),
+                                                  # AdamW on the rest
       seed=42, out_dir='runs')
 ```
+
+`train()` also accepts `data=(train, test_short, test_long, vocab_size)`
+(pre-tokenized sequences, bypassing `load_data`) and `idx2word` —
+the entry point for custom tokenizers/corpora (see `opera-chat/`).
+`opera_lm.Muon` / `split_muon_params` are exported for standalone use,
+and `opera_lm.OperaDecoder` gives O(log T)-per-token incremental
+decoding for `fold_mode='left'` models (exact vs full forward,
+selftested).
 
 ### Recommended starting points
 
@@ -219,7 +239,10 @@ writing (`docs/` contains the pre-registrations):
 - `docs/OPERA_Mechanisms_Guide.md` — **start here**: every arm, fold,
   geometry knob, and optimization knob explained, with its research
   status (incumbent / validated / falsified / exploratory)
-- `docs/opera_paper_draft_v1.md` — the draft
+- `docs/opera_paper_draft_v1.md` — the draft (v1)
+- `docs/opera_paper_draft_v1_1.md` — **current draft**: v1.1 adds exact
+  incremental decoding (§2.5/§4.5), the Muon recipe arm (§4.6), the BPE
+  chat artifact (§4.7), and log-linear-attention related work (§6)
 - `docs/OPERA_Technical_Reference.md` — the mathematical foundation
   (operads, SO(3), Schur's lemma fusion)
 - `docs/OPERA_Resonance_Framework.md` — phase-locking formulation

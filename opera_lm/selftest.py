@@ -14,7 +14,9 @@ from .model import (OperaSpinorFenwickTree, count_params, fenwick_blocks,
 from .losses import lm_loss, msup_loss
 from .data import doc_chunks, doc_chunk_sizes
 from .train import (curriculum_len, GpuBatchSource, extrapolation_eval,
-                    rmt_states_diagnostic)
+                    rmt_states_diagnostic, train)
+from .incremental import OperaDecoder, fenwick_blocks_of
+from .muon import Muon, zeropower_via_newtonschulz5, split_muon_params
 
 # ============================================================================
 # SELF-TEST
@@ -1387,6 +1389,252 @@ def selftest():
     assert cerr10 < 1e-5, f"curriculum slice diverges: {cerr10:.2e}"
     print(f"  curriculum b: same-shape causality exact (0.0); sliced batch "
           f"matches to {cerr10:.1e} (fp tiling noise)")
+
+    # 16. Fenwick-incremental decoding (OperaDecoder): appending tokens one
+    # at a time must reproduce the full forward's per-position logits
+    # EXACTLY (up to fp op-reordering). This is the property that makes
+    # O(log T)/token generation sound: tree nodes are append-only, prefix
+    # states are causal, cross-layer mixing is position-wise.
+    # (a) helper: fenwick_blocks_of(L) == row L-1 of fenwick_blocks.
+    tbl11, _ = fenwick_blocks(37)
+    for L11 in range(1, 38):
+        assert fenwick_blocks_of(L11) == tbl11[L11 - 1], L11
+    print("  incremental a: fenwick_blocks_of matches fenwick_blocks rows")
+    # (b) per-position logit equivalence, incumbent stack (free/none/left
+    #     + chrono fold bias) AND the so3+sin+fold-scale stack (covers the
+    #     fold twist and the positional embedding paths).
+    for tag11, kw11 in [
+        ('incumbent', dict(pe_mode='none', rot_mode='free',
+                           fold_gate_bias=(2.0, 0.0, -2.0))),
+        ('so3+sin+foldscale', dict(pe_mode='sin', rot_mode='so3',
+                                   fold_scale=True, tie=True)),
+    ]:
+        torch.manual_seed(11)
+        m11 = OperaSpinorFenwickTree(vocab_size=101, d=64, nb=16,
+                                     num_layers=2, fold_mode='left', **kw11)
+        m11.eval()
+        T11 = 33                      # odd + crosses power-of-2 boundaries
+        tok11 = torch.randint(1, 100, (1, T11))
+        len11 = torch.tensor([T11])
+        with torch.no_grad():
+            full11 = m11(tok11, len11, head_last_only=True)[-1][0]  # [T,V]
+            dec11 = OperaDecoder(m11)
+            inc11 = torch.stack([dec11.append(int(t)) for t in tok11[0]])
+        derr11 = (full11 - inc11).abs().max().item()
+        assert derr11 < 1e-5, f"incremental diverges ({tag11}): {derr11:.2e}"
+        # reset() re-runs identically (cache hygiene)
+        dec11.reset()
+        with torch.no_grad():
+            inc11b = torch.stack([dec11.append(int(t)) for t in tok11[0]])
+        assert torch.equal(inc11, inc11b), "reset() does not reproduce"
+        print(f"  incremental b [{tag11}]: per-position logits match full "
+              f"forward to {derr11:.1e} over T={T11}; reset exact")
+
+    # 17. Muon optimizer (roadmap T0.1): Newton-Schulz orthogonalization,
+    # parameter partition, learning dynamics, end-to-end train() wiring.
+    # (a) NS5's real contract (modded-nanogpt): output singular values
+    #     land in ~[0.7, 1.2] (NOT 1 +- 1e-3 -- the quintic has a slow
+    #     region for small sigma, which is why Muon uses exactly 5 steps).
+    #     Assert: spectral norm bounded (<=1.3) and the Gram error of the
+    #     OUTPUT beats the Gram error of the Frobenius-normalized INPUT,
+    #     for wide/tall/batched-3x3 (the rot_free case).
+    for g12 in (torch.randn(3, 6), torch.randn(6, 3),
+                torch.randn(4, 3, 3) * (0.8 + 0.4 * torch.rand(4, 3, 3))):
+        x12 = zeropower_via_newtonschulz5(g12)
+        assert x12.shape == g12.shape and x12.dtype == g12.dtype
+        sv12 = torch.linalg.svdvals(x12.float())
+        assert sv12.max().item() <= 1.3, f"NS5 spectral norm {sv12.max()}"
+        xin12 = g12 / (g12.norm(dim=(-2, -1), keepdim=True) + 1e-7)
+        sq12 = min(g12.size(-2), g12.size(-1))
+        eye12 = torch.eye(sq12)
+        gram_out12 = (x12.float() @ x12.float().mT
+                      if g12.size(-2) <= g12.size(-1)
+                      else x12.float().mT @ x12.float())
+        gram_in12 = (xin12 @ xin12.mT if g12.size(-2) <= g12.size(-1)
+                     else xin12.mT @ xin12)
+        eout12 = (gram_out12.reshape(-1, sq12, sq12)
+                  - eye12).abs().max().item()
+        ein12 = (gram_in12.reshape(-1, sq12, sq12) - eye12).abs().max().item()
+        assert eout12 < ein12, f"NS5 did not orthogonalize: {ein12} -> {eout12}"
+    print("  muon a: NS5 spectrally bounded (<=1.3) and improves "
+          "orthogonality for wide/tall/batched-3x3 inputs")
+    # (b) partition: rot_free + cross_mlp + untied head -> Muon;
+    #     word_emb, fusion/blend gates, all 1-dim -> AdamW; disjoint+total.
+    m12 = OperaSpinorFenwickTree(vocab_size=101, d=64, nb=16, num_layers=2,
+                                 pe_mode='none', fold_mode='left',
+                                 rot_mode='free')
+    muon12, adam12 = split_muon_params(m12)
+    ids12 = {id(p) for p in muon12} | {id(p) for p in adam12}
+    assert len(ids12) == len(list(m12.parameters()))
+    names12 = dict(m12.named_parameters())
+    muon_names12 = {n for n, p in names12.items() if any(p is q for q in muon12)}
+    assert 'rot_free' in muon_names12
+    assert any(n.startswith('cross_mlp') and n.endswith('weight')
+               for n in muon_names12)
+    assert 'head.weight' in muon_names12              # untied here
+    for n in names12:
+        if 'emb' in n or 'gate' in n:
+            assert n not in muon_names12, n
+    print(f"  muon b: partition total/disjoint; rot_free+cross_mlp+head "
+          f"muon-side ({sum(p.numel() for p in muon12):,} params), "
+          f"emb/gates adam-side")
+    # (c) learning dynamics: a few Muon steps reduce a quadratic loss.
+    torch.manual_seed(12)
+    p12 = torch.nn.Parameter(torch.randn(10, 5))
+    x12 = torch.randn(32, 10)
+    y12 = torch.randn(32, 5)
+    opt12 = Muon([{'params': [p12], 'use_muon': True, 'lr': 0.05}])
+    first12 = last12 = None
+    for i in range(30):
+        opt12.zero_grad()
+        l12 = ((x12 @ p12 - y12) ** 2).mean()
+        if i == 0:
+            first12 = l12.item()
+        last12 = l12.item()
+        l12.backward()
+        opt12.step()
+    assert last12 < 0.5 * first12, f"muon not learning: {first12} -> {last12}"
+    print(f"  muon c: quadratic loss {first12:.4f} -> {last12:.4f} in 30 steps")
+    # (d) end-to-end: train() with optimizer='muon' on injected synthetic
+    #     data runs, learns (loss finite + below chance-init), checkpoints.
+    import os as _os12, tempfile as _tf12
+    rng12 = random.Random(12)
+    V12 = 64
+    train12 = [[rng12.randrange(1, V12) for _ in range(rng12.randrange(5, 17))]
+               for _ in range(120)]
+    short12 = [[rng12.randrange(1, V12) for _ in range(rng12.randrange(5, 17))]
+               for _ in range(40)]
+    long12 = [[rng12.randrange(1, V12) for _ in range(rng12.randrange(17, 33))]
+              for _ in range(24)]
+    with _tf12.TemporaryDirectory() as tmp12:
+        res12 = train(steps=5, batch=8, max_len=16, vocab_size=V12, d=64,
+                      nb=16, num_layers=2, eval_max_len=32, device='cpu',
+                      pe_mode='none', fold_mode='left', rot_mode='free',
+                      data=(train12, short12, long12, V12), idx2word=None,
+                      out_dir=tmp12, compile_mode='off', use_amp=False,
+                      gpu_data=False, warmup_steps=2, seed=3,
+                      optimizer='muon', muon_lr=0.02)
+        assert math.isfinite(res12['final_loss'])
+        assert res12['init_perplexity'] > 1
+        assert _os12.path.exists(res12_path12 := _os12.path.join(
+            tmp12, 'opera_v8_0_results.jsonl'))
+        pts12 = [f for f in _os12.listdir(tmp12) if f.endswith('.pt')]
+        assert pts12, "no checkpoint saved"
+        assert 'opt-muon' in pts12[0], pts12[0]
+    print(f"  muon d: train() end-to-end, final loss "
+          f"{res12['final_loss']:.3f}, ckpt tagged opt-muon")
+
+    # 18. T0.4 multi-state readout + T1.4 delta memory (roadmap arms).
+    # (a) RNG-stream rule: arms-on model shares every incumbent parameter
+    #     bitwise at the same seed; the only new params are the arms'.
+    torch.manual_seed(13)
+    m13a = OperaSpinorFenwickTree(vocab_size=101, d=64, nb=16, num_layers=2,
+                                  pe_mode='none', fold_mode='left',
+                                  rot_mode='free')
+    torch.manual_seed(13)
+    m13b = OperaSpinorFenwickTree(vocab_size=101, d=64, nb=16, num_layers=2,
+                                  pe_mode='none', fold_mode='left',
+                                  rot_mode='free',
+                                  readout_mode='multistate',
+                                  mem_mode='delta', mem_dim=32)
+    pa13 = dict(m13a.named_parameters())
+    new13 = []
+    for n, p in m13b.named_parameters():
+        if n in pa13:
+            assert torch.equal(p, pa13[n]), f"shared param diverged: {n}"
+        else:
+            new13.append(n)
+    assert any('readout_gate' in n for n in new13)
+    assert any('mem_k' in n for n in new13)
+    n13a = count_params(m13a)
+    n13b = count_params(m13b)
+    print(f"  arms a: shared params bitwise incumbent; {len(new13)} new "
+          f"param tensors ({n13a:,} -> {n13b:,}, +{100 * (n13b - n13a) / n13a:.1f}%)")
+    # (b) zero-init rule: at init the arms-on model's outputs are BITWISE
+    #     the incumbent's (zero-init output projections).
+    m13a.eval(); m13b.eval()
+    tok13 = torch.randint(1, 100, (2, 24))
+    len13 = torch.tensor([24, 17])
+    with torch.no_grad():
+        o13a = m13a(tok13, len13)[-1]
+        o13b = m13b(tok13, len13)[-1]
+    assert torch.equal(o13a, o13b), "arms-on is not the incumbent at init"
+    print("  arms b: flags-on == incumbent at init, bitwise")
+    # (c) causality with arms on: corrupting token j changes nothing at
+    #     positions < j (exact, same-shape).
+    garb13 = tok13.clone()
+    garb13[:, 12:] = 1
+    with torch.no_grad():
+        o13c = m13b(garb13, len13)[-1]
+    assert torch.equal(o13b[:, :12], o13c[:, :12]), \
+        "delta memory or multistate readout leaks future into the past"
+    print("  arms c: causality exact with both arms on (0.0)")
+    # (d) extrapolation shapes: T beyond the trained slot count runs.
+    with torch.no_grad():
+        m13b(torch.randint(1, 100, (1, 300)), torch.tensor([300]))
+    print("  arms d: T=300 forward (untrained readout slots) runs")
+    # (d2) the chunked WY training path (DeltaNet parallel form) is
+    #      numerically the recurrent form: outputs match the sequential
+    #      scan over a multi-chunk T (incl. a partial tail chunk).
+    h13 = torch.randn(2, 96, 64)
+    p13 = torch.randn(2, 96, 64)
+    with torch.no_grad():
+        y13seq = m13b._delta_memory_naive(h13, p13, 0)
+        y13chk = m13b._delta_memory(h13, p13, 0)
+    err13 = (y13seq - y13chk).abs().max().item()
+    assert err13 < 2e-3, f"chunked delta diverges: {err13:.2e}"
+    print(f"  arms d2: chunked WY == recurrent delta rule to {err13:.1e} "
+          f"(T=96, 1.5 chunks)")
+    # (e) OperaDecoder SUPPORTS both arms (the readout is a static
+    #     function of the fold's blocks; the delta memory is incremental
+    #     by design): per-position logits must match the full forward.
+    m13b.eval()
+    tok13e = torch.randint(1, 100, (1, 33))
+    len13e = torch.tensor([33])
+    with torch.no_grad():
+        full13 = m13b(tok13e, len13e, head_last_only=True)[-1][0]
+        dec13 = OperaDecoder(m13b)
+        inc13 = torch.stack([dec13.append(int(t)) for t in tok13e[0]])
+    derr13 = (full13 - inc13).abs().max().item()
+    assert derr13 < 1e-4, f"incremental diverges with arms on: {derr13:.2e}"
+    print(f"  arms e: OperaDecoder supports both arms; per-position "
+          f"logits match full forward to {derr13:.1e} over T=33")
+    # (f) end-to-end: train() with both arms learns and grads reach the
+    #     new parameters.
+    with _tf12.TemporaryDirectory() as tmp13:
+        res13 = train(steps=5, batch=8, max_len=16, vocab_size=V12, d=64,
+                      nb=16, num_layers=2, eval_max_len=32, device='cpu',
+                      pe_mode='none', fold_mode='left', rot_mode='free',
+                      data=(train12, short12, long12, V12), idx2word=None,
+                      out_dir=tmp13, compile_mode='off', use_amp=False,
+                      gpu_data=False, warmup_steps=2, seed=3,
+                      optimizer='muon', muon_lr=0.02,
+                      readout_mode='multistate', mem_mode='delta',
+                      mem_dim=32)
+        assert math.isfinite(res13['final_loss'])
+        assert res13['readout_mode'] == 'multistate'
+        assert res13['mem_mode'] == 'delta'
+        pts13 = [f for f in _os12.listdir(tmp13) if f.endswith('.pt')]
+        assert any('ro-multistate' in f and 'mem-delta32' in f
+                   for f in pts13), pts13
+    m13b.train()
+    m13b(tok13, len13)[-1].sum().backward()
+    # Zero-init arms: at init the upstream projections (mem_k/q/v/beta,
+    # readout_gate) get EXACTLY zero grad through the zero-init output
+    # projections -- by design; they come alive once the projections
+    # move. The wiring check is that the zero-init projections
+    # themselves receive nonzero gradient.
+    assert m13b.mem_out[0].weight.grad is not None and \
+        m13b.mem_out[0].weight.grad.abs().max() > 0, \
+        "no grad to mem_out (memory not wired into the loss)"
+    assert m13b.readout_out[0].weight.grad is not None and \
+        m13b.readout_out[0].weight.grad.abs().max() > 0, \
+        "no grad to readout_out (readout not wired into the loss)"
+    assert m13b.mem_k[0].weight.grad.abs().max().item() == 0.0, \
+        "zero-init contract broken: upstream grad at init"
+    print(f"  arms f: train() end-to-end (loss {res13['final_loss']:.3f}), "
+          f"tagged ro-multistate+mem-delta32; zero-init grad contract "
+          f"(projections receive grad, upstream exactly 0 at init)")
 
     print("  ALL PASS")
 

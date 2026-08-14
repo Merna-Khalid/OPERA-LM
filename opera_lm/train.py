@@ -8,9 +8,18 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from .model import OperaSpinorFenwickTree, count_params
+from .model import OperaSpinorFenwickTree, count_params, fold_work_counts
 from .losses import lm_loss, train_lm_loss, msup_loss
 from .data import load_data
+
+def _eval_batch(base, max_len, ref=256):
+    """Scale an eval batch size down for max_len > ref (same principle as
+    extrapolation_eval's per-bucket scaling below): activation memory per
+    sequence grows ~linearly with T, so a batch tuned at ref tokens OOMs
+    at max_len >> ref (e.g. a state-passing fine-tune with max_len=1024).
+    A no-op when max_len <= ref, which covers every ordinary run."""
+    return max(1, base * ref // max_len)
+
 
 def get_lr(step, warmup_steps, total_steps, max_lr, min_lr=1e-5):
     if step < warmup_steps:
@@ -293,7 +302,10 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
           oam_shared_gate=False, oam_combine='compose', oam_pair='seq',
           rack_exitnorm=False, oam_transport='rack', oam_levelgate=False,
           oam_chan_emb=False, scan_salience=False, scan_decay_bias=-3.0,
-          workspace=False, fold_gate_bias=None, curriculum=None):
+          workspace=False, fold_gate_bias=None, curriculum=None,
+          data=None, idx2word=None, optimizer='adamw', muon_lr=0.02,
+          readout_mode='none', readout_max_slots=16,
+          mem_mode='none', mem_dim=128, init_weights_from=None):
     tag = [f'pe-{pe_mode}']
     assert not (msup and fold_mode == 'scan'), \
         "--msup reads tree levels; --fold scan builds no tree"
@@ -342,7 +354,13 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
         tag.append(f'cur{curriculum[0]}x{curriculum[1]}')
     if tie: tag.append('tie')
     if dropout > 0: tag.append(f'drop{dropout}')
+    if optimizer != 'adamw':
+        tag.append(f'opt-{optimizer}')
+        if optimizer == 'muon' and muon_lr != 0.02:
+            tag.append(f'mlr{muon_lr}')
     if msup: tag.append('msup')
+    if readout_mode != 'none': tag.append(f'ro-{readout_mode}')
+    if mem_mode != 'none': tag.append(f'mem-{mem_mode}{mem_dim}')
     if lock_mode != 'none': tag.append(lock_mode)
     tag = '+'.join(tag)
 
@@ -364,10 +382,18 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
           f"(v7.7 masked: {mw}; {mw/cw:.2f}x less)", flush=True)
 
     os.makedirs(out_dir, exist_ok=True)
-    train_data, test_short, test_long, vocab, word2idx, idx2word = load_data(
-        vocab_size, max_len, eval_max_len, data_mode=data_mode,
-        docs_limit=docs_limit)
-    actual_vocab_size = len(vocab)
+    if data is not None:
+        # Injected data path (e.g. BPE chat corpora): caller supplies
+        # (train_data, test_short, test_long, vocab_size) as lists of token-id
+        # lists, bypassing the word-level Wikipedia load_data entirely.
+        # idx2word stays None unless the caller provides one; tree inspection
+        # is skipped then (it decodes ids to words).
+        train_data, test_short, test_long, actual_vocab_size = data
+    else:
+        train_data, test_short, test_long, vocab, word2idx, idx2word = load_data(
+            vocab_size, max_len, eval_max_len, data_mode=data_mode,
+            docs_limit=docs_limit)
+        actual_vocab_size = len(vocab)
 
     # Variation seed (r15): init + batch sampling only. Applied AFTER
     # load_data so the train/test split (seeded 42 internally) is
@@ -397,9 +423,31 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
                                    scan_salience=scan_salience,
                                    scan_decay_bias=scan_decay_bias,
                                    workspace=workspace,
-                                   fold_gate_bias=fold_gate_bias).to(device)
+                                   fold_gate_bias=fold_gate_bias,
+                                   readout_mode=readout_mode,
+                                   readout_max_slots=readout_max_slots,
+                                   mem_mode=mem_mode,
+                                   mem_dim=mem_dim).to(device)
     npar = count_params(model)
     print(f"  Model params: {npar:,}", flush=True)
+    if init_weights_from is not None:
+        # short post-training phases (e.g. state-passing length-gen
+        # fine-tunes) start from an existing checkpoint's WEIGHTS ONLY --
+        # optimizer/schedule/curriculum/data for this call are independent
+        # of whatever produced init_weights_from, so this is not --resume
+        # (which requires an identical tag/config to find its own
+        # train_ckpt and also restores optimizer+RNG state).
+        sd = torch.load(init_weights_from, map_location=device, weights_only=True)
+        model.load_state_dict(sd)
+        print(f"  Initialized weights from {init_weights_from}", flush=True)
+    if mem_mode == 'delta' and device == 'mps':
+        print(f"  WARNING: mem_mode='delta' on device='mps' is untested at "
+              f"scale (docs/OPERA_Swarm_Notes.md, T1.4) -- the fp32 "
+              f"chunked-WY scan on top of the fold measured ~4x step time "
+              f"and an OOM kill in the one real run to date "
+              f"(opera-chat/mem_run.log). Expect elevated memory/step "
+              f"time; consider --device cuda or a smaller mem_dim/batch "
+              f"until profiled.", flush=True)
 
     # OPT: torch.compile. The fold is compile-safe by construction (static
     # cached Fenwick indices; loop trip counts depend only on T). Eval is
@@ -443,7 +491,21 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
             batch_source = None
 
     warmup = warmup_steps
-    if use_foreach:
+    if optimizer == 'muon':
+        # T0.1 (roadmap): Muon on matrix-shaped hidden params (rot_free's
+        # per-block 3x3 maps, cross_mlp, untied head), AdamW on embeddings/
+        # gates/gains/scalars. ONE optimizer object -> resume machinery
+        # untouched. Per-group lr is re-set every step from the schedule.
+        from .muon import Muon, split_muon_params
+        muon_p, adam_p = split_muon_params(model)
+        opt = Muon([
+            {'params': muon_p, 'use_muon': True, 'lr': muon_lr},
+            {'params': adam_p, 'use_muon': False, 'lr': max_lr},
+        ], lr=max_lr)
+        print(f"  Muon: {sum(p.numel() for p in muon_p):,} matrix params "
+              f"(lr {muon_lr}) + AdamW: {sum(p.numel() for p in adam_p):,} "
+              f"(lr {max_lr})", flush=True)
+    elif use_foreach:
         # AdamW(foreach=True): fused multi-tensor step. weight_decay=0.0
         # keeps the math equal to Adam so the recipe is unchanged.
         opt = torch.optim.AdamW(model.parameters(), lr=max_lr,
@@ -515,7 +577,12 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
     for step in range(start_step, steps):
         lr = get_lr(step, warmup, steps, max_lr)
         for g in opt.param_groups:
-            g['lr'] = lr
+            # Muon groups follow the same warmup/decay schedule, rescaled
+            # to their own base lr (muon_lr).
+            if optimizer == 'muon' and g.get('use_muon'):
+                g['lr'] = lr * (muon_lr / max_lr)
+            else:
+                g['lr'] = lr
 
         if batch_source is not None:
             token_ids, lengths = batch_source.sample(batch)
@@ -584,12 +651,15 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
             print(f"    checkpoint -> {train_ckpt}", flush=True)
 
         if step % 1000 == 0 and step > 0:
-            ppl = compute_perplexity(model_c, test_short[:200], max_len, 32, device)
+            ppl = compute_perplexity(model_c, test_short[:200], max_len,
+                                     _eval_batch(32, max_len), device)
             print(f"    per-token perplexity: {ppl:.2f}", flush=True)
 
     print(f"\n=== Final Evaluation ===", flush=True)
-    ppl_1k = compute_perplexity(model_c, test_short[:1000], max_len, 32, device)
-    ppl = compute_perplexity(model_c, test_short[:5000], max_len, 32, device)
+    ppl_1k = compute_perplexity(model_c, test_short[:1000], max_len,
+                                _eval_batch(32, max_len), device)
+    ppl = compute_perplexity(model_c, test_short[:5000], max_len,
+                             _eval_batch(32, max_len), device)
     print(f"  In-length per-token PPL (<= {max_len}): {ppl:.2f} on 5k test sentences", flush=True)
     print(f"  (legacy 1k-sentence eval for comparison with older runs: {ppl_1k:.2f})", flush=True)
     print(f"  NOTE: single-run differences under ~1.5 PPL are within seed+eval noise.", flush=True)
@@ -603,7 +673,8 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
             ratio = bppl / ppl
             print(f"  len {bucket}: PPL {bppl:.2f}  (n={n}, {ratio:.2f}x in-length)", flush=True)
 
-    inspect_tree(model, test_short[:10], idx2word, device, n=5)
+    if idx2word is not None:
+        inspect_tree(model, test_short[:10], idx2word, device, n=5)
 
     rmt = rmt_states_diagnostic(model, test_short, 32, device, num_sentences=500)
 
@@ -620,6 +691,8 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
         'tree_drop': tree_drop,
         'lock_mode': lock_mode, 'tie': tie, 'dropout': dropout, 'msup': msup,
         'params': npar, 'd': d, 'nb': nb, 'num_layers': num_layers,
+        'readout_mode': readout_mode, 'mem_mode': mem_mode,
+        'mem_dim': (mem_dim if mem_mode != 'none' else None),
         'vocab_size': actual_vocab_size, 'max_len': max_len,
         'eval_max_len': eval_max_len, 'steps': steps,
         'final_loss': loss.item(),
@@ -631,6 +704,8 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
                 'aux_frac': aux_frac, 'amp': use_amp,
                 'lr': max_lr, 'warmup': warmup_steps,
                 'foreach': use_foreach,
+                'optimizer': optimizer,
+                'muon_lr': (muon_lr if optimizer == 'muon' else None),
                 'oam': {'k': oam_k, 'charges': str(oam_charges),
                         'phi': oam_phi, 'shared_gate': oam_shared_gate,
                         'combine': oam_combine,
