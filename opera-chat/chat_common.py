@@ -49,13 +49,31 @@ def encode_ids(tok, text):
     return list(enc.ids) if hasattr(enc, "ids") else list(enc)
 
 
+def _content_to_text(content):
+    """Gradio's ChatInterface message "content" is normally a str, but
+    depending on gradio version / multimodal config it may arrive as a
+    list of parts (each a str, or a dict with a "text" key) -- accept
+    both and extract the plain text."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, str):
+                parts.append(part)
+            elif isinstance(part, dict) and "text" in part:
+                parts.append(part["text"])
+        return "".join(parts)
+    return str(content)
+
+
 def format_conversation(messages, tok):
     """messages: list of {"role", "content"} dicts (roles system/user/
     assistant). Returns the flat token-id list for the conversation."""
     ids = []
     for m in messages:
         ids.append(tok.token_to_id(ROLE_TOKEN[m["role"]]))
-        ids.extend(encode_ids(tok, m["content"].strip()))
+        ids.extend(encode_ids(tok, _content_to_text(m["content"]).strip()))
         if m["role"] == "assistant":
             ids.append(tok.token_to_id(END_TOKEN))
     return ids

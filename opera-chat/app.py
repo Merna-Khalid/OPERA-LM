@@ -68,9 +68,9 @@ demo = gr.ChatInterface(
     # removed); history arrives as {"role","content"} dicts.
     title="OPERA-LM Chat",
     description=(
-        "Research prototype: a ~20M-parameter geometric language model "
+        "Research prototype: a ~150M-parameter geometric language model "
         "(spinor Fenwick tree, NO positional encodings -- position is "
-        "structure), trained from scratch on a subset of smoltalk. "
+        "structure), trained from scratch on the full smoltalk corpus. "
         "Expect toy-quality replies and slow-ish CPU generation. "
         "Model: https://github.com/Merna-Khalid/OPERA-LM"),
 )

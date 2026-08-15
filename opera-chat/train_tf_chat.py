@@ -62,6 +62,11 @@ def main():
     p.add_argument("--muon-lr", type=float, default=0.02)
     p.add_argument("--d", type=int, default=512)
     p.add_argument("--num-layers", type=int, default=4)
+    p.add_argument("--init-weights-from", default=None,
+                   help="load an existing checkpoint's weights before "
+                        "training (e.g. a pretrained-on-raw-text "
+                        "checkpoint, for a fine-tune phase); independent "
+                        "of --resume")
     a = p.parse_args()
 
     with open(a.data, "rb") as f:
@@ -81,6 +86,11 @@ def main():
                                 max_pe_len=a.eval_max_len,
                                 tie=True).to(a.device)
     # tie=True (OPERA chat runs tie=True): ~21.0M vs OPERA's 19.9M
+    if a.init_weights_from is not None:
+        sd = torch.load(a.init_weights_from, map_location=a.device,
+                        weights_only=True)
+        model.load_state_dict(sd)
+        print(f"  Initialized weights from {a.init_weights_from}", flush=True)
     npar = count_params(model)
     print(f"=== transformer baseline [{a.pe}] on chat protocol ===",
           flush=True)
