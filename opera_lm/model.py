@@ -857,8 +857,19 @@ class OperaSpinorFenwickTree(nn.Module):
         unique) and cleared at each forward. Returns None when the cache
         is unsafe: --checkpoint level recomputes compose_pair_batch in
         backward with the SAME R objects, and a cached M from the
-        original graph would disconnect the recompute from R."""
+        original graph would disconnect the recompute from R.
+
+        Also unsafe under torch.compile: id() is a Python object identity,
+        not a traceable value, so dynamo can only make the cache lookup
+        safe by guarding on the tensor's exact memory address -- which
+        changes every step, forcing a full recompile every call (observed
+        on CUDA: ~210s/step, hitting recompile_limit within a handful of
+        steps). Skip the cache during tracing; the caller's einsum
+        fallback (see compose_pair_batch) is fully compile-safe and is
+        the same math, just without the single-GEMM memoization."""
         if self.grad_checkpoint == 'level':
+            return None
+        if torch.compiler.is_compiling():
             return None
         key = id(R)
         ent = self._rot_dense_cache.get(key)
