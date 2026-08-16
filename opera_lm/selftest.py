@@ -1636,6 +1636,43 @@ def selftest():
           f"tagged ro-multistate+mem-delta32; zero-init grad contract "
           f"(projections receive grad, upstream exactly 0 at init)")
 
+    # (ddp) Multi-GPU training plumbing (rank-gated logging/eval/
+    # checkpointing, per-rank GpuBatchSource seeding + rank-tagged
+    # resume files, DDP-wrapping the training step only). Exercised here
+    # on CPU via the gloo backend with world_size=1 -- this machine has
+    # no multi-GPU hardware to test real cross-rank gradient averaging
+    # against, so this only proves the wiring in train() runs end-to-end
+    # without crashing and writes the expected rank-tagged checkpoint;
+    # it is NOT a substitute for an actual multi-GPU run (see the Kaggle
+    # notebook, which is where that has to happen).
+    import os as _os14
+    _os14.environ['RANK'] = '0'
+    _os14.environ['WORLD_SIZE'] = '1'
+    _os14.environ['LOCAL_RANK'] = '0'
+    _os14.environ.setdefault('MASTER_ADDR', '127.0.0.1')
+    _os14.environ.setdefault('MASTER_PORT', '29501')
+    try:
+        with _tf12.TemporaryDirectory() as tmp14:
+            res14 = train(steps=5, batch=8, max_len=16, vocab_size=V12, d=64,
+                          nb=16, num_layers=2, eval_max_len=32, device='cpu',
+                          pe_mode='none', fold_mode='left', rot_mode='free',
+                          data=(train12, short12, long12, V12), idx2word=None,
+                          out_dir=tmp14, compile_mode='off', use_amp=False,
+                          gpu_data=True, warmup_steps=2, seed=5,
+                          optimizer='muon', muon_lr=0.02, save_every=2,
+                          ddp=True)
+            assert res14 is not None and math.isfinite(res14['final_loss'])
+            pts14 = _os14.listdir(tmp14)
+            assert any(f.endswith('_train_ckpt.pt') for f in pts14), pts14
+            assert any(f.endswith('_train_ckpt_rank0.pt') for f in pts14), pts14
+    finally:
+        for k in ('RANK', 'WORLD_SIZE', 'LOCAL_RANK'):
+            _os14.environ.pop(k, None)
+    print(f"  ddp: train(ddp=True) world_size=1/gloo/CPU plumbing runs "
+          f"end-to-end (loss {res14['final_loss']:.3f}); rank-tagged "
+          f"checkpoint written -- NOT a substitute for a real multi-GPU "
+          f"test")
+
     print("  ALL PASS")
 
 

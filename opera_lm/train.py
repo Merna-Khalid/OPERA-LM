@@ -331,7 +331,44 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
           workspace=False, fold_gate_bias=None, curriculum=None,
           data=None, idx2word=None, optimizer='adamw', muon_lr=0.02,
           readout_mode='none', readout_max_slots=16,
-          mem_mode='none', mem_dim=128, init_weights_from=None):
+          mem_mode='none', mem_dim=128, init_weights_from=None,
+          ddp=False):
+    # DDP (multi-GPU data parallelism, added for the Kaggle 2xT4 tier --
+    # a single T4 measured ~8.5x slower than the project's A100, so real
+    # multi-GPU throughput matters there in a way it didn't on Colab).
+    # Launch via `torchrun --nproc_per_node=N script.py --ddp ...`;
+    # torchrun sets RANK/WORLD_SIZE/LOCAL_RANK, read here rather than
+    # threaded through every caller. Scope of this first version:
+    # DDP wraps ONLY the training forward/backward/step; all logging,
+    # checkpointing, and eval run on rank 0 only, against the raw
+    # (unwrapped) model -- eval never calls .backward() so it needs no
+    # DDP wrapping or cross-rank sync at all. torch.compile is force-
+    # disabled under ddp for this version: it has already caused two
+    # hard-to-predict bugs in this codebase this session (the id()-cache
+    # dynamo-guard issue, the P100 kernel-availability crash), and
+    # DDP+compile interaction is a third, separately-tricky axis that
+    # is not validated here -- a documented follow-up, not silently
+    # broken. `device` stays the TYPE string ('cuda') used throughout
+    # this function for branching; `torch_device` below is the actual
+    # per-rank placement string ('cuda:LOCAL_RANK').
+    rank, world_size, local_rank = 0, 1, 0
+    if ddp:
+        import torch.distributed as dist
+        # nccl is the real, intended (and only performant) backend --
+        # multi-GPU training is the whole point. gloo (CPU) is allowed
+        # too, ONLY so this plumbing is unit-testable without a multi-GPU
+        # machine (see selftest.py); it is not a supported real-training
+        # configuration and gets no speed benefit.
+        rank = int(os.environ['RANK'])
+        world_size = int(os.environ['WORLD_SIZE'])
+        local_rank = int(os.environ['LOCAL_RANK'])
+        if not dist.is_initialized():
+            dist.init_process_group(backend='nccl' if device == 'cuda' else 'gloo')
+        if device == 'cuda':
+            torch.cuda.set_device(local_rank)
+    is_main = (rank == 0)
+    torch_device = (f'cuda:{local_rank}' if (ddp and device == 'cuda') else device)
+
     tag = [f'pe-{pe_mode}']
     assert not (msup and fold_mode == 'scan'), \
         "--msup reads tree levels; --fold scan builds no tree"
@@ -390,22 +427,26 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
     if lock_mode != 'none': tag.append(lock_mode)
     tag = '+'.join(tag)
 
-    print(f"=== OPERA-LM v9.0 (Spinor Tree, tree-training line) [{tag}] ===", flush=True)
-    print(f"  steps={steps}, batch={batch}, train max_len={max_len}, eval_max_len={eval_max_len}", flush=True)
-    print(f"  d={d}, nb={nb}, num_layers={num_layers}, lock={lock_mode}, device={device}", flush=True)
-    print(f"  pe={pe_mode}, fold={fold_mode}, fold_rotors={fold_rotors}, "
-          f"fold_scale={fold_scale}", flush=True)
-    print(f"  norm={norm_mode}, act={act_mode}, node_residual={node_residual}", flush=True)
-    print(f"  rot={rot_mode}, seed={seed}, data={data_mode}", flush=True)
-    print(f"  out={out_dir}, save_every={save_every}, resume={resume}", flush=True)
-    print(f"  tie={tie}, dropout={dropout}, msup={msup} (weight {msup_weight})", flush=True)
-    print(f"  OPT: compile={compile_mode}, gpu_data={gpu_data}, "
-          f"aux_frac={aux_frac}, amp={use_amp}, foreach={use_foreach}", flush=True)
-    print(f"  References (train<=20, 4L): OPERA pe-none 70.92 / 1.65x / 1.68x;"
-          f" RoPE transformer 70.71 / 1.60x / 1.68x", flush=True)
-    mw, cw, _ = fold_work_counts(max_len)
-    print(f"  Fold work @T={max_len}: {cw} row-composes/layer "
-          f"(v7.7 masked: {mw}; {mw/cw:.2f}x less)", flush=True)
+    if is_main:
+        print(f"=== OPERA-LM v9.0 (Spinor Tree, tree-training line) [{tag}] ===", flush=True)
+        print(f"  steps={steps}, batch={batch} (per-rank), train max_len={max_len}, eval_max_len={eval_max_len}", flush=True)
+        print(f"  d={d}, nb={nb}, num_layers={num_layers}, lock={lock_mode}, device={device}", flush=True)
+        if ddp:
+            print(f"  DDP: world_size={world_size}, effective batch="
+                  f"{batch * world_size}, compile forced off", flush=True)
+        print(f"  pe={pe_mode}, fold={fold_mode}, fold_rotors={fold_rotors}, "
+              f"fold_scale={fold_scale}", flush=True)
+        print(f"  norm={norm_mode}, act={act_mode}, node_residual={node_residual}", flush=True)
+        print(f"  rot={rot_mode}, seed={seed}, data={data_mode}", flush=True)
+        print(f"  out={out_dir}, save_every={save_every}, resume={resume}", flush=True)
+        print(f"  tie={tie}, dropout={dropout}, msup={msup} (weight {msup_weight})", flush=True)
+        print(f"  OPT: compile={compile_mode}, gpu_data={gpu_data}, "
+              f"aux_frac={aux_frac}, amp={use_amp}, foreach={use_foreach}", flush=True)
+        print(f"  References (train<=20, 4L): OPERA pe-none 70.92 / 1.65x / 1.68x;"
+              f" RoPE transformer 70.71 / 1.60x / 1.68x", flush=True)
+        mw, cw, _ = fold_work_counts(max_len)
+        print(f"  Fold work @T={max_len}: {cw} row-composes/layer "
+              f"(v7.7 masked: {mw}; {mw/cw:.2f}x less)", flush=True)
 
     os.makedirs(out_dir, exist_ok=True)
     if data is not None:
@@ -453,9 +494,10 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
                                    readout_mode=readout_mode,
                                    readout_max_slots=readout_max_slots,
                                    mem_mode=mem_mode,
-                                   mem_dim=mem_dim).to(device)
+                                   mem_dim=mem_dim).to(torch_device)
     npar = count_params(model)
-    print(f"  Model params: {npar:,}", flush=True)
+    if is_main:
+        print(f"  Model params: {npar:,}", flush=True)
     if init_weights_from is not None:
         # short post-training phases (e.g. state-passing length-gen
         # fine-tunes) start from an existing checkpoint's WEIGHTS ONLY --
@@ -463,10 +505,11 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
         # of whatever produced init_weights_from, so this is not --resume
         # (which requires an identical tag/config to find its own
         # train_ckpt and also restores optimizer+RNG state).
-        sd = torch.load(init_weights_from, map_location=device, weights_only=True)
+        sd = torch.load(init_weights_from, map_location=torch_device, weights_only=True)
         model.load_state_dict(sd)
-        print(f"  Initialized weights from {init_weights_from}", flush=True)
-    if mem_mode == 'delta' and device == 'mps':
+        if is_main:
+            print(f"  Initialized weights from {init_weights_from}", flush=True)
+    if mem_mode == 'delta' and device == 'mps' and is_main:
         print(f"  WARNING: mem_mode='delta' on device='mps' is untested at "
               f"scale (docs/OPERA_Swarm_Notes.md, T1.4) -- the fp32 "
               f"chunked-WY scan on top of the fold measured ~4x step time "
@@ -481,9 +524,10 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
     # always save the RAW module (model), never the compiled wrapper.
     # v8.8: compile is now also enabled on MPS for --fold scan ONLY
     # (measured 2.12x step-time speedup, fwd err 6e-6; other folds on MPS
-    # stay eager as before -- untested, out of scope).
+    # stay eager as before -- untested, out of scope). Force-disabled
+    # under ddp for now -- see the docstring note at the top of train().
     model_c = model
-    _compile_ok = (compile_mode != 'off'
+    _compile_ok = (compile_mode != 'off' and not ddp
                    and (device == 'cuda'
                         or (device == 'mps' and fold_mode == 'scan')))
     if _compile_ok:
@@ -498,22 +542,31 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
         if compile_mode != 'default':
             kw['mode'] = compile_mode
         model_c = torch.compile(model, **kw)
-        print(f"  torch.compile enabled (mode={compile_mode}, "
-              f"recompile_limit=64)", flush=True)
-    elif compile_mode != 'off':
-        print(f"  torch.compile skipped on {device}; running eager", flush=True)
+        if is_main:
+            print(f"  torch.compile enabled (mode={compile_mode}, "
+                  f"recompile_limit=64)", flush=True)
+    elif compile_mode != 'off' and is_main:
+        why = "ddp" if ddp else device
+        print(f"  torch.compile skipped ({why}); running eager", flush=True)
 
     # OPT: GPU-resident training data (exact batch-stream resume via a
-    # dedicated generator whose state rides in the checkpoint).
+    # dedicated generator whose state rides in the checkpoint). Under ddp
+    # each rank gets a DIFFERENT stream (seed + rank) -- otherwise every
+    # rank would compute gradients on the identical batch and DDP's
+    # all-reduce would just average N copies of the same gradient, zero
+    # real parallelism benefit for 2x the power draw.
     batch_source = None
     if gpu_data:
         try:
-            batch_source = GpuBatchSource(train_data, max_len, device, seed)
-            print(f"  GPU batch source: {batch_source.N:,} sequences on "
-                  f"{device} ({batch_source.ids.numel() * 8 / 2**20:.0f} MiB)",
-                  flush=True)
+            batch_source = GpuBatchSource(train_data, max_len, torch_device,
+                                          seed + rank)
+            if is_main:
+                print(f"  GPU batch source: {batch_source.N:,} sequences on "
+                      f"{torch_device} ({batch_source.ids.numel() * 8 / 2**20:.0f} MiB)"
+                      + (f", {world_size} ranks" if ddp else ""), flush=True)
         except Exception as e:
-            print(f"  WARNING: gpu_data failed ({e}); CPU sampling", flush=True)
+            if is_main:
+                print(f"  WARNING: gpu_data failed ({e}); CPU sampling", flush=True)
             batch_source = None
 
     warmup = warmup_steps
@@ -528,9 +581,10 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
             {'params': muon_p, 'use_muon': True, 'lr': muon_lr},
             {'params': adam_p, 'use_muon': False, 'lr': max_lr},
         ], lr=max_lr)
-        print(f"  Muon: {sum(p.numel() for p in muon_p):,} matrix params "
-              f"(lr {muon_lr}) + AdamW: {sum(p.numel() for p in adam_p):,} "
-              f"(lr {max_lr})", flush=True)
+        if is_main:
+            print(f"  Muon: {sum(p.numel() for p in muon_p):,} matrix params "
+                  f"(lr {muon_lr}) + AdamW: {sum(p.numel() for p in adam_p):,} "
+                  f"(lr {max_lr})", flush=True)
     elif use_foreach:
         # AdamW(foreach=True): fused multi-tensor step. weight_decay=0.0
         # keeps the math equal to Adam so the recipe is unchanged.
@@ -559,7 +613,7 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
         amp_dtype = torch.bfloat16 if cap[0] >= 8 else torch.float16
     else:
         amp_dtype = torch.bfloat16
-    if use_amp:
+    if use_amp and is_main:
         print(f"  AMP dtype: {amp_dtype}", flush=True)
     scaler = None
     if use_amp and amp_dtype == torch.float16:
@@ -567,22 +621,52 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
             scaler = torch.amp.GradScaler(device)
         except Exception:
             scaler = None
-            print("  (no GradScaler on this backend; fp16 without scaling)", flush=True)
+            if is_main:
+                print("  (no GradScaler on this backend; fp16 without scaling)", flush=True)
     import contextlib
     def amp_ctx():
         if use_amp:
             return torch.autocast(device_type=device, dtype=amp_dtype)
         return contextlib.nullcontext()
 
+    if ddp:
+        # Wrap for the training step ONLY -- eval/inspection/checkpointing
+        # below always use the raw `model` on rank 0, never `model_c`, so
+        # DDP's forward-hook/gradient-sync machinery is never invoked
+        # outside an actual backward() call.
+        from torch.nn.parallel import DistributedDataParallel as _DDP
+        # device_ids/output_device are CUDA-only; gloo (CPU, testing
+        # only, see the note above) requires them to be None.
+        # find_unused_parameters=True: train_lm_loss calls
+        # model.apply_head() a SECOND time out-of-band (once per aux
+        # layer, bypassing model_c/DDP entirely) on top of the head
+        # usage already inside model_c's own forward (head_last_only) --
+        # DDP's default single-forward-hook bucketing does not expect
+        # the same parameters touched via two separate call sites in
+        # one iteration and errors ("Expected to have finished
+        # reduction..."), reproduced and confirmed fixed by this flag
+        # on the CPU/gloo selftest below.
+        model_c = _DDP(model, find_unused_parameters=True,
+                       **({'device_ids': [local_rank], 'output_device': local_rank}
+                          if device == 'cuda' else {}))
+
     # Colab checkpointing (v8.0): resume from a mid-training checkpoint.
     # RNG states are saved/restored so the batch stream continues exactly.
+    # Under ddp: model/opt/step/global-RNG state is common to all ranks,
+    # so every rank independently reads the same rank0-written file
+    # (cheap, and simpler/less risky than reordering the DDP wrap above
+    # to happen after this block so a broadcast would pick it up). Each
+    # rank's GpuBatchSource stream is per-rank (seed + rank), so it is
+    # saved/restored from its OWN separate rank-tagged file instead.
     train_ckpt = os.path.join(out_dir, f'opera_v8_0_{tag.replace("+","_")}_train_ckpt.pt')
+    rank_ckpt = (train_ckpt.replace('_train_ckpt.pt', f'_train_ckpt_rank{rank}.pt')
+                 if ddp else None)
     start_step = 0
     if resume and os.path.exists(train_ckpt):
         # weights_only=False: the checkpoint stores RNG states (numpy
         # objects) and is self-produced/trusted. Required on torch >= 2.6
         # where weights_only defaults to True.
-        st = torch.load(train_ckpt, map_location=device, weights_only=False)
+        st = torch.load(train_ckpt, map_location=torch_device, weights_only=False)
         model.load_state_dict(st['model'])
         opt.load_state_dict(st['opt'])
         start_step = st['step'] + 1
@@ -591,15 +675,27 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
         torch.set_rng_state(st['torch_rng'].cpu())
         if device == 'cuda' and st.get('cuda_rng') is not None:
             torch.cuda.set_rng_state(st['cuda_rng'].cpu())
-        if batch_source is not None and st.get('gpu_rng') is not None:
+        if not ddp and batch_source is not None and st.get('gpu_rng') is not None:
             batch_source.load_state_dict(st['gpu_rng'])
-        print(f"  RESUMED from {train_ckpt} at step {start_step}", flush=True)
+        if is_main:
+            print(f"  RESUMED from {train_ckpt} at step {start_step}", flush=True)
+    if ddp and batch_source is not None and rank_ckpt and os.path.exists(rank_ckpt):
+        rst = torch.load(rank_ckpt, map_location=torch_device, weights_only=False)
+        batch_source.load_state_dict(rst['gpu_rng'])
+        print(f"  rank {rank}: resumed its batch-source stream from {rank_ckpt}", flush=True)
+
+    # Eval/inspection always run against the raw model, never the DDP
+    # wrapper (no backward is ever called during eval, so no DDP sync
+    # machinery is needed) -- for the non-ddp path this is unchanged
+    # from before (model_c is model itself, or the compiled wrapper).
+    eval_model = model if ddp else model_c
 
     init_ppl = _oom_backstop(
-        lambda b: compute_perplexity(model_c, test_short[:200], max_len, b, device),
-        32, device)
-    print(f"  Initial per-token perplexity: {init_ppl:.2f} (chance ~ {actual_vocab_size}; "
-          f"if this is >> chance, STOP - init is broken)", flush=True)
+        lambda b: compute_perplexity(eval_model, test_short[:200], max_len, b, device),
+        32, device) if is_main else None
+    if is_main:
+        print(f"  Initial per-token perplexity: {init_ppl:.2f} (chance ~ {actual_vocab_size}; "
+              f"if this is >> chance, STOP - init is broken)", flush=True)
 
     t0 = time.time()
     for step in range(start_step, steps):
@@ -642,8 +738,22 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
                 # layers' head computed on aux_frac of positions only.
                 all_logits, states = model_c(
                     token_ids, lengths, return_states=True, head_last_only=True)
+                # train_lm_loss calls apply_head(), a custom method, not
+                # forward() -- DDP's wrapper only proxies forward()/
+                # __call__, so model_c.apply_head AttributeErrors under
+                # ddp (caught by the selftest). Use the raw `model` only
+                # in that case; model and the module inside model_c are
+                # the same underlying object, so gradients through
+                # apply_head's params are still tracked by DDP's
+                # reducer hooks regardless of which reference invokes
+                # this op (same reasoning already applied to
+                # msup_loss(model, ...) above). Left as model_c (not
+                # touched) for the non-ddp path, where model_c may be a
+                # torch.compile wrapper and this call site's compiled-
+                # graph behavior is untouched/unverified by this change.
+                head_model = model if ddp else model_c
                 loss, _, _ = train_lm_loss(
-                    model_c, states, token_ids, lengths,
+                    head_model, states, token_ids, lengths,
                     aux_frac=aux_frac, final_logits=all_logits[0])
 
         opt.zero_grad()
@@ -658,7 +768,7 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
 
-        if step % 200 == 0 or step == steps - 1:
+        if is_main and (step % 200 == 0 or step == steps - 1):
             elapsed = time.time() - t0
             done = step - start_step + 1
             cur_txt = f"  T_cur {t_cur}" if t_cur is not None else ""
@@ -666,33 +776,51 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
                   f"({elapsed:.1f}s, {elapsed/done:.2f}s/step){cur_txt}", flush=True)
 
         if save_every and step > 0 and step % save_every == 0:
-            torch.save({
-                'model': model.state_dict(), 'opt': opt.state_dict(),
-                'step': step, 'tag': tag,
-                'py_rng': random.getstate(), 'np_rng': np.random.get_state(),
-                'torch_rng': torch.get_rng_state(),
-                'cuda_rng': (torch.cuda.get_rng_state()
-                             if device == 'cuda' else None),
-                'gpu_rng': (batch_source.state_dict()
-                            if batch_source is not None else None),
-            }, train_ckpt)
-            print(f"    checkpoint -> {train_ckpt}", flush=True)
+            if is_main:
+                torch.save({
+                    'model': model.state_dict(), 'opt': opt.state_dict(),
+                    'step': step, 'tag': tag,
+                    'py_rng': random.getstate(), 'np_rng': np.random.get_state(),
+                    'torch_rng': torch.get_rng_state(),
+                    'cuda_rng': (torch.cuda.get_rng_state()
+                                 if device == 'cuda' else None),
+                    'gpu_rng': (batch_source.state_dict()
+                                if (batch_source is not None and not ddp) else None),
+                }, train_ckpt)
+                print(f"    checkpoint -> {train_ckpt}", flush=True)
+            if ddp and batch_source is not None:
+                # Every rank's own stream state, not just rank 0's --
+                # see the resume block above for why.
+                torch.save({'gpu_rng': batch_source.state_dict()}, rank_ckpt)
 
-        if step % 1000 == 0 and step > 0:
+        if is_main and step % 1000 == 0 and step > 0:
             ppl = _oom_backstop(
-                lambda b: compute_perplexity(model_c, test_short[:200], max_len, b, device),
+                lambda b: compute_perplexity(eval_model, test_short[:200], max_len, b, device),
                 _eval_batch(32, max_len), device)
             print(f"    per-token perplexity: {ppl:.2f}", flush=True)
 
-    print(f"\n=== Final Evaluation ===", flush=True)
-    ppl_1k = _oom_backstop(
-        lambda b: compute_perplexity(model_c, test_short[:1000], max_len, b, device),
-        _eval_batch(32, max_len), device)
-    ppl = _oom_backstop(
-        lambda b: compute_perplexity(model_c, test_short[:5000], max_len, b, device),
-        _eval_batch(32, max_len), device)
-    print(f"  In-length per-token PPL (<= {max_len}): {ppl:.2f} on 5k test sentences", flush=True)
-    print(f"  (legacy 1k-sentence eval for comparison with older runs: {ppl_1k:.2f})", flush=True)
+    if is_main:
+        print(f"\n=== Final Evaluation ===", flush=True)
+        ppl_1k = _oom_backstop(
+            lambda b: compute_perplexity(eval_model, test_short[:1000], max_len, b, device),
+            _eval_batch(32, max_len), device)
+        ppl = _oom_backstop(
+            lambda b: compute_perplexity(eval_model, test_short[:5000], max_len, b, device),
+            _eval_batch(32, max_len), device)
+        print(f"  In-length per-token PPL (<= {max_len}): {ppl:.2f} on 5k test sentences", flush=True)
+        print(f"  (legacy 1k-sentence eval for comparison with older runs: {ppl_1k:.2f})", flush=True)
+
+    if not is_main:
+        # All further code (extrapolation eval, tree inspection, RMT
+        # diagnostic, final checkpoint, results.jsonl) is rank-0-only --
+        # none of it calls model_c or any dist.* collective, so no
+        # further cross-rank synchronization is needed; each rank just
+        # tears down its own process group independently and exits.
+        if ddp:
+            import torch.distributed as dist
+            dist.destroy_process_group()
+        return None
+
     print(f"  NOTE: single-run differences under ~1.5 PPL are within seed+eval noise.", flush=True)
 
     print(f"\n=== Length Extrapolation (train <= {max_len}) ===", flush=True)
@@ -761,5 +889,8 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
     with open(results_path, 'a') as f:
         f.write(json.dumps(results) + '\n')
     print(f"Saved to {results_path}", flush=True)
+    if ddp:
+        import torch.distributed as dist
+        dist.destroy_process_group()
     return results
 

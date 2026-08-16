@@ -18,6 +18,11 @@ Usage:
   python prepare_fineweb.py --smoke
   python prepare_fineweb.py --tokenizer opera-chat/tokenizer.json \
       --out data_fineweb.pkl --max-tokens 500000000
+
+  # optional SmolLM2-style mix (all three expose a "text" field, so the
+  # tokenize/chunk loop below is unchanged either way):
+  python prepare_fineweb.py --mix fineweb,finemath,stackedu \
+      --mix-weights 0.85,0.10,0.05 --max-tokens 500000000
 """
 import argparse
 import pickle
@@ -36,6 +41,18 @@ def main():
     p.add_argument("--out", default="data_fineweb.pkl")
     p.add_argument("--fw-config", default="sample-10BT",
                    help="HuggingFaceFW/fineweb-edu config name")
+    p.add_argument("--mix", default=None,
+                   help="comma-separated source names to interleave "
+                        "instead of plain FineWeb-Edu, e.g. "
+                        "'fineweb,finemath,stackedu' (choices: fineweb, "
+                        "finemath, stackedu)")
+    p.add_argument("--mix-weights", default=None,
+                   help="comma-separated sampling weights matching "
+                        "--mix, e.g. '0.85,0.10,0.05' (default: equal)")
+    p.add_argument("--finemath-config", default="finemath-3plus",
+                   help="HuggingFaceTB/finemath config name")
+    p.add_argument("--stackedu-lang", default="Python",
+                   help="HuggingFaceTB/stack-edu language config")
     p.add_argument("--max-tokens", type=int, default=500_000_000,
                    help="stop after streaming ~this many BPE tokens "
                         "(500M is a deliberately modest default for a "
@@ -53,8 +70,37 @@ def main():
 
     from datasets import load_dataset
     from opera_lm.data import doc_chunks
-    ds = load_dataset("HuggingFaceFW/fineweb-edu", name=a.fw_config,
-                      split="train", streaming=True)
+
+    if a.mix:
+        from datasets import interleave_datasets
+        sources = [s.strip() for s in a.mix.split(",")]
+        weights = ([float(w) for w in a.mix_weights.split(",")]
+                   if a.mix_weights else [1.0 / len(sources)] * len(sources))
+        assert len(sources) == len(weights), \
+            "--mix and --mix-weights must have the same length"
+        # all three expose a "text" field, so the tokenize/chunk loop
+        # below needs no per-source special-casing
+        source_loaders = {
+            "fineweb": lambda: load_dataset(
+                "HuggingFaceFW/fineweb-edu", name=a.fw_config,
+                split="train", streaming=True),
+            "finemath": lambda: load_dataset(
+                "HuggingFaceTB/finemath", name=a.finemath_config,
+                split="train", streaming=True),
+            "stackedu": lambda: load_dataset(
+                "HuggingFaceTB/stack-edu", name=a.stackedu_lang,
+                split="train", streaming=True),
+        }
+        unknown = set(sources) - set(source_loaders)
+        assert not unknown, \
+            f"unknown --mix source(s) {unknown}, choose from {list(source_loaders)}"
+        ds = interleave_datasets([source_loaders[s]() for s in sources],
+                                 probabilities=weights, seed=42,
+                                 stopping_strategy="all_exhausted")
+        print(f"  mixing: {dict(zip(sources, weights))}", flush=True)
+    else:
+        ds = load_dataset("HuggingFaceFW/fineweb-edu", name=a.fw_config,
+                          split="train", streaming=True)
 
     rng = random.Random(42)
     cap = a.eval_max_len

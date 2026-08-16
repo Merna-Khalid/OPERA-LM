@@ -66,13 +66,13 @@ demo = gr.ChatInterface(
     ],
     # gradio >= 6: ChatInterface is messages-native (the `type` kwarg was
     # removed); history arrives as {"role","content"} dicts.
-    title="OPERA-LM Chat",
-    description=(
+    title=os.environ.get("MODEL_TITLE", "OPERA-LM Chat"),
+    description=os.environ.get("MODEL_DESC", (
         "Research prototype: a ~150M-parameter geometric language model "
         "(spinor Fenwick tree, NO positional encodings -- position is "
         "structure), trained from scratch on the full smoltalk corpus. "
         "Expect toy-quality replies and slow-ish CPU generation. "
-        "Model: https://github.com/Merna-Khalid/OPERA-LM"),
+        "Model: https://github.com/Merna-Khalid/OPERA-LM")),
 )
 
 if __name__ == "__main__":

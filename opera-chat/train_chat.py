@@ -70,6 +70,15 @@ def main():
                    help="load an existing checkpoint's weights before "
                         "training (short fine-tune phases, e.g. state "
                         "passing); independent of --resume")
+    p.add_argument("--ddp", action="store_true",
+                   help="multi-GPU data parallelism (e.g. Kaggle's 2xT4). "
+                        "--batch is PER-GPU. Launch with torchrun, not "
+                        "plain python: `torchrun --nproc_per_node=2 "
+                        "train_chat.py --ddp --device cuda ...`. Forces "
+                        "--compile off (see opera_lm.train.train's "
+                        "docstring note); verified on CPU/gloo via "
+                        "opera_lm.selftest, not yet on real multi-GPU "
+                        "hardware -- report back what breaks.")
     a = p.parse_args()
 
     with open(a.data, "rb") as f:
@@ -105,13 +114,23 @@ def main():
         data=(train_data, test_short, test_long, vocab_size),
         idx2word=None, optimizer=a.optimizer, muon_lr=a.muon_lr,
         readout_mode=a.readout, mem_mode=a.mem, mem_dim=a.mem_dim,
-        use_metal=a.metal, init_weights_from=a.init_weights_from)
+        use_metal=a.metal, init_weights_from=a.init_weights_from,
+        ddp=a.ddp)
+
+    # Under --ddp, train() returns None on every rank except 0 (see its
+    # docstring note); only rank 0 does the post-training packaging
+    # below, matching train()'s own rank-gating so ranks >0 don't race
+    # rank 0 to write the same files.
+    if a.ddp and int(os.environ.get("RANK", "0")) != 0:
+        return
 
     # The final checkpoint is a raw state_dict; train()'s tag is derived
     # from its kwargs, so glob for the newest non-resume .pt instead of
-    # reconstructing the filename.
+    # reconstructing the filename (rank-tagged _train_ckpt_rankN.pt
+    # files from --ddp are also excluded by the same suffix check).
     finals = [f for f in glob.glob(os.path.join(a.out_dir, "*.pt"))
-              if not f.endswith("_train_ckpt.pt")]
+              if not f.endswith("_train_ckpt.pt")
+              and "_train_ckpt_rank" not in f]
     assert finals, f"no final .pt found in {a.out_dir}"
     ckpt = max(finals, key=os.path.getmtime)
     cfg = {"vocab_size": vocab_size, "d": a.d, "nb": a.nb,
