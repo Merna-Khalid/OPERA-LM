@@ -62,6 +62,15 @@ def main():
     p.add_argument("--compile", default="default",
                    choices=["default", "reduce-overhead", "max-autotune",
                             "off"])
+    p.add_argument("--grad-checkpoint", default="", choices=["", "level", "layer"],
+                   help="activation checkpointing to trade compute for "
+                        "memory (~25-35%% slower steps): 'level' wraps "
+                        "each compose node, 'layer' wraps each whole "
+                        "layer (cheaper but incompatible with msup / "
+                        "--no-msup is required for 'layer'). Use 'level' "
+                        "if a curriculum stage OOMs (activation memory "
+                        "grows with --curriculum's T_cur, not just "
+                        "--max-len).")
     p.add_argument("--metal", action="store_true",
                    help="fused Metal kernels for the compose node "
                         "(Apple Silicon; now supports rot_mode='free', "
@@ -115,7 +124,7 @@ def main():
         idx2word=None, optimizer=a.optimizer, muon_lr=a.muon_lr,
         readout_mode=a.readout, mem_mode=a.mem, mem_dim=a.mem_dim,
         use_metal=a.metal, init_weights_from=a.init_weights_from,
-        ddp=a.ddp)
+        ddp=a.ddp, grad_checkpoint=a.grad_checkpoint)
 
     # Under --ddp, train() returns None on every rank except 0 (see its
     # docstring note); only rank 0 does the post-training packaging
