@@ -253,6 +253,7 @@ class OperaSpinorFenwickTree(nn.Module):
                  fold_mode='left', fold_rotors='shared', fold_scale=False,
                  norm_mode='layer', act_mode='tanh', node_residual=False,
                  tree_drop=0.0, grad_checkpoint='', use_metal=False,
+                 use_triton=False,
                  rot_mode='so3', oam_k=4, oam_charges='auto',
                  oam_phi=0.7853981633974483, oam_shared_gate=False,
                  oam_combine='compose', oam_pair='seq', rack_exitnorm=False,
@@ -285,6 +286,8 @@ class OperaSpinorFenwickTree(nn.Module):
             assert lock_mode == 'none', "--fold scan builds no tree nodes"
             assert not use_metal, \
                 "--fold scan is eager-only (no MSL kernel); drop --metal"
+            assert not use_triton, \
+                "--fold scan is eager-only (no Triton kernel); drop --triton"
             assert fold_rotors == 'shared' and not fold_scale, \
                 "--fold-rotors/--fold-scale tune the Fenwick fold, not the scan"
             assert not node_residual and tree_drop == 0.0, \
@@ -300,12 +303,16 @@ class OperaSpinorFenwickTree(nn.Module):
         assert fold_rotors in ('shared', 'separate')
         assert norm_mode in ('layer', 'blockrms', 'rms')
         assert act_mode in ('tanh', 'linear')
+        assert not (use_metal and use_triton), \
+            "--metal and --triton are alternative kernel backends (Apple " \
+            "Silicon vs CUDA); pass at most one"
         self.norm_mode = norm_mode
         self.act_mode = act_mode
         self.node_residual = node_residual
         self.tree_drop = tree_drop
         self.grad_checkpoint = grad_checkpoint
         self.use_metal = use_metal
+        self.use_triton = use_triton
         if use_metal:
             # FusedNode.backward recomputes fv from the saved inputs
             # (metal_kernel.py) rather than recovering it via R_O^{-1},
@@ -316,6 +323,15 @@ class OperaSpinorFenwickTree(nn.Module):
                 print("WARNING: --metal requested but torch.mps.compile_shader"
                       " unavailable; using the (identical-math) fallback.",
                       flush=True)
+        if use_triton:
+            # Same no-inversion backward strategy as FusedNode, ported to
+            # Triton for CUDA -- see triton_kernel.py's module docstring
+            # for the Versor (arXiv:2602.10195) kernel-strategy credit.
+            from .triton_kernel import triton_available
+            if not triton_available():
+                print("WARNING: --triton requested but no CUDA device / "
+                      "triton install found; using the (identical-math) "
+                      "fallback.", flush=True)
         self.pe_mode = pe_mode
         self.fold_mode = fold_mode
         self.fold_rotors = fold_rotors
@@ -926,13 +942,19 @@ class OperaSpinorFenwickTree(nn.Module):
 
         hl = h_left.reshape(N, nb, 4)
         hr = h_right.reshape(N, nb, 4)
-        if self.use_metal and self.lock_mode == 'none':
+        if (self.use_metal or self.use_triton) and self.lock_mode == 'none':
             # KERNEL V2: entire node pre-norm in ONE kernel (rotations +
             # geometric product + gated combine + output rotation).
             # Eager keeps only the gate matmul and the norm. The
             # diagnostic lock is SKIPPED here (~8 elementwise passes of
             # pure overhead per node) except during tree inspection.
-            from .metal_kernel import fused_node
+            # use_triton (CUDA) and use_metal (Apple Silicon) share this
+            # branch: same math, same autograd.Function contract, just a
+            # different fused kernel underneath -- see triton_kernel.py.
+            if self.use_triton:
+                from .triton_kernel import fused_node_triton as fused_node
+            else:
+                from .metal_kernel import fused_node
             W = self.fusion_gate[layer_idx].weight
             b = gb
             g = (F.linear(h_left, W[:, :self.d]) +
@@ -959,7 +981,10 @@ class OperaSpinorFenwickTree(nn.Module):
                 rms = torch.sqrt((pb * pb).mean(-1, keepdim=True) + 1e-6)
                 parent = (pb / rms * self.block_gain[layer_idx][None, :, None]).reshape(N, -1)
             if self.act_mode == 'tanh':
-                from .metal_kernel import fused_act
+                if self.use_triton:
+                    from .triton_kernel import fused_act_triton as fused_act
+                else:
+                    from .metal_kernel import fused_act
                 parent = fused_act(parent)
             if self.res_logit is not None:
                 r = torch.sigmoid(self.res_logit[layer_idx])

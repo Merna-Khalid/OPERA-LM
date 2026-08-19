@@ -318,7 +318,7 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
           msup_weight=0.1, pe_mode='sin', fold_mode='left',
           fold_rotors='shared', fold_scale=False,
           norm_mode='layer', act_mode='tanh', node_residual=False,
-          tree_drop=0.0, grad_checkpoint='', use_metal=False,
+          tree_drop=0.0, grad_checkpoint='', use_metal=False, use_triton=False,
           use_amp=True, use_foreach=True, rot_mode='so3', seed=42,
           data_mode='sentences', docs_limit=100000, out_dir='.',
           save_every=0, resume=False,
@@ -386,6 +386,7 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
     if tree_drop > 0: tag.append(f'tdrop{tree_drop}')
     if grad_checkpoint: tag.append(f'ckpt-{grad_checkpoint}')
     if use_metal: tag.append('metal')
+    if use_triton: tag.append('triton')
     if use_amp: tag.append('amp')
     if use_foreach: tag.append('foreach')
     if compile_mode != 'off': tag.append(f'cmp-{compile_mode}')
@@ -478,7 +479,7 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
                                    node_residual=node_residual,
                                    tree_drop=tree_drop,
                                    grad_checkpoint=grad_checkpoint,
-                                   use_metal=use_metal,
+                                   use_metal=use_metal, use_triton=use_triton,
                                    rot_mode=rot_mode, oam_k=oam_k,
                                    oam_charges=oam_charges, oam_phi=oam_phi,
                                    oam_shared_gate=oam_shared_gate,

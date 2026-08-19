@@ -75,6 +75,14 @@ def main():
                    help="fused Metal kernels for the compose node "
                         "(Apple Silicon; now supports rot_mode='free', "
                         "not just 'so3')")
+    p.add_argument("--triton", action="store_true",
+                   help="fused Triton kernel for the compose node (CUDA; "
+                        "same math/contract as --metal, ported from it -- "
+                        "see opera_lm/triton_kernel.py). Requires a CUDA "
+                        "device and `triton` installed; run "
+                        "`python3 -m opera_lm.triton_kernel --test` on "
+                        "the target GPU before a real training run, since "
+                        "this path has not been hardware-verified.")
     p.add_argument("--init-weights-from", default=None,
                    help="load an existing checkpoint's weights before "
                         "training (short fine-tune phases, e.g. state "
@@ -123,7 +131,7 @@ def main():
         data=(train_data, test_short, test_long, vocab_size),
         idx2word=None, optimizer=a.optimizer, muon_lr=a.muon_lr,
         readout_mode=a.readout, mem_mode=a.mem, mem_dim=a.mem_dim,
-        use_metal=a.metal, init_weights_from=a.init_weights_from,
+        use_metal=a.metal, use_triton=a.triton, init_weights_from=a.init_weights_from,
         ddp=a.ddp, grad_checkpoint=a.grad_checkpoint)
 
     # Under --ddp, train() returns None on every rank except 0 (see its
