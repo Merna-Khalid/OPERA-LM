@@ -95,7 +95,7 @@ def generate_stream(model, tok, history, n_tokens=100, temp=0.8, top_p=0.9,
             ctx = out[-max_ctx:]
             t = torch.tensor([ctx], dtype=torch.long, device=device)
             lens = torch.tensor([len(ctx)], device=device)
-            logits = model(t, lens, head_last_only=True)[-1][0, len(ctx) - 1]
+            logits = model(t, lens, head_last_only=True).logits[-1][0, len(ctx) - 1]
             nxt = _sample(logits, temp, top_p, top_k)
             if nxt == end_id:
                 break
@@ -168,7 +168,7 @@ def selftest():
                 ctx = out[-max_ctx:]
                 t = torch.tensor([ctx], dtype=torch.long)
                 lens = torch.tensor([len(ctx)])
-                lg = model(t, lens, head_last_only=True)[-1][0, len(ctx) - 1]
+                lg = model(t, lens, head_last_only=True).logits[-1][0, len(ctx) - 1]
                 nxt = _sample(lg, 0.8, 0.9, 0)
                 if nxt == dec_end:
                     break

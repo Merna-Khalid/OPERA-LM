@@ -1,6 +1,21 @@
 """Self-test suite (no data download needed).
 
-Run: python -m opera_lm.selftest
+Run: python -m opera_lm.selftest       # sequential, aborts with a traceback
+                                        # on the first failing arm; ends with
+                                        # "ALL PASS"
+     pytest tests/test_selftest.py     # each arm is an independent pytest
+                                        # test: a failure in one does not
+                                        # prevent the others from running,
+                                        # and a single arm can be selected
+                                        # with -k or ::test_name
+
+Each test_* function below is one self-contained "arm" (own seeds, own
+models, own data) so it can run standalone, in any order, under pytest.
+`torch.manual_seed(0)` is the first line of every arm: sections that reseed
+internally (most of them, to pair same-seed models for identity/parity
+checks) immediately override it, so it's a no-op there; sections that don't
+reseed get the same reproducible starting state the original single
+`selftest()` function gave them when it seeded once at the top.
 """
 import random
 import math
@@ -19,14 +34,12 @@ from .incremental import OperaDecoder, fenwick_blocks_of
 from .muon import Muon, zeropower_via_newtonschulz5, split_muon_params
 
 # ============================================================================
-# SELF-TEST
+# SELF-TEST -- one function per arm
 # ============================================================================
 
-def selftest():
+def test_scan_fold():
+    # SCAN FOLD (OPERA-Scan arm, v8.5; design: OPERA_Scan_Arm_Design.md)
     torch.manual_seed(0)
-    print("=== v8.0 self-test (r19) ===")
-
-    # -5. SCAN FOLD (OPERA-Scan arm, v8.5; design: OPERA_Scan_Arm_Design.md)
     # (a) ASSOCIATIVITY of the affine compose: exact semidirect
     #     (Euclidean-group) product, verified to float tolerance on random
     #     UNNORMALIZED states (q carried unnormalized through the scan)
@@ -70,7 +83,7 @@ def selftest():
                                   pe_mode='none', fold_mode='scan')
     tok = torch.randint(1, 101, (3, 29))
     lens = torch.tensor([29, 14, 5])
-    loss, _, _ = lm_loss(m_sc(tok, lens), tok, lens)
+    loss, _, _ = lm_loss(m_sc(tok, lens).logits, tok, lens)
     loss.backward()
     assert torch.isfinite(loss)
     gw = m_sc.scan_wq[0].weight.grad.abs().sum().item()
@@ -83,9 +96,9 @@ def selftest():
     tok = torch.randint(1, 101, (1, 12))
     lens = torch.tensor([12])
     with torch.no_grad():
-        a1 = m_sc(tok, lens)[-1][0, :8].clone()
+        a1 = m_sc(tok, lens).logits[-1][0, :8].clone()
         tok2 = tok.clone(); tok2[0, 10] = (tok2[0, 10] + 5) % 100 + 1
-        b1 = m_sc(tok2, lens)[-1][0, :8]
+        b1 = m_sc(tok2, lens).logits[-1][0, :8]
     cerr = (a1 - b1).abs().max().item()
     print(f"  scan causality err: {cerr:.2e}")
     assert cerr < 1e-5
@@ -132,7 +145,7 @@ def selftest():
     losses = []
     for _ in range(5):
         opt.zero_grad()
-        ls, _, _ = lm_loss(m_sm(tok, lens), tok, lens)
+        ls, _, _ = lm_loss(m_sm(tok, lens).logits, tok, lens)
         ls.backward()
         opt.step()
         losses.append(ls.item())
@@ -207,7 +220,7 @@ def selftest():
     tok = torch.randint(1, 101, (2, 12))
     lens = torch.tensor([12, 7])
     with torch.no_grad():
-        id_err = (m_off(tok, lens)[-1] - m_on(tok, lens)[-1]).abs().max().item()
+        id_err = (m_off(tok, lens).logits[-1] - m_on(tok, lens).logits[-1]).abs().max().item()
     print(f"  salience: identity-at-init err {id_err:.2e} (zero-init FiLM)")
     assert id_err == 0.0
     # (ii) param delta: +L*(d*r + r + r*2d + 2d) with r = 64
@@ -243,10 +256,10 @@ def selftest():
     tok = torch.randint(1, 101, (1, 12))
     lens = torch.tensor([12])
     with torch.no_grad():
-        moved = (m_sc2(tok, lens)[-1] - m_z(tok, lens)[-1]).abs().max().item()
-        a2 = m_sc2(tok, lens)[-1][0, :8].clone()
+        moved = (m_sc2(tok, lens).logits[-1] - m_z(tok, lens).logits[-1]).abs().max().item()
+        a2 = m_sc2(tok, lens).logits[-1][0, :8].clone()
         tok2 = tok.clone(); tok2[0, 10] = (tok2[0, 10] + 5) % 100 + 1
-        b2 = m_sc2(tok2, lens)[-1][0, :8]
+        b2 = m_sc2(tok2, lens).logits[-1][0, :8]
     scerr = (a2 - b2).abs().max().item()
     print(f"  salience: randomized FiLM moves output by {moved:.2e} (>0), "
           f"causality err {scerr:.2e}")
@@ -261,7 +274,7 @@ def selftest():
     losses = []
     for _ in range(5):
         opt.zero_grad()
-        ls, _, _ = lm_loss(m_ss(tok, lens), tok, lens)
+        ls, _, _ = lm_loss(m_ss(tok, lens).logits, tok, lens)
         ls.backward()
         opt.step()
         losses.append(ls.item())
@@ -284,7 +297,7 @@ def selftest():
     tok = torch.randint(1, 101, (2, 12))
     lens = torch.tensor([12, 7])
     with torch.no_grad():
-        wid_err = (m_w0(tok, lens)[-1] - m_w1(tok, lens)[-1]).abs().max().item()
+        wid_err = (m_w0(tok, lens).logits[-1] - m_w1(tok, lens).logits[-1]).abs().max().item()
     print(f"  workspace: identity-at-init err {wid_err:.2e} (zero-init gate)")
     assert wid_err == 0.0
     # (c) PARAM DELTA: per layer K*d + 6*(d*dk) + d with K=4, dk=64
@@ -329,10 +342,10 @@ def selftest():
     tok = torch.randint(1, 101, (1, 128))
     lens = torch.tensor([128])
     with torch.no_grad():
-        moved = (m_wc(tok, lens)[-1] - m_wz(tok, lens)[-1]).abs().max().item()
-        ref = m_wc(tok, lens)[-1][0].clone()
+        moved = (m_wc(tok, lens).logits[-1] - m_wz(tok, lens).logits[-1]).abs().max().item()
+        ref = m_wc(tok, lens).logits[-1][0].clone()
         tok2 = tok.clone(); tok2[0, 101] = (tok2[0, 101] + 5) % 100 + 1
-        pert = m_wc(tok2, lens)[-1][0]
+        pert = m_wc(tok2, lens).logits[-1][0]
     werr_global = (ref[:101] - pert[:101]).abs().max().item()
     werr_chunk = (ref[:96] - pert[:96]).abs().max().item()
     post = (ref[101:] - pert[101:]).abs().max().item()
@@ -354,7 +367,7 @@ def selftest():
     losses = []
     for _ in range(5):
         opt.zero_grad()
-        ls, _, _ = lm_loss(m_wt(tok, lens), tok, lens)
+        ls, _, _ = lm_loss(m_wt(tok, lens).logits, tok, lens)
         ls.backward()
         opt.step()
         losses.append(ls.item())
@@ -375,15 +388,18 @@ def selftest():
         tok_m = tok.to('mps')
         lens_m = lens.to('mps')
         with torch.no_grad():
-            e_ref = m_cp(tok_m, lens_m)[-1]
-            e_cmp = m_cc(tok_m, lens_m)[-1]
+            e_ref = m_cp(tok_m, lens_m).logits[-1]
+            e_cmp = m_cc(tok_m, lens_m).logits[-1]
         cerr = (e_ref - e_cmp).abs().max().item()
         print(f"  workspace torch.compile (MPS): fwd err {cerr:.2e}")
         assert cerr < 1e-5
         del m_cp, m_cc
         torch.mps.empty_cache()
 
-    # -4. SPINE READOUT (r19)
+
+def test_spine_readout():
+    # SPINE READOUT (r19)
+    torch.manual_seed(0)
     # (a) single-block positions bypass -> identical to left (params
     #     created last: shared RNG stream; num_layers=1)
     torch.manual_seed(17)
@@ -396,8 +412,8 @@ def selftest():
     tok = torch.randint(1, 101, (2, 8))
     lens = torch.full((2,), 8)
     with torch.no_grad():
-        ll3 = m_l3(tok, lens)[-1]
-        ls3 = m_s(tok, lens)[-1]
+        ll3 = m_l3(tok, lens).logits[-1]
+        ls3 = m_s(tok, lens).logits[-1]
     sp_pos = [0, 1, 3, 7]; mp_pos = [2, 4, 5, 6]
     e1 = (ll3[:, sp_pos] - ls3[:, sp_pos]).abs().max().item()
     e2 = (ll3[:, mp_pos] - ls3[:, mp_pos]).abs().max().item()
@@ -414,7 +430,7 @@ def selftest():
                                   pe_mode='none', fold_mode='spine')
     tok = torch.randint(1, 101, (3, 29))
     lens = torch.tensor([29, 14, 5])
-    loss, _, _ = lm_loss(m_s2(tok, lens), tok, lens)
+    loss, _, _ = lm_loss(m_s2(tok, lens).logits, tok, lens)
     loss.backward()
     assert torch.isfinite(loss)
     gq = m_s2.spine_q.grad.abs().sum().item()
@@ -427,9 +443,9 @@ def selftest():
     tok = torch.randint(1, 101, (1, 12))
     lens = torch.tensor([12])
     with torch.no_grad():
-        a2 = m_s2(tok, lens)[-1][0, :8].clone()
+        a2 = m_s2(tok, lens).logits[-1][0, :8].clone()
         tok2 = tok.clone(); tok2[0, 10] = (tok2[0, 10] + 5) % 100 + 1
-        b2 = m_s2(tok2, lens)[-1][0, :8]
+        b2 = m_s2(tok2, lens).logits[-1][0, :8]
     cerr2 = (a2 - b2).abs().max().item()
     print(f"  spine causality err: {cerr2:.2e}")
     assert cerr2 < 1e-5
@@ -437,12 +453,15 @@ def selftest():
     m_s3 = OperaSpinorFenwickTree(vocab_size=101, d=64, nb=16, num_layers=2,
                                   pe_mode='none', fold_mode='spine',
                                   rot_mode='free')
-    loss, _, _ = lm_loss(m_s3(tok, lens), tok, lens)
+    loss, _, _ = lm_loss(m_s3(tok, lens).logits, tok, lens)
     loss.backward()
     assert torch.isfinite(loss)
     print(f"  spine + rotfree: loss {loss.item():.3f}, OK")
 
-    # -3. RACK FOLD (r17)
+
+def test_rack_fold():
+    # RACK FOLD (r17)
+    torch.manual_seed(0)
     # (a) the fold's core operation satisfies the RACK AXIOM numerically:
     #     with x ▷ y := ŷ x ŷ⁻¹, check (x▷y)▷z == (x▷z)▷(y▷z)
     x = torch.randn(64, 4); y = torch.randn(64, 4); z = torch.randn(64, 4)
@@ -475,8 +494,8 @@ def selftest():
     tok = torch.randint(1, 101, (2, 8))
     lens = torch.full((2,), 8)
     with torch.no_grad():
-        ll2 = m_l2(tok, lens)[-1]
-        lr2 = m_r(tok, lens)[-1]
+        ll2 = m_l2(tok, lens).logits[-1]
+        lr2 = m_r(tok, lens).logits[-1]
     sp = [0, 1, 3, 7]; mp = [2, 4, 5, 6]
     e1 = (ll2[:, sp] - lr2[:, sp]).abs().max().item()
     e2 = (ll2[:, mp] - lr2[:, mp]).abs().max().item()
@@ -506,7 +525,7 @@ def selftest():
                                   pe_mode='none', fold_mode='rack')
     tok = torch.randint(1, 101, (3, 29))
     lens = torch.tensor([29, 14, 5])
-    loss, _, _ = lm_loss(m_r2(tok, lens), tok, lens)
+    loss, _, _ = lm_loss(m_r2(tok, lens).logits, tok, lens)
     loss.backward()
     assert torch.isfinite(loss)
     gg = sum(p.grad.abs().sum().item() for p in m_r2.rack_gate.parameters())
@@ -516,14 +535,17 @@ def selftest():
     tok = torch.randint(1, 101, (1, 12))
     lens = torch.tensor([12])
     with torch.no_grad():
-        a1 = m_r2(tok, lens)[-1][0, :8].clone()
+        a1 = m_r2(tok, lens).logits[-1][0, :8].clone()
         tok2 = tok.clone(); tok2[0, 10] = (tok2[0, 10] + 5) % 100 + 1
-        b1 = m_r2(tok2, lens)[-1][0, :8]
+        b1 = m_r2(tok2, lens).logits[-1][0, :8]
     cerr = (a1 - b1).abs().max().item()
     print(f"  rack causality err: {cerr:.2e}")
     assert cerr < 1e-5
 
-    # -2.7 RACK EXIT-NORM (r18)
+
+def test_rack_exitnorm():
+    # RACK EXIT-NORM (r18)
+    torch.manual_seed(0)
     # (a) single-block positions STILL bypass -> identical to left (the
     #     exit norm applies to folded positions only); multi-block
     #     positions differ from plain rack (the norm did something)
@@ -541,9 +563,9 @@ def selftest():
     tok = torch.randint(1, 101, (2, 8))
     lens = torch.full((2,), 8)
     with torch.no_grad():
-        ll4 = m_l4(tok, lens)[-1]
-        lre = m_re(tok, lens)[-1]
-        lr0 = m_r0(tok, lens)[-1]
+        ll4 = m_l4(tok, lens).logits[-1]
+        lre = m_re(tok, lens).logits[-1]
+        lr0 = m_r0(tok, lens).logits[-1]
     sp = [0, 1, 3, 7]; mp = [2, 4, 5, 6]
     e1 = (ll4[:, sp] - lre[:, sp]).abs().max().item()
     e2 = (lr0[:, mp] - lre[:, mp]).abs().max().item()
@@ -566,7 +588,7 @@ def selftest():
                                    rack_exitnorm=True)
     tok = torch.randint(1, 101, (3, 29))
     lens = torch.tensor([29, 14, 5])
-    loss, _, _ = lm_loss(m_re2(tok, lens), tok, lens)
+    loss, _, _ = lm_loss(m_re2(tok, lens).logits, tok, lens)
     loss.backward()
     assert torch.isfinite(loss)
     gn = sum(p.grad.abs().sum().item()
@@ -575,7 +597,10 @@ def selftest():
           f"{gn:.3f} (>0)")
     assert gn > 0
 
-    # -2.4 OAM NODE TRANSPORT (v8.2)
+
+def test_oam_node_transport():
+    # OAM NODE TRANSPORT (v8.2)
+    torch.manual_seed(0)
     # (a) k=1, charges '0', transport node is BITWISE --fold left: the
     #     loop is compose(acc, next) with shared node params -- the left
     #     fold itself. Param delta = num_layers (phi only, frozen).
@@ -591,7 +616,7 @@ def selftest():
     tok = torch.randint(1, 101, (2, 12))
     lens = torch.tensor([12, 7])
     with torch.no_grad():
-        d_n1 = (m_lf(tok, lens)[-1] - m_n1(tok, lens)[-1]).abs().max().item()
+        d_n1 = (m_lf(tok, lens).logits[-1] - m_n1(tok, lens).logits[-1]).abs().max().item()
     dp = count_params(m_n1) - count_params(m_lf)
     print(f"  oam-node k=1 chg0 == left err: {d_n1:.2e} "
           f"(param delta +{dp}, expected +2 = phi)")
@@ -608,7 +633,7 @@ def selftest():
                                   oam_phi=0.0, oam_combine='sum')
     m_n2.eval()
     with torch.no_grad():
-        d_n2 = (m_lf(tok, lens)[-1] - m_n2(tok, lens)[-1]).abs().max().item()
+        d_n2 = (m_lf(tok, lens).logits[-1] - m_n2(tok, lens).logits[-1]).abs().max().item()
     print(f"  oam-node k=2 phi0 sum == left err: {d_n2:.2e} "
           f"(identical channels collapse)")
     assert d_n2 < 1e-5
@@ -627,7 +652,7 @@ def selftest():
     assert dp4 == 2
     tok = torch.randint(1, 101, (3, 29))
     lens = torch.tensor([29, 14, 5])
-    loss, _, _ = lm_loss(m_n4(tok, lens), tok, lens)
+    loss, _, _ = lm_loss(m_n4(tok, lens).logits, tok, lens)
     loss.backward()
     assert torch.isfinite(loss)
     gp = m_n4.oam_phi.grad.abs().sum().item()
@@ -637,18 +662,21 @@ def selftest():
     tok = torch.randint(1, 101, (1, 12))
     lens = torch.tensor([12])
     with torch.no_grad():
-        a1 = m_n4(tok, lens)[-1][0, :8].clone()
+        a1 = m_n4(tok, lens).logits[-1][0, :8].clone()
         tok2 = tok.clone(); tok2[0, 10] = (tok2[0, 10] + 5) % 100 + 1
-        b1 = m_n4(tok2, lens)[-1][0, :8]
+        b1 = m_n4(tok2, lens).logits[-1][0, :8]
     cerr = (a1 - b1).abs().max().item()
     print(f"  oam-node causality err: {cerr:.2e}")
     assert cerr < 1e-5
     with torch.no_grad():
-        d_ch = (m_n4(tok, lens)[-1] - m_lf2(tok, lens)[-1]).abs().max().item()
+        d_ch = (m_n4(tok, lens).logits[-1] - m_lf2(tok, lens).logits[-1]).abs().max().item()
     print(f"  oam-node k=4 charge-on vs left diff: {d_ch:.2e} (>0)")
     assert d_ch > 1e-4
 
-    # -2.5 OAM FOLD (v8.1)
+
+def test_oam_fold():
+    # OAM FOLD (v8.1)
+    torch.manual_seed(0)
     # (a) k=1, charges '0' is BITWISE --fold rack (gate draw sequence is
     #     identical; charge rotation skipped entirely when all charges 0)
     torch.manual_seed(17)
@@ -662,8 +690,8 @@ def selftest():
     tok = torch.randint(1, 101, (2, 12))
     lens = torch.tensor([12, 7])
     with torch.no_grad():
-        lr_ = m_rk(tok, lens)[-1]
-        lo_ = m_o1(tok, lens)[-1]
+        lr_ = m_rk(tok, lens).logits[-1]
+        lo_ = m_o1(tok, lens).logits[-1]
     e_rk = (lr_ - lo_).abs().max().item()
     print(f"  oam k=1 chg0 == rack err: {e_rk:.2e} (phi delta "
           f"+{count_params(m_o1) - count_params(m_rk)} params, expected +2)")
@@ -686,9 +714,9 @@ def selftest():
     tok = torch.randint(1, 101, (2, 12))
     lens = torch.full((2,), 12)
     with torch.no_grad():
-        lc = m_oc(tok, lens)[-1]
-        l0 = m_o0(tok, lens)[-1]
-        lp0 = m_op0(tok, lens)[-1]
+        lc = m_oc(tok, lens).logits[-1]
+        l0 = m_o0(tok, lens).logits[-1]
+        lp0 = m_op0(tok, lens).logits[-1]
     d_on = (lc - l0).abs().max().item()
     d_off = (l0 - lp0).abs().max().item()
     print(f"  oam charge: on-vs-off diff {d_on:.2e} (>0), "
@@ -729,7 +757,7 @@ def selftest():
     tok = torch.randint(1, 101, (2, 12))
     lens = torch.full((2,), 12)
     with torch.no_grad():
-        d_pair = (m_ps(tok, lens)[-1] - m_pc(tok, lens)[-1]).abs().max().item()
+        d_pair = (m_ps(tok, lens).logits[-1] - m_pc(tok, lens).logits[-1]).abs().max().item()
     print(f"  oam pair-conj: perm [1,2,0,3] OK, seq-vs-conj diff "
           f"{d_pair:.2e} (>0), state_dict keys unchanged")
     assert d_pair > 1e-5
@@ -754,7 +782,7 @@ def selftest():
                                   pe_mode='none', fold_mode='oam')
     tok = torch.randint(1, 101, (3, 29))
     lens = torch.tensor([29, 14, 5])
-    loss, _, _ = lm_loss(m_o4(tok, lens), tok, lens)
+    loss, _, _ = lm_loss(m_o4(tok, lens).logits, tok, lens)
     loss.backward()
     assert torch.isfinite(loss)
     gg = sum(p.grad.abs().sum().item() for p in m_o4.oam_gate.parameters())
@@ -766,9 +794,9 @@ def selftest():
     tok = torch.randint(1, 101, (1, 12))
     lens = torch.tensor([12])
     with torch.no_grad():
-        a1 = m_o4(tok, lens)[-1][0, :8].clone()
+        a1 = m_o4(tok, lens).logits[-1][0, :8].clone()
         tok2 = tok.clone(); tok2[0, 10] = (tok2[0, 10] + 5) % 100 + 1
-        b1 = m_o4(tok2, lens)[-1][0, :8]
+        b1 = m_o4(tok2, lens).logits[-1][0, :8]
     cerr_o = (a1 - b1).abs().max().item()
     print(f"  oam causality err: {cerr_o:.2e}")
     assert cerr_o < 1e-5
@@ -777,7 +805,7 @@ def selftest():
                                   oam_combine='sum', oam_shared_gate=True)
     tok = torch.randint(1, 101, (2, 33))       # T=33: odd tree, k odd
     lens = torch.tensor([33, 9])
-    loss2, _, _ = lm_loss(m_os(tok, lens), tok, lens)
+    loss2, _, _ = lm_loss(m_os(tok, lens).logits, tok, lens)
     loss2.backward()
     assert torch.isfinite(loss2)
     print(f"  oam k=3 combine=sum shared-gate: loss {loss2.item():.3f}, OK")
@@ -794,7 +822,7 @@ def selftest():
     assert abs(lv0 - 0.0474) < 1e-3, lv0
     tok = torch.randint(1, 101, (2, 17))
     lens = torch.tensor([17, 6])
-    loss3, _, _ = lm_loss(m_lg(tok, lens), tok, lens)
+    loss3, _, _ = lm_loss(m_lg(tok, lens).logits, tok, lens)
     loss3.backward()
     gl = m_lg.oam_level_gate.grad.abs().sum().item()
     ge = m_lg.oam_chan_emb.grad.abs().sum().item()
@@ -812,11 +840,14 @@ def selftest():
     tok = torch.randint(1, 101, (2, 12))
     lens = torch.full((2,), 12)
     with torch.no_grad():
-        e3 = (m_rk3(tok, lens)[-1] - m_o3(tok, lens)[-1]).abs().max().item()
+        e3 = (m_rk3(tok, lens).logits[-1] - m_o3(tok, lens).logits[-1]).abs().max().item()
     print(f"  oam chan-emb zeros at init: k=1 chg0 == rack err {e3:.2e}")
     assert e3 < 1e-6
 
-    # -1. ATTEND READOUT (v8.0)
+
+def test_attend_readout():
+    # ATTEND READOUT (v8.0)
+    torch.manual_seed(0)
     # (a) single-block positions bypass attention -> IDENTICAL to left
     #     fold given same seed (attend params created last: shared RNG
     #     stream). num_layers=1 so layer-2 mixing can't spread diffs.
@@ -831,8 +862,8 @@ def selftest():
     tok = torch.randint(1, 101, (2, T))
     lens = torch.full((2,), T)
     with torch.no_grad():
-        ll = m_left(tok, lens)[-1]
-        la = m_att(tok, lens)[-1]
+        ll = m_left(tok, lens).logits[-1]
+        la = m_att(tok, lens).logits[-1]
     # positions with popcount(L)==1: prefixes of length 1,2,4,8 -> idx 0,1,3,7
     single_pos = [0, 1, 3, 7]
     err_single = (ll[:, single_pos] - la[:, single_pos]).abs().max().item()
@@ -852,7 +883,7 @@ def selftest():
                                 pe_mode='none', fold_mode='attend')
     tok = torch.randint(1, 101, (3, 29))
     lens = torch.tensor([29, 14, 5])
-    loss, _, _ = lm_loss(m2(tok, lens), tok, lens)
+    loss, _, _ = lm_loss(m2(tok, lens).logits, tok, lens)
     loss.backward()
     assert torch.isfinite(loss)
     gq = m2.fold_attn_q.grad.abs().sum().item()
@@ -864,9 +895,9 @@ def selftest():
     tok = torch.randint(1, 101, (1, 12))
     lens = torch.tensor([12])
     with torch.no_grad():
-        a = m2(tok, lens)[-1][0, :8].clone()
+        a = m2(tok, lens).logits[-1][0, :8].clone()
         tok2 = tok.clone(); tok2[0, 10] = (tok2[0, 10] + 5) % 100 + 1
-        b = m2(tok2, lens)[-1][0, :8]
+        b = m2(tok2, lens).logits[-1][0, :8]
     err = (a - b).abs().max().item()
     print(f"  attend causality err: {err:.2e}")
     assert err < 1e-5
@@ -874,7 +905,7 @@ def selftest():
     m3 = OperaSpinorFenwickTree(vocab_size=101, d=64, nb=16, num_layers=2,
                                 pe_mode='none', fold_mode='attend',
                                 rot_mode='free', fold_scale=True)
-    loss, _, _ = lm_loss(m3(tok, lens), tok, lens)
+    loss, _, _ = lm_loss(m3(tok, lens).logits, tok, lens)
     loss.backward()
     assert torch.isfinite(loss)
     print(f"  attend + rotfree + fold-scale: loss {loss.item():.3f}, OK")
@@ -885,7 +916,10 @@ def selftest():
     assert (e1[0, 0] - e1[0, 3]).abs().max().item() > 0.1
     print("  level_sin_enc: deterministic, shape OK, levels distinguishable")
 
-    # -2. DOCS DATA CHUNKER (v8.0): schedule covers every bucket
+
+def test_docs_data_chunker():
+    # DOCS DATA CHUNKER (v8.0): schedule covers every bucket
+    torch.manual_seed(0)
     ml, cap = 20, 80
     sizes = doc_chunk_sizes(ml, cap)
     assert set(sizes) == {20, 40, 60, 80}
@@ -917,9 +951,12 @@ def selftest():
     print("  doc_chunks long-first: 1.5k/2.5k/3.5k-word articles land in "
           "buckets 1/2/3 by their opening chunk; coverage exact")
 
-    # 0. FOLD COMPACTION EQUIVALENCE -- the v7.9 claim. Same weights,
-    #    compacted 'left' vs reference 'left-masked', ragged lengths,
-    #    T chosen to exercise popcount up to 4 (29 = 11101).
+
+def test_fold_compaction_equivalence():
+    # FOLD COMPACTION EQUIVALENCE -- the v7.9 claim. Same weights,
+    # compacted 'left' vs reference 'left-masked', ragged lengths,
+    # T chosen to exercise popcount up to 4 (29 = 11101).
+    torch.manual_seed(0)
     for T in (13, 29):
         torch.manual_seed(3)
         m_c = OperaSpinorFenwickTree(vocab_size=101, d=64, nb=16, num_layers=2,
@@ -932,7 +969,7 @@ def selftest():
         lens = torch.tensor([T, max(5, T // 2), 5])
         with torch.no_grad():
             err = 0.0
-            for lc, lm in zip(m_c(tok, lens), m_m(tok, lens)):
+            for lc, lm in zip(m_c(tok, lens).logits, m_m(tok, lens).logits):
                 err = max(err, (lc - lm).abs().max().item())
         masked_w, compact_w, S = fold_work_counts(T)
         print(f"  fold compaction T={T}: err vs masked {err:.2e}; "
@@ -944,7 +981,7 @@ def selftest():
                                  pe_mode='none', fold_mode='left')
     tok = torch.randint(1, 101, (3, 29))
     lens = torch.tensor([29, 14, 5])
-    loss, _, _ = lm_loss(m_g(tok, lens), tok, lens)
+    loss, _, _ = lm_loss(m_g(tok, lens).logits, tok, lens)
     loss.backward()
     for n_, p_ in m_g.named_parameters():
         if p_.grad is not None:
@@ -956,7 +993,10 @@ def selftest():
         print(f"  fold work @T={T}: masked {masked_w} vs compacted {compact_w} "
               f"({masked_w/compact_w:.2f}x less)")
 
-    # 0b. ROT ABLATION (r15): --rot free
+
+def test_rot_ablation():
+    # ROT ABLATION (r15): --rot free
+    torch.manual_seed(0)
     # (a) flags-off inventory: quat present, rot_free absent
     m_so3 = OperaSpinorFenwickTree(vocab_size=101, d=64, nb=16, num_layers=2)
     assert m_so3.quat is not None and m_so3.rot_free is None
@@ -979,7 +1019,7 @@ def selftest():
     # (d) forward/backward finite, grads reach rot_free, exact causality
     tok = torch.randint(1, 101, (3, 13))
     lens = torch.tensor([13, 7, 5])
-    loss, _, _ = lm_loss(m_free(tok, lens), tok, lens)
+    loss, _, _ = lm_loss(m_free(tok, lens).logits, tok, lens)
     loss.backward()
     assert torch.isfinite(loss)
     assert m_free.rot_free.grad is not None
@@ -990,9 +1030,9 @@ def selftest():
     tok = torch.randint(1, 101, (1, 12))
     lens = torch.tensor([12])
     with torch.no_grad():
-        a = m_free(tok, lens)[-1][0, :8].clone()
+        a = m_free(tok, lens).logits[-1][0, :8].clone()
         tok2 = tok.clone(); tok2[0, 10] = (tok2[0, 10] + 5) % 100 + 1
-        b = m_free(tok2, lens)[-1][0, :8]
+        b = m_free(tok2, lens).logits[-1][0, :8]
     err = (a - b).abs().max().item()
     print(f"  rot free causality err: {err:.2e}")
     assert err < 1e-5
@@ -1001,7 +1041,7 @@ def selftest():
                                   pe_mode='none', rot_mode='free',
                                   fold_rotors='separate')
     assert m_ff.rot_free_fold is not None and m_ff.quat_fold is None
-    loss, _, _ = lm_loss(m_ff(tok, lens), tok, lens)
+    loss, _, _ = lm_loss(m_ff(tok, lens).logits, tok, lens)
     loss.backward()
     assert torch.isfinite(loss)
     print(f"  rot free + fold-rotors separate: loss {loss.item():.3f}, OK")
@@ -1017,7 +1057,10 @@ def selftest():
           f"free orth err {free_orth:.2e} (free is unconstrained)")
     assert so3_orth < 1e-5 and free_orth > 1e-3
 
-    # 1. rotations valid
+
+def test_rotations_valid():
+    # rotations valid
+    torch.manual_seed(0)
     q = torch.randn(64, 4)
     q = q / q.norm(dim=-1, keepdim=True)
     R = quat_to_rotmat(q)
@@ -1026,22 +1069,28 @@ def selftest():
     print(f"  rotmat orthogonality err {orth_err:.2e}")
     assert orth_err < 1e-5
 
-    # 2. flags-off model matches v7.0 module inventory (no logit_scale,
-    #    head has bias, no dropout modules)
+
+def test_flags_off_module_inventory():
+    # flags-off model matches v7.0 module inventory (no logit_scale,
+    # head has bias, no dropout modules)
+    torch.manual_seed(0)
     m0 = OperaSpinorFenwickTree(vocab_size=101, d=64, nb=16, num_layers=2)
     assert m0.logit_scale is None and m0.head.bias is not None
     names = [n for n, _ in m0.named_parameters()]
     assert not any('logit' in n for n in names)
     print(f"  flags-off param inventory matches v7.0 ({count_params(m0):,} params)")
 
-    # 3. TIE INIT FIX: initial loss must be ~ln(V), not sqrt(d)-scale.
+
+def test_tie_init():
+    # TIE INIT FIX: initial loss must be ~ln(V), not sqrt(d)-scale.
+    torch.manual_seed(0)
     V = 1000
     mt = OperaSpinorFenwickTree(vocab_size=V, d=64, nb=16, num_layers=2, tie=True)
     mt.eval()
     tok = torch.randint(1, V, (8, 16))
     lens = torch.full((8,), 16)
     with torch.no_grad():
-        logits = mt(tok, lens)
+        logits = mt(tok, lens).logits
         loss, _, _ = lm_loss(logits, tok, lens)
     lnV = math.log(V)
     print(f"  tied init loss {loss.item():.2f} vs ln(V)={lnV:.2f} "
@@ -1053,49 +1102,65 @@ def selftest():
     print(f"  tie saves {saved:,} params (expected ~ d*V = {64*V:,})")
     assert saved > 0.9 * 64 * V
 
-    # 4. msup: vectorized loss finite, backward works, adds no params
+
+def test_msup():
+    # msup: vectorized loss finite, backward works, adds no params
+    torch.manual_seed(0)
     m = OperaSpinorFenwickTree(vocab_size=101, d=64, nb=16, num_layers=2)
     tok = torch.randint(1, 101, (3, 13))
     lens = torch.tensor([13, 7, 5])
-    all_logits, levels = m(tok, lens, return_levels=True)
-    base, _, _ = lm_loss(all_logits, tok, lens)
-    ms = msup_loss(m, levels, tok, lens)
+    out = m(tok, lens, return_levels=True)
+    base, _, _ = lm_loss(out.logits, tok, lens)
+    ms = msup_loss(m, out.levels, tok, lens)
     (base + 0.1 * ms).backward()
     print(f"  msup loss {ms.item():.3f} (base {base.item():.3f}); backward OK")
     assert torch.isfinite(ms)
 
-    # 5. msup target correctness on a hand case: T=8, level 1 node 0
-    #    covers [0,1], must predict token at position 2 -> targets[:,1].
+
+def test_msup_target_indexing():
+    # msup target correctness on a hand case: T=8, level 1 node 0
+    # covers [0,1], must predict token at position 2 -> targets[:,1].
     tgt_check_span = 2
     node0_target_pos = (0 + 1) * tgt_check_span - 1
     assert node0_target_pos == 1
     print("  msup target indexing sanity: node(level1,0) -> targets[:,1] OK")
 
-    # 6. dropout only active in training
+
+def test_dropout_eval_only():
+    # dropout only active in training
+    torch.manual_seed(0)
+    tok = torch.randint(1, 101, (3, 13))
+    lens = torch.tensor([13, 7, 5])
     md = OperaSpinorFenwickTree(vocab_size=101, d=64, nb=16, num_layers=2, dropout=0.5)
     md.eval()
     with torch.no_grad():
-        a = md(tok, lens)[-1]
-        b = md(tok, lens)[-1]
+        a = md(tok, lens).logits[-1]
+        b = md(tok, lens).logits[-1]
     print(f"  dropout eval determinism err {(a-b).abs().max().item():.2e}")
     assert (a - b).abs().max().item() == 0.0
 
-    # 7. causality with all flags on
+
+def test_causality_all_flags():
+    # causality with all flags on
+    torch.manual_seed(0)
     mall = OperaSpinorFenwickTree(vocab_size=101, d=64, nb=16, num_layers=2,
                                   tie=True, dropout=0.3)
     mall.eval()
     tok = torch.randint(1, 101, (1, 12))
     lens = torch.tensor([12])
     with torch.no_grad():
-        a = mall(tok, lens)[-1][0, :8].clone()
+        a = mall(tok, lens).logits[-1][0, :8].clone()
         tok2 = tok.clone(); tok2[0, 10] = (tok2[0, 10] + 5) % 100 + 1
-        b = mall(tok2, lens)[-1][0, :8]
+        b = mall(tok2, lens).logits[-1][0, :8]
     caus_err = (a - b).abs().max().item()
     print(f"  causality err (all flags): {caus_err:.2e}")
     assert caus_err < 1e-5
 
-    # 8. rotor PE: isometry (norm preserved per state), identity at t=0,
-    #    and cache-free correctness across lengths
+
+def test_rotor_pe_isometry():
+    # rotor PE: isometry (norm preserved per state), identity at t=0,
+    # and cache-free correctness across lengths
+    torch.manual_seed(0)
     cos, sin = rotor_pos_tables(12, 16, 'cpu')
     st = torch.randn(2, 12, 64)
     st_r = apply_rotor_pe(st, cos, sin, 16)
@@ -1110,13 +1175,16 @@ def selftest():
     print(f"  rotor PE: scalar/v_z invariance err {inv_err:.2e}")
     assert inv_err < 1e-6
 
-    # 9. forward/backward + causality for all three PE modes
+
+def test_pe_modes_causality():
+    # forward/backward + causality for all three PE modes
+    torch.manual_seed(0)
     for pm in ('sin', 'none', 'rotor'):
         mp = OperaSpinorFenwickTree(vocab_size=101, d=64, nb=16, num_layers=2,
                                     pe_mode=pm)
         tok = torch.randint(1, 101, (3, 13))
         lens = torch.tensor([13, 7, 5])
-        logits = mp(tok, lens)
+        logits = mp(tok, lens).logits
         loss, _, _ = lm_loss(logits, tok, lens)
         loss.backward()
         assert torch.isfinite(loss)
@@ -1124,14 +1192,17 @@ def selftest():
         tok = torch.randint(1, 101, (1, 12))
         lens = torch.tensor([12])
         with torch.no_grad():
-            a = mp(tok, lens)[-1][0, :8].clone()
+            a = mp(tok, lens).logits[-1][0, :8].clone()
             tok2 = tok.clone(); tok2[0, 10] = (tok2[0, 10] + 5) % 100 + 1
-            b = mp(tok2, lens)[-1][0, :8]
+            b = mp(tok2, lens).logits[-1][0, :8]
         err = (a - b).abs().max().item()
         print(f"  pe={pm}: loss {loss.item():.3f}, causality err {err:.2e}")
         assert err < 1e-5
 
-    # 10. FOLD TESTS
+
+def test_fold_variants():
+    # FOLD TESTS
+    torch.manual_seed(0)
     # (a) flags-off param inventory unchanged (no quat_fold / fold_theta)
     m_base = OperaSpinorFenwickTree(vocab_size=101, d=64, nb=16, num_layers=2)
     assert m_base.quat_fold is None and m_base.fold_theta is None
@@ -1147,7 +1218,7 @@ def selftest():
     tok = torch.randint(1, 101, (2, 3))
     lens = torch.tensor([3, 3])
     with torch.no_grad():
-        eq_err = (m_l(tok, lens)[-1] - m_b(tok, lens)[-1]).abs().max().item()
+        eq_err = (m_l(tok, lens).logits[-1] - m_b(tok, lens).logits[-1]).abs().max().item()
     print(f"  balanced==left for popcount<=2 prefixes: err {eq_err:.2e}")
     assert eq_err < 1e-5
     # (c) all fold configs: forward/backward finite + exact causality
@@ -1160,7 +1231,7 @@ def selftest():
                                     pe_mode='none', **kw)
         tok = torch.randint(1, 101, (3, 13))
         lens = torch.tensor([13, 7, 5])
-        logits = mf(tok, lens)
+        logits = mf(tok, lens).logits
         loss, _, _ = lm_loss(logits, tok, lens)
         loss.backward()
         assert torch.isfinite(loss)
@@ -1168,9 +1239,9 @@ def selftest():
         tok = torch.randint(1, 101, (1, 12))
         lens = torch.tensor([12])
         with torch.no_grad():
-            a = mf(tok, lens)[-1][0, :8].clone()
+            a = mf(tok, lens).logits[-1][0, :8].clone()
             tok2 = tok.clone(); tok2[0, 10] = (tok2[0, 10] + 5) % 100 + 1
-            b = mf(tok2, lens)[-1][0, :8]
+            b = mf(tok2, lens).logits[-1][0, :8]
         err = (a - b).abs().max().item()
         print(f"  fold cfg {kw}: loss {loss.item():.3f}, causality err {err:.2e}")
         assert err < 1e-5
@@ -1179,13 +1250,16 @@ def selftest():
     mf = OperaSpinorFenwickTree(vocab_size=101, d=64, nb=16, num_layers=2,
                                 fold_scale=True)
     tok = torch.randint(1, 101, (2, 9)); lens = torch.tensor([9, 9])
-    loss, _, _ = lm_loss(mf(tok, lens), tok, lens)
+    loss, _, _ = lm_loss(mf(tok, lens).logits, tok, lens)
     loss.backward()
     gth = mf.fold_theta.grad.abs().sum().item()
     print(f"  fold_theta receives gradient: {gth:.4f} (>0)")
     assert gth > 0
 
-    # 12. NODE SURGERY TESTS (v7.6)
+
+def test_node_surgery():
+    # NODE SURGERY TESTS (v7.6)
+    torch.manual_seed(0)
     # (a) flags-off inventory unchanged (LayerNorm present, no gains/logits)
     m0b = OperaSpinorFenwickTree(vocab_size=101, d=64, nb=16, num_layers=2)
     assert m0b.comp_norm is not None and m0b.block_gain is None
@@ -1215,16 +1289,16 @@ def selftest():
                                     pe_mode='none', **kw)
         tok = torch.randint(1, 101, (3, 13))
         lens = torch.tensor([13, 7, 5])
-        loss, _, _ = lm_loss(ms(tok, lens), tok, lens)
+        loss, _, _ = lm_loss(ms(tok, lens).logits, tok, lens)
         loss.backward()
         assert torch.isfinite(loss)
         ms.eval()
         tok = torch.randint(1, 101, (1, 12))
         lens = torch.tensor([12])
         with torch.no_grad():
-            a = ms(tok, lens)[-1][0, :8].clone()
+            a = ms(tok, lens).logits[-1][0, :8].clone()
             tok2 = tok.clone(); tok2[0, 10] = (tok2[0, 10] + 5) % 100 + 1
-            b = ms(tok2, lens)[-1][0, :8]
+            b = ms(tok2, lens).logits[-1][0, :8]
         err = (a - b).abs().max().item()
         print(f"  surgery cfg {kw}: loss {loss.item():.3f}, causality err {err:.2e}")
         assert err < 1e-5
@@ -1234,14 +1308,17 @@ def selftest():
     r0 = torch.sigmoid(mr.res_logit).detach()
     print(f"  residual gate init r = {[round(float(x),3) for x in r0]} (~0.88)")
     tok = torch.randint(1, 101, (2, 9)); lens = torch.tensor([9, 9])
-    loss, _, _ = lm_loss(mr(tok, lens), tok, lens)
+    loss, _, _ = lm_loss(mr(tok, lens).logits, tok, lens)
     loss.backward()
     assert mr.res_logit.grad is not None and mr.res_logit.grad.abs().sum() > 0
 
-    # 12a. GpuBatchSource resume round-trip (opt7b regression guard):
-    #     save state mid-stream, keep sampling, then restore into a FRESH
-    #     source and verify the continuation is identical. Also feed the
-    #     state back as a plain tensor clone (what torch.load hands us).
+
+def test_gpu_batch_source_resume():
+    # GpuBatchSource resume round-trip (opt7b regression guard):
+    # save state mid-stream, keep sampling, then restore into a FRESH
+    # source and verify the continuation is identical. Also feed the
+    # state back as a plain tensor clone (what torch.load hands us).
+    torch.manual_seed(0)
     fake_train = [[random.randint(1, 100) for _ in range(random.randint(5, 12))]
                   for _ in range(50)]
     bs1 = GpuBatchSource(fake_train, 12, 'cpu', seed=9)
@@ -1258,7 +1335,10 @@ def selftest():
     print("  GpuBatchSource: state_dict on CPU/uint8, exact-stream resume "
           "after restore (regression guard for the CUDA set_state crash)")
 
-    # 12b. extrapolation_eval (opt7): length-scaled batch, bucket logic
+
+def test_extrapolation_eval():
+    # extrapolation_eval (opt7): length-scaled batch, bucket logic
+    torch.manual_seed(0)
     m_ex = OperaSpinorFenwickTree(vocab_size=101, d=64, nb=16, num_layers=1,
                                   pe_mode='none', fold_mode='left')
     rng_ex = random.Random(5)
@@ -1275,12 +1355,19 @@ def selftest():
     print(f"  extrapolation_eval: bucket PPL {ppl_ex:.1f} (n=36), "
           f"starved bucket -> None, batch scaling path OK")
 
-    # 13. RMT diagnostic runs on CPU states (synthetic model, tiny data)
+
+def test_rmt_diagnostic():
+    # RMT diagnostic runs on CPU states (synthetic model, tiny data)
+    torch.manual_seed(0)
+    m0 = OperaSpinorFenwickTree(vocab_size=101, d=64, nb=16, num_layers=2)
     fake_data = [[random.randint(1, 100) for _ in range(random.randint(5, 12))]
                  for _ in range(20)]
     rmt_states_diagnostic(m0, fake_data, batch_size=8, device='cpu', num_sentences=20)
 
-    # 14. --gate-bias (v9, arm A): CHRONO FOLD GATE INIT
+
+def test_gate_bias():
+    # --gate-bias (v9, arm A): CHRONO FOLD GATE INIT
+    torch.manual_seed(0)
     torch.manual_seed(77)
     m_g0 = OperaSpinorFenwickTree(vocab_size=101, d=64, nb=16, num_layers=2,
                                   pe_mode='none', fold_mode='left')
@@ -1323,8 +1410,8 @@ def selftest():
         lvb, _ = m_tb.build_tree(emb9, 0, *m_tb.get_rotations(0))
         for a_, b_ in zip(lv0, lvb):
             assert torch.equal(a_, b_), "tree path reads fold_gate_bias"
-        p0 = m_t0(tok9, len9)[-1]
-        pb = m_tb(tok9, len9)[-1]
+        p0 = m_t0(tok9, len9).logits[-1]
+        pb = m_tb(tok9, len9).logits[-1]
     table9, _ = fenwick_blocks(16)
     single9 = torch.tensor([len(bl) <= 1 for bl in table9])
     assert torch.equal(p0[:, single9], pb[:, single9]), \
@@ -1335,7 +1422,7 @@ def selftest():
           "multi-block positions")
     # (d) grads reach the bias; (e) exact param delta at the 22M rung
     m_tb.train()
-    m_tb(tok9, len9)[-1].sum().backward()
+    m_tb(tok9, len9).logits[-1].sum().backward()
     assert m_tb.fold_gate_bias.grad is not None and \
         m_tb.fold_gate_bias.grad.abs().max() > 0
     dd9, nbb9 = 640, 160
@@ -1356,7 +1443,10 @@ def selftest():
         m_gs(tok9, len9)
     print("  gate-bias f: --fold spine + --gate-bias composition runs")
 
-    # 15. --curriculum (v9, arm C): LENGTH CURRICULUM
+
+def test_curriculum():
+    # --curriculum (v9, arm C): LENGTH CURRICULUM
+    torch.manual_seed(0)
     # (a) schedule: starts at cur0, doubles every `every` steps, caps at
     #     max_len; deterministic in step (exact --resume).
     assert curriculum_len(0, 64, 2000, 1024) == 64
@@ -1371,6 +1461,7 @@ def selftest():
     #     information its loss supervises. (ii) CROSS SHAPE: the slice
     #     then matches the full run to fp tiling noise (GEMM batch
     #     geometry only, ~1e-7), not to logic differences.
+    gt9 = torch.Generator().manual_seed(13)
     m_cu = OperaSpinorFenwickTree(vocab_size=101, d=64, nb=16, num_layers=2,
                                   pe_mode='none', fold_mode='left')
     m_cu.eval()
@@ -1378,11 +1469,11 @@ def selftest():
     len10 = torch.tensor([32, 25])
     tc10 = 16
     with torch.no_grad():
-        full10 = m_cu(tok10, len10)[-1]
+        full10 = m_cu(tok10, len10).logits[-1]
         garb10 = tok10.clone()
         garb10[:, tc10:] = 1
-        same10 = m_cu(garb10, len10)[-1]
-        part10 = m_cu(tok10[:, :tc10], len10.clamp(max=tc10))[-1]
+        same10 = m_cu(garb10, len10).logits[-1]
+        part10 = m_cu(tok10[:, :tc10], len10.clamp(max=tc10)).logits[-1]
     assert torch.equal(full10[:, :tc10], same10[:, :tc10]), \
         "tokens at >= t_cur leak into positions < t_cur"
     cerr10 = (full10[:, :tc10] - part10).abs().max().item()
@@ -1390,11 +1481,14 @@ def selftest():
     print(f"  curriculum b: same-shape causality exact (0.0); sliced batch "
           f"matches to {cerr10:.1e} (fp tiling noise)")
 
-    # 16. Fenwick-incremental decoding (OperaDecoder): appending tokens one
+
+def test_incremental_decoding():
+    # Fenwick-incremental decoding (OperaDecoder): appending tokens one
     # at a time must reproduce the full forward's per-position logits
     # EXACTLY (up to fp op-reordering). This is the property that makes
     # O(log T)/token generation sound: tree nodes are append-only, prefix
     # states are causal, cross-layer mixing is position-wise.
+    torch.manual_seed(0)
     # (a) helper: fenwick_blocks_of(L) == row L-1 of fenwick_blocks.
     tbl11, _ = fenwick_blocks(37)
     for L11 in range(1, 38):
@@ -1417,7 +1511,7 @@ def selftest():
         tok11 = torch.randint(1, 100, (1, T11))
         len11 = torch.tensor([T11])
         with torch.no_grad():
-            full11 = m11(tok11, len11, head_last_only=True)[-1][0]  # [T,V]
+            full11 = m11(tok11, len11, head_last_only=True).logits[-1][0]  # [T,V]
             dec11 = OperaDecoder(m11)
             inc11 = torch.stack([dec11.append(int(t)) for t in tok11[0]])
         derr11 = (full11 - inc11).abs().max().item()
@@ -1430,8 +1524,11 @@ def selftest():
         print(f"  incremental b [{tag11}]: per-position logits match full "
               f"forward to {derr11:.1e} over T={T11}; reset exact")
 
-    # 17. Muon optimizer (roadmap T0.1): Newton-Schulz orthogonalization,
+
+def test_muon_optimizer():
+    # Muon optimizer (roadmap T0.1): Newton-Schulz orthogonalization,
     # parameter partition, learning dynamics, end-to-end train() wiring.
+    torch.manual_seed(0)
     # (a) NS5's real contract (modded-nanogpt): output singular values
     #     land in ~[0.7, 1.2] (NOT 1 +- 1e-3 -- the quintic has a slow
     #     region for small sigma, which is why Muon uses exactly 5 steps).
@@ -1516,7 +1613,7 @@ def selftest():
                       optimizer='muon', muon_lr=0.02)
         assert math.isfinite(res12['final_loss'])
         assert res12['init_perplexity'] > 1
-        assert _os12.path.exists(res12_path12 := _os12.path.join(
+        assert _os12.path.exists(_os12.path.join(
             tmp12, 'opera_v8_0_results.jsonl'))
         pts12 = [f for f in _os12.listdir(tmp12) if f.endswith('.pt')]
         assert pts12, "no checkpoint saved"
@@ -1524,7 +1621,10 @@ def selftest():
     print(f"  muon d: train() end-to-end, final loss "
           f"{res12['final_loss']:.3f}, ckpt tagged opt-muon")
 
-    # 18. T0.4 multi-state readout + T1.4 delta memory (roadmap arms).
+
+def test_readout_and_delta_memory_arms():
+    # T0.4 multi-state readout + T1.4 delta memory (roadmap arms).
+    torch.manual_seed(0)
     # (a) RNG-stream rule: arms-on model shares every incumbent parameter
     #     bitwise at the same seed; the only new params are the arms'.
     torch.manual_seed(13)
@@ -1556,8 +1656,8 @@ def selftest():
     tok13 = torch.randint(1, 100, (2, 24))
     len13 = torch.tensor([24, 17])
     with torch.no_grad():
-        o13a = m13a(tok13, len13)[-1]
-        o13b = m13b(tok13, len13)[-1]
+        o13a = m13a(tok13, len13).logits[-1]
+        o13b = m13b(tok13, len13).logits[-1]
     assert torch.equal(o13a, o13b), "arms-on is not the incumbent at init"
     print("  arms b: flags-on == incumbent at init, bitwise")
     # (c) causality with arms on: corrupting token j changes nothing at
@@ -1565,7 +1665,7 @@ def selftest():
     garb13 = tok13.clone()
     garb13[:, 12:] = 1
     with torch.no_grad():
-        o13c = m13b(garb13, len13)[-1]
+        o13c = m13b(garb13, len13).logits[-1]
     assert torch.equal(o13b[:, :12], o13c[:, :12]), \
         "delta memory or multistate readout leaks future into the past"
     print("  arms c: causality exact with both arms on (0.0)")
@@ -1592,7 +1692,7 @@ def selftest():
     tok13e = torch.randint(1, 100, (1, 33))
     len13e = torch.tensor([33])
     with torch.no_grad():
-        full13 = m13b(tok13e, len13e, head_last_only=True)[-1][0]
+        full13 = m13b(tok13e, len13e, head_last_only=True).logits[-1][0]
         dec13 = OperaDecoder(m13b)
         inc13 = torch.stack([dec13.append(int(t)) for t in tok13e[0]])
     derr13 = (full13 - inc13).abs().max().item()
@@ -1601,6 +1701,15 @@ def selftest():
           f"logits match full forward to {derr13:.1e} over T=33")
     # (f) end-to-end: train() with both arms learns and grads reach the
     #     new parameters.
+    import os as _os12, tempfile as _tf12
+    rng12 = random.Random(12)
+    V12 = 64
+    train12 = [[rng12.randrange(1, V12) for _ in range(rng12.randrange(5, 17))]
+               for _ in range(120)]
+    short12 = [[rng12.randrange(1, V12) for _ in range(rng12.randrange(5, 17))]
+               for _ in range(40)]
+    long12 = [[rng12.randrange(1, V12) for _ in range(rng12.randrange(17, 33))]
+              for _ in range(24)]
     with _tf12.TemporaryDirectory() as tmp13:
         res13 = train(steps=5, batch=8, max_len=16, vocab_size=V12, d=64,
                       nb=16, num_layers=2, eval_max_len=32, device='cpu',
@@ -1618,7 +1727,7 @@ def selftest():
         assert any('ro-multistate' in f and 'mem-delta32' in f
                    for f in pts13), pts13
     m13b.train()
-    m13b(tok13, len13)[-1].sum().backward()
+    m13b(tok13, len13).logits[-1].sum().backward()
     # Zero-init arms: at init the upstream projections (mem_k/q/v/beta,
     # readout_gate) get EXACTLY zero grad through the zero-init output
     # projections -- by design; they come alive once the projections
@@ -1673,6 +1782,51 @@ def selftest():
           f"checkpoint written -- NOT a substitute for a real multi-GPU "
           f"test")
 
+
+# Sequential order of the CLI runner below: matches the original file's
+# top-to-bottom arm order (r19).
+_ARMS = [
+    test_scan_fold,
+    test_spine_readout,
+    test_rack_fold,
+    test_rack_exitnorm,
+    test_oam_node_transport,
+    test_oam_fold,
+    test_attend_readout,
+    test_docs_data_chunker,
+    test_fold_compaction_equivalence,
+    test_rot_ablation,
+    test_rotations_valid,
+    test_flags_off_module_inventory,
+    test_tie_init,
+    test_msup,
+    test_msup_target_indexing,
+    test_dropout_eval_only,
+    test_causality_all_flags,
+    test_rotor_pe_isometry,
+    test_pe_modes_causality,
+    test_fold_variants,
+    test_node_surgery,
+    test_gpu_batch_source_resume,
+    test_extrapolation_eval,
+    test_rmt_diagnostic,
+    test_gate_bias,
+    test_curriculum,
+    test_incremental_decoding,
+    test_muon_optimizer,
+    test_readout_and_delta_memory_arms,
+]
+
+
+def selftest():
+    """Sequential CLI runner (python -m opera_lm.selftest): runs every arm
+    in the same order the single monolithic function used to, and aborts
+    with a traceback on the first failing arm (unlike pytest, which runs
+    each arm defined above as its own independent test)."""
+    torch.manual_seed(0)
+    print("=== v8.0 self-test (r19) ===")
+    for arm in _ARMS:
+        arm()
     print("  ALL PASS")
 
 

@@ -1,5 +1,6 @@
 """OperaSpinorFenwickTree: spinor (Cl(3)) Fenwick-tree language model."""
 import math
+from typing import NamedTuple, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -224,6 +225,22 @@ def associative_scan(q, b):
         b = torch.cat([b[:, :shift], bc], dim=1)
         shift *= 2
     return q, b
+
+
+class OperaOutput(NamedTuple):
+    """forward()'s return value: fields absent from a given call (the
+    corresponding return_* flag was False) are None rather than the field
+    itself missing, so callers never need to know which other flags were
+    passed to find their own field's position. A NamedTuple (not a plain
+    dataclass) on purpose: DDP's find_unused_parameters gradient sync walks
+    the forward output via isinstance(obj, (list, tuple)) to locate
+    tensors (torch/nn/parallel/distributed.py's _find_tensors) and does not
+    recurse into arbitrary objects, so a plain dataclass would silently
+    break DDP training (opera_lm.train.train's ddp=True path)."""
+    logits: list
+    tree: Optional[list] = None
+    levels: Optional[list] = None
+    states: Optional[list] = None
 
 
 # ============================================================================
@@ -1059,7 +1076,7 @@ class OperaSpinorFenwickTree(nn.Module):
         return levels, locks
 
     def _fenwick_indices(self, T, num_levels, level_offsets, device):
-        key = (T, num_levels)
+        key = (T, num_levels, str(device))
         if key in self._fenwick_cache:
             return self._fenwick_cache[key]
         table, max_blocks = fenwick_blocks(T)
@@ -1793,6 +1810,11 @@ class OperaSpinorFenwickTree(nn.Module):
 
         pad = None  # on-fly indexing: tree built without padding
 
+        # Instance state read by _compose/compose_pair_batch further down
+        # this same forward call -- not thread-safe if forward() is ever
+        # invoked concurrently on one shared module instance (DDP is
+        # multi-process, so this doesn't currently apply, but torch.compile
+        # or a future multi-threaded caller would race on it).
         self._need_locks = return_tree
         self._rot_dense_cache.clear()
         per_layer_prefix = []
@@ -1845,16 +1867,12 @@ class OperaSpinorFenwickTree(nn.Module):
         else:
             all_logits = [self.apply_head(p) for p in per_layer_prefix]
 
-        extras = []
-        if return_tree:
-            extras.append(tree_info)
-        if return_levels:
-            extras.append(per_layer_levels)
-        if return_states:
-            extras.append(per_layer_prefix)
-        if extras:
-            return (all_logits, *extras)
-        return all_logits
+        return OperaOutput(
+            logits=all_logits,
+            tree=tree_info if return_tree else None,
+            levels=per_layer_levels if return_levels else None,
+            states=per_layer_prefix if return_states else None,
+        )
 
 
 

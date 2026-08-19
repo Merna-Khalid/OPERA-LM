@@ -129,7 +129,7 @@ def compute_perplexity(model, test_data, max_len, batch_size, device):
         # so a compiled model sees ONE input shape for every batch.
         token_ids, lengths = make_batch_full(batch, max_len)
         token_ids, lengths = token_ids.to(device), lengths.to(device)
-        all_logits = model(token_ids, lengths, head_last_only=True)
+        all_logits = model(token_ids, lengths, head_last_only=True).logits
         _, final_sum, vcount = lm_loss(all_logits, token_ids, lengths)
         total_loss += final_sum.item()
         total_tokens += vcount.item()
@@ -210,8 +210,7 @@ def rmt_states_diagnostic(model, test_data, batch_size, device, num_sentences=50
         token_ids, lengths = make_batch_full(batch, bl)
         token_ids, lengths = token_ids.to(device), lengths.to(device)
         out = model(token_ids, lengths, return_states=True)
-        all_logits, per_layer_prefix = out
-        h = per_layer_prefix[-1]                                  # [B, T, d]
+        h = out.states[-1]                                        # [B, T, d]
         for b in range(h.shape[0]):
             L = int(lengths[b].item())
             feats.append(h[b, :L, :].cpu())
@@ -280,7 +279,7 @@ def inspect_tree(model, sentences, idx2word, device, n=5):
             T = len(sent)
             token_ids, lengths = make_batch_full([sent], T)
             token_ids, lengths = token_ids.to(device), lengths.to(device)
-            all_logits = model(token_ids, lengths)
+            all_logits = model(token_ids, lengths).logits
             pred_idx = all_logits[-1][0, T - 2].argmax().item()
             pred_word = idx2word.get(pred_idx, '<unk>')
             print(f"  Sentence: {' '.join(words)}", flush=True)
@@ -295,8 +294,9 @@ def inspect_tree(model, sentences, idx2word, device, n=5):
         T = len(sent)
         token_ids, lengths = make_batch_full([sent], T)
         token_ids, lengths = token_ids.to(device), lengths.to(device)
-        all_logits, tree_info = model(token_ids, lengths, return_tree=True)
-        levels, locks = tree_info[0]
+        out = model(token_ids, lengths, return_tree=True)
+        all_logits = out.logits
+        levels, locks = out.tree[0]
         top = len(levels) - 1
         tree_str = tree_to_str(levels, locks, words, top, 0)
         pred_idx = all_logits[-1][0, T - 2].argmax().item()
@@ -730,14 +730,15 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
 
         with amp_ctx():
             if msup:
-                all_logits, levels = model_c(token_ids, lengths, return_levels=True)
-                loss, _, _ = lm_loss(all_logits, token_ids, lengths)
-                loss = loss + msup_weight * msup_loss(model, levels, token_ids, lengths)
+                out = model_c(token_ids, lengths, return_levels=True)
+                loss, _, _ = lm_loss(out.logits, token_ids, lengths)
+                loss = loss + msup_weight * msup_loss(model, out.levels, token_ids, lengths)
             else:
                 # OPT: final-layer head inside the compiled graph; aux
                 # layers' head computed on aux_frac of positions only.
-                all_logits, states = model_c(
+                out = model_c(
                     token_ids, lengths, return_states=True, head_last_only=True)
+                all_logits, states = out.logits, out.states
                 # train_lm_loss calls apply_head(), a custom method, not
                 # forward() -- DDP's wrapper only proxies forward()/
                 # __call__, so model_c.apply_head AttributeErrors under

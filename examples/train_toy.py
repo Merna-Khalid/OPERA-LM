@@ -42,9 +42,9 @@ def main():
             token_ids = torch.randint(4, vocab_size, (batch, T), generator=gen)
             lengths = torch.full((batch,), T, dtype=torch.long)
 
-        all_logits, levels = model(token_ids, lengths, return_levels=True)
-        loss, _, _ = lm_loss(all_logits, token_ids, lengths)
-        loss = loss + 0.1 * msup_loss(model, levels, token_ids, lengths)
+        out = model(token_ids, lengths, return_levels=True)
+        loss, _, _ = lm_loss(out.logits, token_ids, lengths)
+        loss = loss + 0.1 * msup_loss(model, out.levels, token_ids, lengths)
 
         opt.zero_grad()
         loss.backward()
