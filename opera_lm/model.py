@@ -157,6 +157,42 @@ def relative_lock(s0, v0, s1, v1, eps=1e-8):
     return (1.0 - inner * inner).clamp(0.0, 1.0)
 
 
+def inject_geometry(states, geom, geom_mask, nb, geom_block=0):
+    """Overwrite the VECTOR part (dims 1:4) of block `geom_block` of
+    `states` ([..., d], d=4*nb) with `geom` ([..., 3]) wherever
+    `geom_mask` ([...], bool) is True; the scalar channel and every
+    other block are untouched. Used by callers (e.g. a downstream
+    spatial-reasoning task) that want a leaf's position to be a literal
+    rotor-composable vector instead of a token embedding -- text/LM
+    callers never pass geom, so this function does not otherwise exist
+    in their compute graph.
+
+    Built via cat/where rather than an in-place write into the reshaped
+    view (`h[..., geom_block, 1:] = ...`): `states` is typically
+    word_emb's output, which requires grad, and in-place-writing into a
+    view of it trips autograd's version-counter check the first time
+    this runs inside a backward pass. cat/where has no such hazard.
+
+    geom/geom_mask may be plain numpy arrays (the natural output of a
+    non-torch encoding pipeline, e.g. a game-observation tokenizer) --
+    coerced to tensors here so every caller gets this for free instead
+    of each one remembering to convert."""
+    if not torch.is_tensor(geom):
+        geom = torch.as_tensor(geom, dtype=states.dtype, device=states.device)
+    if not torch.is_tensor(geom_mask):
+        geom_mask = torch.as_tensor(geom_mask, dtype=torch.bool,
+                                    device=states.device)
+    shape = states.shape
+    h = states.reshape(*shape[:-1], nb, 4)
+    s, v = h[..., geom_block, :1], h[..., geom_block, 1:]
+    new_block = torch.cat(
+        [s, torch.where(geom_mask.unsqueeze(-1), geom, v)], dim=-1
+    ).unsqueeze(-2)
+    h = torch.cat([h[..., :geom_block, :], new_block,
+                   h[..., geom_block + 1:, :]], dim=-2)
+    return h.reshape(*shape)
+
+
 # ============================================================================
 # OPERA-SCAN (v8.5) -- associative affine scan (OPERA_Scan_Arm_Design.md)
 # ============================================================================
@@ -241,6 +277,7 @@ class OperaOutput(NamedTuple):
     tree: Optional[list] = None
     levels: Optional[list] = None
     states: Optional[list] = None
+    energy: Optional[list] = None
 
 
 # ============================================================================
@@ -970,6 +1007,12 @@ class OperaSpinorFenwickTree(nn.Module):
                         hl[..., 0], v0d, hr[..., 0], v1d).mean(-1, keepdim=True)
             else:
                 lock_scalar = torch.zeros(N, 1, device=h_left.device)
+            if getattr(self, '_need_energy', False):
+                with torch.no_grad():
+                    energy_scalar = parent.reshape(N, nb, 4).norm(
+                        dim=-1).mean(-1, keepdim=True)
+            else:
+                energy_scalar = torch.zeros(N, 1, device=h_left.device)
             if self.norm_mode == 'layer':
                 parent = self.comp_norm[layer_idx](parent)
             elif self.norm_mode == 'rms':
@@ -989,7 +1032,7 @@ class OperaSpinorFenwickTree(nn.Module):
             if self.res_logit is not None:
                 r = torch.sigmoid(self.res_logit[layer_idx])
                 parent = r * parent + (1.0 - r) * 0.5 * (h_left + h_right)
-            return parent, lock_scalar
+            return parent, lock_scalar, energy_scalar
         if self.use_metal:
             # lock_mode='interference' needs lock-modulated gates: use the
             # v1 kernel (rotate+geo) and keep the rest eager.
@@ -1053,6 +1096,12 @@ class OperaSpinorFenwickTree(nn.Module):
             fv = torch.einsum('kij,nkj->nki', R_O, fv)
 
         parent = torch.cat([fs.unsqueeze(-1), fv], dim=-1).reshape(N, -1)
+        if getattr(self, '_need_energy', False):
+            with torch.no_grad():
+                energy_scalar = parent.reshape(N, nb, 4).norm(
+                    dim=-1).mean(-1, keepdim=True)
+        else:
+            energy_scalar = torch.zeros(N, 1, device=h_left.device)
         if self.norm_mode == 'layer':
             parent = self.comp_norm[layer_idx](parent)
         elif self.norm_mode == 'rms':
@@ -1073,7 +1122,7 @@ class OperaSpinorFenwickTree(nn.Module):
         if self.res_logit is not None:
             r = torch.sigmoid(self.res_logit[layer_idx])
             parent = r * parent + (1.0 - r) * 0.5 * (h_left + h_right)
-        return parent, lock_scalar
+        return parent, lock_scalar, energy_scalar
 
     def build_tree(self, states, layer_idx, R_L, R_R, R_O):
         """ON-FLY INDEXING: no padding anywhere. A Fenwick block (k, j)
@@ -1086,6 +1135,7 @@ class OperaSpinorFenwickTree(nn.Module):
         B, n0, d = states.shape
         levels = [states]
         locks = []
+        energies = []
         current = states
         while current.shape[1] >= 2:
             n = current.shape[1]
@@ -1093,12 +1143,13 @@ class OperaSpinorFenwickTree(nn.Module):
             left = current[:, 0:2 * m:2, :]
             right = current[:, 1:2 * m:2, :]
             N = B * m
-            parent, lock = self._compose(
+            parent, lock, energy = self._compose(
                 left.reshape(N, d), right.reshape(N, d), layer_idx, R_L, R_R, R_O)
             current = parent.reshape(B, m, d)
             levels.append(current)
             locks.append(lock.reshape(B, m))
-        return levels, locks
+            energies.append(energy.reshape(B, m))
+        return levels, locks, energies
 
     def _fenwick_indices(self, T, num_levels, level_offsets, device):
         key = (T, num_levels, str(device))
@@ -1167,7 +1218,7 @@ class OperaSpinorFenwickTree(nn.Module):
                       < count[:, None]).float()               # [T, S]
             for s_idx in range(1, max_blocks):
                 nxt = gathered[:, :, s_idx, :]
-                composed, _ = self._compose(
+                composed, _, _ = self._compose(
                     acc.reshape(B * T, d), nxt.reshape(B * T, d),
                     layer_idx, R_L, R_R, R_O)
                 composed = composed.reshape(B, T, d)
@@ -1215,7 +1266,7 @@ class OperaSpinorFenwickTree(nn.Module):
                 nxt = gathered[:, act, s_idx, :]
                 # v9 arm A: chrono bias on the TRANSPORT composes only;
                 # the final ctx compose below is readout, not transport.
-                composed, _ = self._compose(
+                composed, _, _ = self._compose(
                     a.reshape(B * m, d), nxt.reshape(B * m, d),
                     layer_idx, R_L, R_R, R_O, gate_bias=fgb)
                 acc = acc.index_copy(1, act, composed.reshape(B, m, d))
@@ -1237,7 +1288,7 @@ class OperaSpinorFenwickTree(nn.Module):
             scores = scores.masked_fill(~validf[None, :, :], neg)
             w = torch.softmax(scores, dim=-1)                # [B,T,S_eff]
             ctx = (w.unsqueeze(-1) * sp).sum(dim=2)          # [B,T,d]
-            composed, _ = self._compose(
+            composed, _, _ = self._compose(
                 ctx.reshape(B * T, d), acc.reshape(B * T, d),
                 layer_idx, R_L, R_R, R_O)
             out = composed.reshape(B, T, d)
@@ -1347,7 +1398,7 @@ class OperaSpinorFenwickTree(nn.Module):
                             [v[..., 0] + self.oam_chan_emb[layer_idx][None, None],
                              v[..., 1], v[..., 2], v[..., 3]], dim=-1)
                         n_in = v.reshape(B * m * k, d)
-                    composed, _ = self._compose(
+                    composed, _, _ = self._compose(
                         a.reshape(B * m * k, d), n_in,
                         layer_idx, R_L, R_R, R_O)
                     acc = acc.index_copy(1, act,
@@ -1447,7 +1498,7 @@ class OperaSpinorFenwickTree(nn.Module):
                     npairs = kk // 2
                     cl = slots[:, :, 0:2 * npairs:2, :]
                     cr = slots[:, :, 1:2 * npairs:2, :]
-                    comp, _ = self._compose(
+                    comp, _, _ = self._compose(
                         cl.reshape(B * T * npairs, d),
                         cr.reshape(B * T * npairs, d),
                         layer_idx, R_L, R_R, R_O)
@@ -1495,7 +1546,7 @@ class OperaSpinorFenwickTree(nn.Module):
             w = torch.softmax(scores, dim=-1)                    # [B,m,S]
             ctx = (w.unsqueeze(-1) * g_act).sum(dim=2)           # [B,m,d]
 
-            composed, _ = self._compose(
+            composed, _, _ = self._compose(
                 ctx.reshape(B * m, d), last.reshape(B * m, d),
                 layer_idx, R_L, R_R, R_O)
             return base.index_copy(1, act, composed.reshape(B, m, d))
@@ -1523,7 +1574,7 @@ class OperaSpinorFenwickTree(nn.Module):
                 nxt = gathered[:, act, s_idx, :]          # [B, m, d]
                 # v9 arm A: chrono-biased gate on the fold transport
                 # (shared weights; only the bias differs from the tree).
-                composed, _ = self._compose(
+                composed, _, _ = self._compose(
                     a.reshape(B * m, d), nxt.reshape(B * m, d),
                     layer_idx, R_L, R_R, R_O, gate_bias=fgb)
                 acc = acc.index_copy(1, act, composed.reshape(B, m, d))
@@ -1546,7 +1597,7 @@ class OperaSpinorFenwickTree(nn.Module):
                 # a position's block count are masked no-ops.
                 has_slot = (count > s_idx)
                 nxt = gathered[:, :, s_idx, :]
-                composed, _ = self._compose(
+                composed, _, _ = self._compose(
                     acc.reshape(B * T, d), nxt.reshape(B * T, d),
                     layer_idx, R_L, R_R, R_O)
                 composed = composed.reshape(B, T, d)
@@ -1566,7 +1617,7 @@ class OperaSpinorFenwickTree(nn.Module):
             n_pairs = S // 2
             left = slots[:, :, 0:2 * n_pairs:2, :]                # [B,T,n_pairs,d]
             right = slots[:, :, 1:2 * n_pairs:2, :]
-            composed, _ = self._compose(
+            composed, _, _ = self._compose(
                 left.reshape(B * T * n_pairs, d),
                 right.reshape(B * T * n_pairs, d),
                 layer_idx, R_L, R_R, R_O)
@@ -1815,7 +1866,8 @@ class OperaSpinorFenwickTree(nn.Module):
         return torch.tanh(prefix) + 0.1 * prefix
 
     def forward(self, token_ids, lengths, return_tree=False, return_levels=False,
-                return_states=False, head_last_only=False):
+                return_states=False, head_last_only=False, return_energy=False,
+                geom=None, geom_mask=None, geom_block=0):
         B, T = token_ids.shape
         device = token_ids.device
         d = self.d
@@ -1832,6 +1884,14 @@ class OperaSpinorFenwickTree(nn.Module):
         # pe_mode == 'none': tree/Fenwick structure is the only position source
         if self.dropout > 0:
             states = F.dropout(states, p=self.dropout, training=self.training)
+        if geom is not None:
+            # Non-LM callers only (e.g. a spatial-reasoning task): splice
+            # literal geometric vectors into specific leaves' block
+            # `geom_block` BEFORE the tree ever sees them, so the tree's
+            # existing rotation/geometric-product composition operates on
+            # real coordinates for those leaves, not learned embeddings.
+            states = inject_geometry(states, geom, geom_mask, self.nb,
+                                     geom_block)
 
         pad = None  # on-fly indexing: tree built without padding
 
@@ -1841,42 +1901,48 @@ class OperaSpinorFenwickTree(nn.Module):
         # multi-process, so this doesn't currently apply, but torch.compile
         # or a future multi-threaded caller would race on it).
         self._need_locks = return_tree
+        self._need_energy = return_energy
         self._rot_dense_cache.clear()
         per_layer_prefix = []
         tree_info = []
         per_layer_levels = []
+        per_layer_energies = []
 
         def _layer_body(current, layer_idx, T):
             if self.fold_mode == 'scan':
-                # no tree: levels/locks are empty (msup/tree-inspection N/A)
-                return self.scan_prefix(current, layer_idx), [], []
+                # no tree: levels/locks/energies are empty (msup/tree-
+                # inspection/energy-diagnostic N/A)
+                return self.scan_prefix(current, layer_idx), [], [], []
             R_L, R_R, R_O = self.get_rotations(layer_idx)
-            levels, locks = self.build_tree(current, layer_idx, R_L, R_R, R_O)
+            levels, locks, energies = self.build_tree(
+                current, layer_idx, R_L, R_R, R_O)
             prefix = self.prefix_states(levels, T, layer_idx, R_L, R_R, R_O)
             if self.mem_mode == 'delta':
                 # T1.4: the memory reads the layer's token states, the
                 # fold's prefix state queries it by content.
                 prefix = prefix + self._delta_memory(current, prefix,
                                                      layer_idx)
-            return prefix, levels, locks
+            return prefix, levels, locks, energies
 
         current = states
         for layer_idx in range(self.num_layers):
             if self.grad_checkpoint == 'layer' and self.training:
                 from torch.utils.checkpoint import checkpoint
-                assert not (return_tree or return_levels), \
-                    "--checkpoint layer is incompatible with tree/level outputs"
+                assert not (return_tree or return_levels or return_energy), \
+                    "--checkpoint layer is incompatible with tree/level/energy outputs"
                 prefix = checkpoint(
                     lambda c, li=layer_idx: _layer_body(c, li, T)[0],
                     current, use_reentrant=False)
-                levels = locks = None
+                levels = locks = energies = None
             else:
-                prefix, levels, locks = _layer_body(current, layer_idx, T)
+                prefix, levels, locks, energies = _layer_body(current, layer_idx, T)
             per_layer_prefix.append(prefix)
             if return_tree:
                 tree_info.append((levels, locks))
             if return_levels:
                 per_layer_levels.append(levels)
+            if return_energy:
+                per_layer_energies.append(energies)
 
             mixed = self.cross_mlp[layer_idx](prefix)
             if self.dropout > 0:
@@ -1897,6 +1963,7 @@ class OperaSpinorFenwickTree(nn.Module):
             tree=tree_info if return_tree else None,
             levels=per_layer_levels if return_levels else None,
             states=per_layer_prefix if return_states else None,
+            energy=per_layer_energies if return_energy else None,
         )
 
 

@@ -42,12 +42,15 @@ reference math, (2) analytic backward matches autograd, and -- if a CUDA
 GPU + triton are available -- (3) the Triton kernel's forward/backward
 match the fallback bitwise-tolerably, including a non-orthogonal R_O case
 (rot_mode='free').
-NOTE: written and math-verified WITHOUT a CUDA GPU available in this
-session -- ported mechanically from the already-hardware-verified Metal
-kernel rather than re-derived, but the Triton execution path itself is
-UNTESTED until --test passes on real hardware. Please run it (Kaggle's
-T4s, e.g.) before trusting this in a real training run, and report back
-anything that fails.
+NOTE: written and initially math-verified WITHOUT a CUDA GPU (ported
+mechanically from the already-hardware-verified Metal kernel rather than
+re-derived); the Triton execution path itself has since passed --test on
+a Kaggle T4 (2026-08-20): forward err 1.4e-6, backward err 3.8e-6, and
+1.9e-6/7.6e-6 for the non-orthogonal-R_O (rot_mode='free') case. Still
+unmeasured: actual wall-clock speedup vs the eager/_dense_rot path --
+this test only checks correctness, not that it's faster. Re-run --test
+after any change to this file, and on any GPU family you haven't
+verified against yet (fp16/bf16 tolerances in particular are untested).
 """
 import torch
 

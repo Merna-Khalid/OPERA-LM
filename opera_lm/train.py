@@ -248,6 +248,42 @@ def rmt_states_diagnostic(model, test_data, batch_size, device, num_sentences=50
     }
 
 
+@torch.no_grad()
+def energy_diagnostic(model, test_data, batch_size, device):
+    """Versor-inspired diagnostic (arXiv:2602.10195): strict-SO(3) rotor
+    composition preserves paravector norm exactly; OPERA's rot_mode='free'
+    deliberately relaxes R_O's orthogonality, trading that guarantee away
+    for capacity. This tracks the composed node's energy (mean per-block
+    L2 norm) by tree depth BEFORE comp_norm/rms/blockrms rescales it --
+    the only place a non-orthogonal R_O's drift is actually visible,
+    since every norm_mode re-normalizes each node before it becomes the
+    next level's input, erasing the signal from anything read post-norm
+    (see compose_pair_batch's `_need_energy` gate and OperaOutput.energy).
+    A roughly flat curve across depth means the raw composition is
+    stable; one that collapses toward the norm's 1e-6 epsilon floor or
+    grows by an order of magnitude across a handful of levels means
+    'free' rotations are destabilizing the node even though the post-norm
+    output looks fine -- exactly the failure mode this exists to catch
+    before it shows up as a harder-to-diagnose loss regression."""
+    if getattr(model, 'fold_mode', None) == 'scan':
+        return None  # scan builds no tree -- nothing to measure
+    model.eval()
+    batch = test_data[:max(1, batch_size)]
+    bl = max(len(s) for s in batch)
+    token_ids, lengths = make_batch_full(batch, bl)
+    token_ids, lengths = token_ids.to(device), lengths.to(device)
+    out = model(token_ids, lengths, return_energy=True)
+    print("\n=== Energy Diagnostic (pre-norm node energy by tree depth) ===",
+          flush=True)
+    summary = []
+    for li, energies in enumerate(out.energy):
+        curve = [round(e.mean().item(), 3) for e in energies]
+        summary.append(curve)
+        print(f"  layer {li} (levels 1..{len(curve)}): {curve}", flush=True)
+    model.train()
+    return summary
+
+
 # ============================================================================
 # TREE INSPECTION (identical to v7.0)
 # ============================================================================
@@ -733,7 +769,8 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
             if msup:
                 out = model_c(token_ids, lengths, return_levels=True)
                 loss, _, _ = lm_loss(out.logits, token_ids, lengths)
-                loss = loss + msup_weight * msup_loss(model, out.levels, token_ids, lengths)
+                loss = loss + msup_weight * msup_loss(
+                    model, out.levels, token_ids, lengths, aux_frac=aux_frac)
             else:
                 # OPT: final-layer head inside the compiled graph; aux
                 # layers' head computed on aux_frac of positions only.
@@ -800,6 +837,14 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
                 lambda b: compute_perplexity(eval_model, test_short[:200], max_len, b, device),
                 _eval_batch(32, max_len), device)
             print(f"    per-token perplexity: {ppl:.2f}", flush=True)
+            # raw `model` (not eval_model/model_c): return_energy changes
+            # forward()'s control flow, and model_c may be torch.compile'd
+            # against the default (return_energy=False) path -- same
+            # eager-only reasoning as inspect_tree/rmt_states_diagnostic
+            # below, just hit periodically instead of only at the end.
+            _oom_backstop(
+                lambda b: energy_diagnostic(model, test_short[:b], b, device),
+                _eval_batch(32, max_len), device)
 
     if is_main:
         print(f"\n=== Final Evaluation ===", flush=True)
@@ -841,6 +886,10 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
         lambda b: rmt_states_diagnostic(model, test_short, b, device, num_sentences=500),
         32, device)
 
+    energy = _oom_backstop(
+        lambda b: energy_diagnostic(model, test_short[:b], b, device),
+        _eval_batch(32, max_len), device)
+
     ckpt_path = os.path.join(out_dir, f'opera_v8_0_{tag.replace("+", "_")}.pt')
     torch.save(model.state_dict(), ckpt_path)
     print(f"\nCheckpoint saved to {ckpt_path}", flush=True)
@@ -863,6 +912,7 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
         'extrapolation': {k: v[0] for k, v in extrap.items()},
         'init_perplexity': init_ppl,
         'rmt': rmt,
+        'energy_by_depth': energy,
         'opt': {'compile': compile_mode, 'gpu_data': gpu_data,
                 'aux_frac': aux_frac, 'amp': use_amp,
                 'lr': max_lr, 'warmup': warmup_steps,

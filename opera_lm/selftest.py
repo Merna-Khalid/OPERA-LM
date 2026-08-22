@@ -25,7 +25,7 @@ import torch
 from .model import (OperaSpinorFenwickTree, count_params, fenwick_blocks,
                     level_sin_enc, fold_work_counts, quat_to_rotmat,
                     quat_sandwich, affine_compose, associative_scan,
-                    rotor_pos_tables, apply_rotor_pe)
+                    rotor_pos_tables, apply_rotor_pe, inject_geometry)
 from .losses import lm_loss, msup_loss
 from .data import doc_chunks, doc_chunk_sizes
 from .train import (curriculum_len, GpuBatchSource, extrapolation_eval,
@@ -1406,8 +1406,8 @@ def test_gate_bias():
     m_t0.eval(); m_tb.eval()
     with torch.no_grad():
         emb9 = m_t0.word_emb(tok9)
-        lv0, _ = m_t0.build_tree(emb9, 0, *m_t0.get_rotations(0))
-        lvb, _ = m_tb.build_tree(emb9, 0, *m_tb.get_rotations(0))
+        lv0, _, _ = m_t0.build_tree(emb9, 0, *m_t0.get_rotations(0))
+        lvb, _, _ = m_tb.build_tree(emb9, 0, *m_tb.get_rotations(0))
         for a_, b_ in zip(lv0, lvb):
             assert torch.equal(a_, b_), "tree path reads fold_gate_bias"
         p0 = m_t0(tok9, len9).logits[-1]
@@ -1523,6 +1523,53 @@ def test_incremental_decoding():
         assert torch.equal(inc11, inc11b), "reset() does not reproduce"
         print(f"  incremental b [{tag11}]: per-position logits match full "
               f"forward to {derr11:.1e} over T={T11}; reset exact")
+
+
+def test_geometry_injection_incremental():
+    # inject_geometry (non-LM callers, e.g. a spatial-reasoning task):
+    # splicing a literal vector into a leaf's block BEFORE the tree sees
+    # it must (a) leave every untouched leaf/block bit-for-bit identical
+    # to plain word_emb, and (b) stay exactly equivalent between the
+    # batched forward and OperaDecoder.append, same bar as
+    # test_incremental_decoding above.
+    torch.manual_seed(20)
+    m20 = OperaSpinorFenwickTree(vocab_size=101, d=64, nb=16, num_layers=2,
+                                 pe_mode='none', rot_mode='free',
+                                 fold_mode='left')
+    m20.eval()
+    T20 = 33                          # odd + crosses power-of-2 boundaries
+    tok20 = torch.randint(1, 100, (1, T20))
+    len20 = torch.tensor([T20])
+    mask20 = torch.rand(1, T20) < 0.3
+    geom20 = torch.randn(1, T20, 3)
+    with torch.no_grad():
+        # (a) geom=None reproduces plain forward exactly (default path
+        # is textually unchanged -- no injection branch runs at all).
+        base20 = m20(tok20, len20, head_last_only=True).logits[-1]
+        same20 = m20(tok20, len20, head_last_only=True, geom=None,
+                    geom_mask=None).logits[-1]
+        assert torch.equal(base20, same20), "geom=None must be a no-op"
+
+        # (b) batched injection vs per-token incremental injection.
+        full20 = m20(tok20, len20, head_last_only=True, geom=geom20,
+                    geom_mask=mask20).logits[-1][0]                  # [T,V]
+        dec20 = OperaDecoder(m20)
+        inc20 = torch.stack([
+            dec20.append(int(tok20[0, t]),
+                         geom=geom20[0, t] if mask20[0, t] else None)
+            for t in range(T20)])
+    derr20 = (full20 - inc20).abs().max().item()
+    assert derr20 < 1e-5, f"geometry injection diverges: {derr20:.2e}"
+    dec20.reset()
+    with torch.no_grad():
+        inc20b = torch.stack([
+            dec20.append(int(tok20[0, t]),
+                         geom=geom20[0, t] if mask20[0, t] else None)
+            for t in range(T20)])
+    assert torch.equal(inc20, inc20b), "reset() does not reproduce"
+    print(f"  geometry injection: batched vs incremental match to "
+          f"{derr20:.1e} over T={T20} ({int(mask20.sum())} injected "
+          f"positions); geom=None no-op verified; reset exact")
 
 
 def test_muon_optimizer():
@@ -1813,6 +1860,7 @@ _ARMS = [
     test_gate_bias,
     test_curriculum,
     test_incremental_decoding,
+    test_geometry_injection_incremental,
     test_muon_optimizer,
     test_readout_and_delta_memory_arms,
 ]

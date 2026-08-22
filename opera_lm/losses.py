@@ -83,7 +83,7 @@ def lm_loss(all_logits, token_ids, lengths, aux_weight=0.5):
     return total / (denom * weight_total), final_sum, vcount
 
 
-def msup_loss(model, per_layer_levels, token_ids, lengths):
+def msup_loss(model, per_layer_levels, token_ids, lengths, aux_frac=1.0):
     """Multi-scale supervision, vectorized (one tensor op per tree level).
 
     An internal node at level l with index i summarizes span
@@ -91,7 +91,21 @@ def msup_loss(model, per_layer_levels, token_ids, lengths):
     i.e. token at position (i+1)*2^l, which is targets[:, (i+1)*2^l - 1].
     Nodes whose target falls outside the sentence are masked out.
     Uses the same (possibly tied) head; adds no parameters.
-    Returns a mean loss over all valid (node, batch) pairs."""
+    Returns a mean loss over all valid (node, batch) pairs.
+
+    aux_frac (v9 OOM mitigation): mirrors train_lm_loss's aux-position
+    subsampling -- supervise only a random aux_frac fraction of each
+    level's nodes, rescaled by 1/aux_frac (unbiased estimator of the
+    full sum; the normalizing `count` below is still the TRUE full-
+    resolution count, computed before subsampling). aux_frac=1.0
+    reproduces the original, full-resolution loss exactly. Every level
+    does a full-vocab head projection per node ([B, m, V]), none of it
+    checkpointed, so at long T this dominates activation memory even
+    after the compose node itself is checkpointed (--checkpoint level):
+    a curriculum run that stopped OOMing in compose_pair_batch at
+    T_cur=128 went on to OOM here instead, one call later in the same
+    step, with grad_checkpoint='level' set but aux_frac left unwired on
+    this call site -- this parameter is that fix."""
     B, T = token_ids.shape
     device = token_ids.device
     targets = token_ids[:, 1:]                                   # [B, T-1]
@@ -113,17 +127,30 @@ def msup_loss(model, per_layer_levels, token_ids, lengths):
             tgt_pos = tgt_pos[keep]
             m = node_ids.shape[0]
 
-            states = levels[level_idx][:, node_ids, :]           # [B, m, d]
-            logits = model.apply_head(states)                    # [B, m, V]
-            tgt = targets[:, tgt_pos]                            # [B, m]
-            # valid if the predicted position is inside the sentence
+            # valid if the predicted position is inside the sentence --
+            # computed at full resolution BEFORE subsampling, since count
+            # (the loss normalizer) must reflect the true node population.
             valid = (tgt_pos[None, :] + 1) < lengths[:, None]    # [B, m]
+            count = count + valid.sum()
+
+            if aux_frac < 1.0:
+                m_sub = max(1, int(round(m * aux_frac)))
+                sub = torch.randperm(m, device=device)[:m_sub]
+                node_ids = node_ids[sub]
+                tgt_pos = tgt_pos[sub]
+                valid = valid[:, sub]
+                scale = 1.0 / aux_frac
+            else:
+                scale = 1.0
+
+            states = levels[level_idx][:, node_ids, :]           # [B, m', d]
+            logits = model.apply_head(states)                    # [B, m', V]
+            tgt = targets[:, tgt_pos]                            # [B, m']
 
             loss_per = F.cross_entropy(
                 logits.reshape(-1, logits.shape[-1]), tgt.reshape(-1),
-                reduction='none').reshape(B, m)
-            total = total + (loss_per * valid.float()).sum()
-            count = count + valid.sum()
+                reduction='none').reshape(B, -1)
+            total = total + (loss_per * valid.float()).sum() * scale
     if isinstance(count, int):                                   # no levels contributed
         return torch.zeros((), device=device)
     return total / count.clamp(min=1).float()

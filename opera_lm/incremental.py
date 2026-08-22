@@ -26,7 +26,7 @@ import torch
 import torch.nn.functional as F
 
 from .model import (sinusoidal_pos_enc, rotor_pos_tables, apply_rotor_pe,
-                    level_sin_enc)
+                    level_sin_enc, inject_geometry)
 
 
 def fenwick_blocks_of(L):
@@ -113,9 +113,16 @@ class OperaDecoder:
         else:
             self.mem = None
 
-    def _embed_position(self, token_id, t):
+    def _embed_position(self, token_id, t, geom=None, geom_block=0):
         """Embedding + positional contribution for position t (eval: no
-        dropout). Matches model.forward's embedding stage for one row."""
+        dropout). Matches model.forward's embedding stage for one row.
+
+        geom (optional [3] tensor): mirrors forward()'s geom/geom_mask --
+        non-LM callers only, splices a literal vector into block
+        `geom_block` of this ONE leaf, after PE, before it enters the
+        tree. A single append() call is always "this position or not",
+        so unlike forward() there's no separate mask arg: geom is not
+        None means inject here, with an all-True (scalar) mask."""
         m = self.model
         tok = torch.tensor([[token_id]], dtype=torch.long, device=self.device)
         x = m.word_emb(tok)[0, 0]                                  # [d]
@@ -125,6 +132,9 @@ class OperaDecoder:
             cos, sin = rotor_pos_tables(t + 1, m.nb, self.device)
             x = apply_rotor_pe(x.reshape(1, 1, -1),
                                cos[t:], sin[t:], m.nb)[0, 0]
+        if geom is not None:
+            mask = torch.ones((), dtype=torch.bool, device=self.device)
+            x = inject_geometry(x, geom, mask, m.nb, geom_block)
         return x
 
     def _fold_twist(self, blk, level, layer_idx):
@@ -141,11 +151,11 @@ class OperaDecoder:
         return torch.stack([sc, vx2, vy2, vz], dim=-1).reshape(m.d)
 
     @torch.no_grad()
-    def append(self, token_id):
+    def append(self, token_id, geom=None, geom_block=0):
         m = self.model
         t = self.t
         d = m.d
-        x = self._embed_position(int(token_id), t)
+        x = self._embed_position(int(token_id), t, geom, geom_block)
         prefix = None
         for l in range(m.num_layers):
             R_L, R_R, R_O = self.rots[l]
