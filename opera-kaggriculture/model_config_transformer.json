@@ -1,0 +1,15 @@
+{
+  "vocab_size": 245,
+  "d": 96,
+  "nheads": 4,
+  "num_layers": 2,
+  "ffn_mult": 3.3,
+  "tie": true,
+  "pe_mode": "nope",
+  "use_geom": false,
+  "ckpt": "tf_kagri_model.pt",
+  "max_len": 256,
+  "final_eval_loss": 0.064461891915632,
+  "final_eval_exact_match": 0.9746081702812488,
+  "n_params": 221390
+}

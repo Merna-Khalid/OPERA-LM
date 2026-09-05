@@ -1,0 +1,16 @@
+{
+  "vocab_size": 245,
+  "d": 128,
+  "nb": 32,
+  "num_layers": 2,
+  "tie": true,
+  "pe_mode": "none",
+  "fold_mode": "left",
+  "rot_mode": "free",
+  "geom_block": 0,
+  "use_geom": true,
+  "ckpt": "runs_kagri_geom/kagri_model.pt",
+  "final_eval_loss": 0.05198256443203105,
+  "final_eval_exact_match": 0.9810598610591245,
+  "max_len": 256
+}
