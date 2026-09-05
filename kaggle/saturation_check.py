@@ -62,3 +62,14 @@ def main():
 
 if __name__ == "__main__":
     main()
+    # Hard exit, same as train_tokenizer.py/prepare_data.py: HF streaming
+    # leaves downloader threads alive after main() returns, and they crash
+    # the interpreter during finalization (observed on Kaggle 2026-09-05:
+    # "PyGILState_Release ... runtime state: finalizing" -> SIGABRT AFTER
+    # the output json was already written). The artifact is complete by
+    # the time we get here; skip teardown entirely.
+    import os
+    import sys
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)

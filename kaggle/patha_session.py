@@ -330,15 +330,20 @@ def stage_data(st):
     save_state(st)
     push_all(st, "data: tokenizer built")
 
-    # (2) saturation check + adoption rule (prereg §5.1)
+    # (2) saturation check + adoption rule (prereg §5.1). Judged by the
+    # ARTIFACT, not the exit code: HF-streaming scripts can abort during
+    # interpreter finalization AFTER writing their output (the repo's
+    # known downloader-thread landmine; saturation_check now os._exit(0)s
+    # too, but a half-dead rc with a complete json is a pass).
     if not have_data("tokenizer_saturation.json"):
-        rc = run([PY, os.path.join(REPO, "kaggle", "saturation_check.py"),
-                  "--old", os.path.join(REPO, "opera-chat", "tokenizer.json"),
-                  "--new", find_data("tokenizer_2m.json"),
-                  "--out", os.path.join(WORK_DATA,
-                                        "tokenizer_saturation.json")],
-                 "data_saturation.log")
-        assert rc == 0, "saturation check failed"
+        run([PY, os.path.join(REPO, "kaggle", "saturation_check.py"),
+             "--old", os.path.join(REPO, "opera-chat", "tokenizer.json"),
+             "--new", find_data("tokenizer_2m.json"),
+             "--out", os.path.join(WORK_DATA,
+                                   "tokenizer_saturation.json")],
+            "data_saturation.log")
+        assert have_data("tokenizer_saturation.json"), \
+            "saturation check failed (no output json)"
     with open(find_data("tokenizer_saturation.json")) as f:
         sat = json.load(f)
     st["measured"]["tokenizer_saturation"] = sat
