@@ -11,8 +11,12 @@ quota, ~6–9 sessions.
 
 1. **Create the notebook**: Kaggle → Code → New Notebook → File →
    Import Notebook → upload `kaggle/OPERA_PathA.ipynb` from this repo.
-2. **Settings → Accelerator → GPU T4 x2.** (P100 is confirmed broken —
+2. **Settings → Accelerator:** start with **none (CPU)** for the first
+   (data-build) session — it's free and uses no GPU quota — then switch
+   to **GPU T4 x2** for every session after. (P100 is confirmed broken —
    Kaggle's torch wheel has no sm_60 kernels; the engine also checks.)
+   Switching accelerator restarts the session; that's expected and safe
+   (see Session mechanics below).
 3. **Settings → Internet → On.**
 4. **Add-ons → Secrets** → add two secrets:
    - `KAGGLE_USERNAME` — your kaggle username
@@ -22,12 +26,20 @@ quota, ~6–9 sessions.
    `PATHA_COMMIT` with the commit hash you pushed this kit under (or
    leave `main`).
 
-## Session flow (each one: open notebook → Save & Run All → walk away)
+## Session flow (each one: open notebook → **Save & Run All** → walk away)
 
-Sessions continue server-side; closing the tab is fine. The engine
-(`kaggle/patha_session.py`) auto-picks the next stage, trains inside a
-wall-clock governor (default 10.5h + 30min hard margin, under Kaggle's
-~12h cap), checkpoints every 1000 steps, and pushes:
+**Session mechanics to know:** switching the accelerator (CPU ↔ T4 x2)
+restarts the session and wipes `/kaggle/working`. Only pushed datasets
+and saved notebook versions survive. The engine pushes after **every
+artifact and stage**, so a killed session loses at most the artifact in
+flight; **Save & Run All** (not interactive Run All) additionally
+persists `/kaggle/working` as a notebook version. Attached inputs (Add
+Input) are notebook configuration — they persist across restarts and
+remount each session.
+
+The engine (`kaggle/patha_session.py`) auto-picks the next stage, trains
+inside a wall-clock governor (default 10.5h + 30min hard margin, under
+Kaggle's ~12h cap), checkpoints every 1000 steps, and pushes:
 
 - `opera-lm-patha-ckpt` (private dataset): runs/, state.json, logs/,
   artifacts/

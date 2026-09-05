@@ -299,13 +299,17 @@ def stage_env(st):
 
 def stage_data(st):
     """One-time data build (CPU session, no GPU quota). Writes
-    WORK_DATA and pushes the data dataset."""
+    WORK_DATA and pushes after EVERY artifact -- a mid-stage session
+    kill (cap hit, accelerator switch, manual stop) then loses at most
+    the one artifact in flight, not the whole build, because the pushed
+    dataset is what the next session re-attaches ( Kaggle wipes
+    /kaggle/working on every session restart)."""
     os.makedirs(WORK_DATA, exist_ok=True)
 
     # (1) 2M-line tokenizer -- the Mac-segfault fix is cloud RAM; staged
     # fallback 2M -> 1.5M -> 1M per prereg §5.1's spirit (measured).
-    tok_2m = os.path.join(WORK_DATA, "tokenizer_2m.json")
-    if not os.path.exists(tok_2m):
+    if not have_data("tokenizer_2m.json"):
+        tok_2m = os.path.join(WORK_DATA, "tokenizer_2m.json")
         for docs in (2_000_000, 1_500_000, 1_000_000):
             rc = run([PY, "opera-chat/train_tokenizer.py",
                       "--docs", str(docs), "--out", tok_2m],
@@ -317,61 +321,71 @@ def stage_data(st):
                 st["measured"]["tokenizer_docs"] = docs
                 st["measured"]["tokenizer_peak_rss_gb"] = round(peak, 1)
                 break
-        assert os.path.exists(tok_2m), "tokenizer training failed at 1M+"
+        assert have_data("tokenizer_2m.json"), \
+            "tokenizer training failed at 1M+"
     save_state(st)
+    push_all(st, "data: tokenizer built")
 
     # (2) saturation check + adoption rule (prereg §5.1)
-    sat_json = os.path.join(WORK_DATA, "tokenizer_saturation.json")
-    if not os.path.exists(sat_json):
+    if not have_data("tokenizer_saturation.json"):
         rc = run([PY, os.path.join(REPO, "kaggle", "saturation_check.py"),
                   "--old", os.path.join(REPO, "opera-chat", "tokenizer.json"),
-                  "--new", tok_2m, "--out", sat_json],
+                  "--new", find_data("tokenizer_2m.json"),
+                  "--out", os.path.join(WORK_DATA,
+                                        "tokenizer_saturation.json")],
                  "data_saturation.log")
         assert rc == 0, "saturation check failed"
-    with open(sat_json) as f:
+    with open(find_data("tokenizer_saturation.json")) as f:
         sat = json.load(f)
     st["measured"]["tokenizer_saturation"] = sat
-    chosen = tok_2m if sat.get("adopt_new") else os.path.join(
-        REPO, "opera-chat", "tokenizer.json")
+    chosen = (find_data("tokenizer_2m.json") if sat.get("adopt_new")
+              else os.path.join(REPO, "opera-chat", "tokenizer.json"))
     shutil.copy(chosen, os.path.join(WORK_DATA, "tokenizer.json"))
     log(f"tokenizer adopted: {'NEW 2M-line' if sat.get('adopt_new') else 'OLD (§4.8 comparability)'}")
     save_state(st)
+    push_all(st, "data: tokenizer adopted")
 
-    # (3) smoltalk pools
-    smol = os.path.join(WORK_DATA, "data_smoltalk_512.pkl")
-    if not os.path.exists(smol):
+    # (3) smoltalk pools. have_data() checks the pushed dataset too, so
+    # a session resuming after a mid-stage kill skips whatever already
+    # reached the dataset and rebuilds only what did not.
+    if not have_data("data_smoltalk_512.pkl"):
         rc = run([PY, "opera-chat/prepare_data.py",
-                  "--tokenizer", os.path.join(WORK_DATA, "tokenizer.json"),
-                  "--out", smol, "--n-convs", "5000000",
-                  "--max-len", str(MAX_LEN),
+                  "--tokenizer", find_data("tokenizer.json"),
+                  "--out", os.path.join(WORK_DATA, "data_smoltalk_512.pkl"),
+                  "--n-convs", "5000000", "--max-len", str(MAX_LEN),
                   "--eval-max-len", str(EVAL_MAX)],
                  "data_prepare_smoltalk.log")
         assert rc == 0, "smoltalk prep failed"
+        push_all(st, "data: smoltalk pool built")
 
     # (4) FineWeb-Edu 250M-token pool
-    fw = os.path.join(WORK_DATA, "data_fineweb_512.pkl")
-    if not os.path.exists(fw):
+    if not have_data("data_fineweb_512.pkl"):
         rc = run([PY, "opera-chat/prepare_fineweb.py",
-                  "--tokenizer", os.path.join(WORK_DATA, "tokenizer.json"),
-                  "--out", fw, "--max-tokens", "250000000",
-                  "--max-len", str(MAX_LEN),
+                  "--tokenizer", find_data("tokenizer.json"),
+                  "--out", os.path.join(WORK_DATA, "data_fineweb_512.pkl"),
+                  "--max-tokens", "250000000", "--max-len", str(MAX_LEN),
                   "--eval-max-len", str(EVAL_MAX)],
                  "data_prepare_fineweb.log")
         assert rc == 0, "fineweb prep failed"
+        push_all(st, "data: fineweb pool built")
 
-    # (5) pack both train pools -> eval-only pkl + npy pair
-    for pkl in (smol, fw):
-        prefix = pkl[:-4]
-        if not os.path.exists(prefix + ".tokens.npy"):
+    # (5) pack both train pools -> eval-only pkl + npy pair. The source
+    # pkl may sit on the read-only dataset mount (read is fine); pack
+    # OUTPUTS always go to the writable WORK_DATA, then push.
+    for name in ("data_smoltalk_512", "data_fineweb_512"):
+        prefix = os.path.join(WORK_DATA, name)
+        if not have_data(name + ".tokens.npy"):
             rc = run([PY, os.path.join(REPO, "kaggle", "pack_data.py"),
-                      "--pkl", pkl, "--prefix", prefix,
+                      "--pkl", find_data(name + ".pkl"),
+                      "--prefix", prefix,
                       "--max-len", str(MAX_LEN)], "data_pack.log")
-            assert rc == 0, f"packing {pkl} failed"
+            assert rc == 0, f"packing {name} failed"
+            push_all(st, f"data: {name} packed")
 
     # (6) bucket-population report (prereg §5.2)
     run([PY, os.path.join(REPO, "kaggle", "bucket_report.py"),
-         "--smoltalk", smol[:-4] + ".eval.pkl",
-         "--fineweb", fw[:-4] + ".eval.pkl",
+         "--smoltalk", find_data("data_smoltalk_512.eval.pkl"),
+         "--fineweb", find_data("data_fineweb_512.eval.pkl"),
          "--max-len", str(MAX_LEN), "--eval-max-len", str(EVAL_MAX),
          "--out", os.path.join(WORK_DATA, "bucket_report.json")],
         "data_buckets.log")
