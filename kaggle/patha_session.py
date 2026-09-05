@@ -132,6 +132,8 @@ def restore_ckpts():
 # ---------------------------------------------------------------- run
 
 def _spawn(cmd, logfile, env_extra):
+    """Start one job; returns (proc, logfile_handle, logfile_path) --
+    the 3-tuple run_jobs/_watch unpack."""
     os.makedirs(os.path.dirname(logfile), exist_ok=True)
     f = open(logfile, "a")
     f.write(f"\n=== {time.ctime()} ===\n{' '.join(cmd)}\n")
@@ -140,7 +142,7 @@ def _spawn(cmd, logfile, env_extra):
     full_env.update(env_extra)
     proc = subprocess.Popen(cmd, cwd=REPO, stdout=f, stderr=f,
                             env=full_env, start_new_session=True)
-    return proc, f
+    return proc, f, logfile
 
 
 def _watch(procs):
@@ -187,16 +189,18 @@ def run(cmd, log_name, env=None):
 
 
 def parse_s_per_step(logfile):
-    """Last '(...s/step)' on a line that also shows T_cur 512 -- the
-    steady-state number the session budgeting uses."""
-    pat = re.compile(rf"T_cur {MAX_LEN}\b.*\(([\d.]+)s/step\)"
-                     rf"|\(([\d.]+)s/step\).*T_cur {MAX_LEN}\b")
+    """Last '<x>s/step' on a line that also shows 'T_cur 512' -- the
+    steady-state number the session budgeting uses. (The log format is
+    '(<cumulative>s, <avg>s/step)  T_cur 512': one paren wraps both
+    numbers, so match the inner value, not a paren-prefixed one.)"""
     best = None
     with open(os.path.join(WORK, "logs", logfile)) as f:
         for line in f:
-            m = pat.search(line)
+            if f"T_cur {MAX_LEN}" not in line:
+                continue
+            m = re.search(r"([\d.]+)s/step", line)
             if m:
-                best = float(m.group(1) or m.group(2))
+                best = float(m.group(1))
     return best
 
 
