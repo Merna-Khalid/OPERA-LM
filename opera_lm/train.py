@@ -11,6 +11,7 @@ import torch.nn as nn
 from .model import OperaSpinorFenwickTree, count_params, fold_work_counts
 from .losses import lm_loss, train_lm_loss, msup_loss
 from .data import load_data
+from .packed import packed_stats
 
 def _eval_batch(base, max_len, ref=256):
     """Scale an eval batch size down for max_len > ref (same principle as
@@ -386,7 +387,7 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
           data=None, idx2word=None, optimizer='adamw', muon_lr=0.02,
           readout_mode='none', readout_max_slots=16,
           mem_mode='none', mem_dim=128, init_weights_from=None,
-          ddp=False):
+          packed_data=None, ddp=False):
     # DDP (multi-GPU data parallelism, added for the Kaggle 2xT4 tier --
     # a single T4 measured ~8.5x slower than the project's A100, so real
     # multi-GPU throughput matters there in a way it didn't on Colab).
@@ -629,15 +630,33 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
     # rank would compute gradients on the identical batch and DDP's
     # all-reduce would just average N copies of the same gradient, zero
     # real parallelism benefit for 2x the power draw.
+    # packed_data: path prefix of a packed pool (.tokens.npy/.offsets.npy,
+    # see opera_lm.packed) -- replaces the resident tensor with an mmap
+    # fetch per step. The generator and randint call are IDENTICAL to
+    # GpuBatchSource, so the batch stream and checkpoint format are
+    # unchanged; train_data is then only used for eval-side statistics
+    # (and may be the empty list when the caller keeps just eval pools).
     batch_source = None
     if gpu_data:
         try:
-            batch_source = GpuBatchSource(train_data, max_len, torch_device,
-                                          seed + rank)
-            if is_main:
-                print(f"  GPU batch source: {batch_source.N:,} sequences on "
-                      f"{torch_device} ({batch_source.ids.numel() * 8 / 2**20:.0f} MiB)"
-                      + (f", {world_size} ranks" if ddp else ""), flush=True)
+            if packed_data:
+                from .packed import PackedBatchSource
+                batch_source = PackedBatchSource(packed_data, max_len,
+                                                 torch_device, seed + rank)
+                if is_main:
+                    st_ = packed_stats(packed_data)
+                    print(f"  packed batch source: {batch_source.N:,} seqs "
+                          f"({st_['total_tokens'] / 2**20:.0f}M tokens, "
+                          f"mmap) on {torch_device}"
+                          + (f", {world_size} ranks" if ddp else ""),
+                          flush=True)
+            else:
+                batch_source = GpuBatchSource(train_data, max_len,
+                                              torch_device, seed + rank)
+                if is_main:
+                    print(f"  GPU batch source: {batch_source.N:,} sequences on "
+                          f"{torch_device} ({batch_source.ids.numel() * 8 / 2**20:.0f} MiB)"
+                          + (f", {world_size} ranks" if ddp else ""), flush=True)
         except Exception as e:
             if is_main:
                 print(f"  WARNING: gpu_data failed ({e}); CPU sampling", flush=True)

@@ -1,0 +1,188 @@
+# OPERA Path A — Pre-registered protocol: length generalization of pretrained chat models (train @ 512, evaluate to 8192)
+
+**Version:** 1.0 — 2026-09-05
+**Status:** PRE-REGISTERED. Committed before the first GPU session of this
+study. No post-hoc edits: deviations discovered mid-study are appended in
+the *Amendments log*, never rewritten.
+**Hardware note:** all runs on Kaggle free tier (2×T4, DDP where stated),
+fp16 + GradScaler (Turing capability gate), interrupt-safe multi-session
+execution with exact-stream resume. Multi-session resume restores model,
+optimizer, step, and all RNG states, so a resumed run's batch stream is
+identical to an uninterrupted one on the same hardware/software stack.
+
+---
+
+## 1. Motivation and lineage
+
+This study extends the 155M Colab study (§4.8 of the paper draft v1.3):
+
+- Chat-only from scratch: **OPERA won** in-length (11.78 vs RoPE 18.60)
+  and every extrapolation bucket to 2048.
+- FineWeb-Edu pretrain (82M tokens) from scratch: transformer won (83.55
+  vs 105.89).
+- Two-stage (pretrain → smoltalk SFT): **transformer won** (11.24 vs
+  13.04), reversing run 1.
+
+Two questions are open and both are pre-registered here:
+(a) does OPERA's flat position curve — measured only on the 20M pilot —
+survive pretraining + SFT at 155M and extend to 16× training length?
+(b) does the two-stage flip persist at 3× the pretraining budget?
+
+## 2. Protocol (frozen)
+
+### 2.1 Data
+
+- **Tokenizer:** byte-level BPE. Default = the existing 16,384-vocab
+  `tokenizer.json` (the one used by §4.8). A fresh tokenizer trained on
+  2,000,000 smoltalk message lines (the Mac-segfault fix, run on cloud
+  RAM) is evaluated under the adoption rule in §5.1 before any training.
+- **SFT corpus:** full smoltalk `all` split (1,043,917 conversations),
+  `prepare_data.py --n-convs 5000000 --max-len 512 --eval-max-len 8192`,
+  conversation-level 95/5 split (seed 42, as baked into the script),
+  train = chunks ≤ 512, test_long = (512, 8192].
+- **Pretrain corpus:** FineWeb-Edu `sample-10BT` streamed to a 250M-token
+  pool (`prepare_fineweb.py`), chunked at 512.
+- **Packed loading:** pools are packed to flat int32 arrays + offsets and
+  memory-mapped (`--batch-source packed`); batch streams are verified
+  identical to the incumbent `GpuBatchSource` (selftest) so sampling
+  semantics change nothing.
+
+### 2.2 Arms (matched protocol)
+
+| arm | architecture | params | position mechanism |
+|---|---|---|---|
+| OPERA | d=1664, nb=416, 8 layers, fold left, rot free, msup, tie | 154,815,249 | constructive (Fenwick), pe none |
+| TF RoPE | d=1264, 8 heads, 7 layers, tied | 155,049,777 | rotary (vanilla extension, `max_pe_len=8192`, no NTK/YaRN — limitation, §7) |
+| TF NoPE | same as RoPE arm | same | none (causal-mask emergent) |
+
+Identical: seed 42, Muon(lr 0.02) + AdamW(lr 1e-3) partition, warmup 500,
+WSD schedule (decay over final 20%), grad clip 1.0, fp16 autocast +
+GradScaler (T4), curriculum (64, 250) → 512, effective batch **32**
+(16/rank × 2 ranks DDP for OPERA on 2×T4; batch 32 single-T4 for each
+transformer arm; the two TF arms run concurrently, one per GPU).
+
+Known deviation from §4.8 (logged): §4.8 was batch 16 × T=256 single A100
+with cosine LR; this study is batch 32 × T=512 with WSD. All three arms
+share the new protocol; no arm is favored. LR was not retuned at the new
+batch size (recipe-asymmetry limitation carries over).
+
+### 2.3 Schedules
+
+- **Stage 1 — pretrain:** 15,000 steps × 16,384 tokens/step ≈ **246M
+  tokens** (target "≈250M"; 3.0× the §4.8 attempt). Decision points at
+  step 6,100 (≈100M) and 9,150 (≈150M) per §5.3.
+- **Stage 2 — SFT:** 2,500 steps ≈ 41M tokens ≈ 1.2 epochs of the smoltalk
+  pool — token-matched to §4.8's SFT (10k × 4,096). Initialized via
+  `--init-weights-from` (weights only).
+- **Stage 3 — instruments:** (a) in-length PPL, test_short[:5000] @ 512;
+  (b) extrapolation buckets (width 512) to 8192 from test_long, counts
+  reported per bucket; (c) position curves to 8192 (below); (d) sampling
+  demo at contexts 1k/2k/4k/8k from held-out long conversations, temp 0.8
+  top-p 0.9, `max_ctx` 8192, incremental decoder.
+
+### 2.4 Position-curve instrument (`opera-chat/position_curve.py`)
+
+Final-layer per-position next-token CE, fp32, no autocast, no grad;
+sequences = first 1,000 of test_long with ≥ 1024 tokens (pool order —
+the v1.2 convention); bands of 128 positions to 8192; per-band token
+counts always reported. Headline quantities per arm: best-band CE,
+degradation best → final 2× band (last band ending ≤ 1024), degradation
+best → final horizon band (the band containing 8191), across-boundary
+delta (mean CE [512,1024) minus [0,512)), mean CE beyond 4096.
+
+## 3. Hypotheses and decision rules
+
+**H1 (flatness survives pretraining).** OPERA's position-curve
+degradation (best band → final horizon band, §2.4) is ≤ 50% of TF
+RoPE's on the same sequences. *Decision:* PASS if
+`deg_opera ≤ 0.5 × deg_rope` AND OPERA's across-boundary delta
+≤ +0.10 nats. FAIL otherwise; report both numbers regardless.
+
+**H2 (absolute long-context quality).** OPERA's mean CE over positions
+≥ 4096 (aggregated bands) is lower than TF RoPE's. *Decision:* PASS if
+strictly lower. Report NoPE alongside (no gate).
+
+**H3 (the two-stage flip at 3× budget).** In-length PPL (§2.3a) ranks
+the three arms after SFT. *Decision:* report the ranking verbatim; the
+flip PERSISTS if RoPE < OPERA; CLOSES/REVERSES otherwise. Pre-stated
+interpretation: persistence supports §4.8's "transformer raw-text head
+start" reading; reversal is the headline outcome for geometric models.
+Either way this is a result, not a failure.
+
+**H4 (honest flatness null).** If TF RoPE's degradation (best → final
+horizon band) is < 0.15 nats, RoPE is "flat" on this protocol and H1's
+flatness claim does not discriminate; the long-context claim then rests
+on H2 + O(T log T) cost only. *Decision:* recorded automatically from
+the curve; no discretion.
+
+All gates are computed by a script from the three `position_curve.py`
+JSON outputs + results.jsonl rows; numbers are copied verbatim into the
+outcomes section, appended below when the study completes.
+
+## 4. Session-robustness policy (part of the protocol)
+
+Kaggle sessions are governor-limited (clean stop before the 9h T4×2
+cap), checkpoint every 1,000 steps (≈25–40 min), checkpoints pushed to
+the persistent Kaggle Dataset in-session. A preempted session resumes
+from the last pushed checkpoint with exact-stream resume. Consequence
+for validity: none intended — resume is state-exact; any deviation
+(e.g. a checkpoint lost to a double fault, forcing a re-run from an
+earlier step) is logged in the Amendments log with the step range
+affected.
+
+## 5. Data rules (pre-committed)
+
+### 5.1 Tokenizer adoption rule
+Compare old (500k-line) vs new (2M-line) tokenizer on 1,000 conversations
+sampled from the smoltalk stream (in-distribution sample; streaming a
+strictly held-out range past the tokenizers' training lines costs ~an
+hour of session time for no decision value — the rule measures
+compression of the training distribution): median tokens/conversation
+and total tokens. Adopt the new one ONLY if median compression improves
+by ≥ 1%; otherwise keep the §4.8 tokenizer for comparability. Either way
+both artifacts are kept and the measurement is reported.
+
+### 5.2 Eval-pool population rule
+Extrapolation buckets and position bands are reported with their token
+counts; thin buckets (< 50 sequences for PPL buckets, < 5,000 tokens for
+bands) are marked and excluded from gate arithmetic (H2 uses aggregated
+bands ≥ 4096 only if they clear this floor). Population is a property of
+smoltalk's long tail; it is reported, not patched.
+
+### 5.3 Pretraining budget decision rule
+Default target 246M tokens. If Kaggle quota/throughput makes the full
+budget impractical, the pre-stated floors are: **150M** (usable, report
+as "floor-150") and **100M** (minimum viable, "floor-100"); the SFT
+stage may start from any floor, and the achieved budget is reported with
+every result. No arm gets a different budget than another.
+
+## 6. Honesty box: what "chatable" means at this budget
+
+A 155M model pretrained on ~250M tokens (0.01% of SmolLM2-135M's 2T) and
+SFT'd on smoltalk. **Will:** correct chat format (turn-taking, stopping),
+fluent grammatical multi-turn replies that reference context, simple
+instruction-following behaviors, recall of very common facts, and — the
+study's claim — measurably better length behavior at 4–8k context than
+the matched RoPE baseline if H1/H2 pass. **Will not:** reliable factual
+knowledge, arithmetic, complex multi-constraint instructions, or
+assistant-level helpfulness. This text ships with the demo.
+
+## 7. Limitations acknowledged at registration
+
+Single seed (project convention); single model scale (155M); vanilla
+RoPE extension only (no NTK/YaRN — a stronger RoPE arm is future work);
+WSD + batch-32 protocol differs from §4.8's cosine + batch-16 (shared by
+all arms, but cross-study comparisons carry this caveat); position
+mechanisms compared at one training length (512); FineWeb-Edu only
+(no code/multilingual mix); Kaggle T4 fp16 numerics (GradScaler; the
+NaN-skip divergence guard is active and its skip counts are reported).
+
+---
+
+## Outcomes (appended when complete; empty until then)
+
+*(nothing yet)*
+
+## Amendments log (append-only)
+
+*(nothing yet)*

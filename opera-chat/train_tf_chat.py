@@ -62,6 +62,18 @@ def main():
     p.add_argument("--muon-lr", type=float, default=0.02)
     p.add_argument("--d", type=int, default=512)
     p.add_argument("--num-layers", type=int, default=4)
+    p.add_argument("--curriculum-t0", type=int, default=64)
+    p.add_argument("--curriculum-every", type=int, default=250)
+    p.add_argument("--lr-schedule", default="cosine",
+                   choices=["cosine", "wsd"],
+                   help="wsd = warmup-stable-decay (same option as "
+                        "opera_lm.train; keep arms matched)")
+    p.add_argument("--wsd-decay-frac", type=float, default=0.2)
+    p.add_argument("--packed-data", default=None,
+                   help="path prefix of a packed train pool (mmap; "
+                        "stream-identical to the default source). With "
+                        "this flag the --data pkl may carry an empty "
+                        "'train' list (eval pools only)")
     p.add_argument("--init-weights-from", default=None,
                    help="load an existing checkpoint's weights before "
                         "training (e.g. a pretrained-on-raw-text "
@@ -74,6 +86,10 @@ def main():
     train_data = d["train"]
     test_short, test_long = d["test_short"], d["test_long"]
     vocab_size = d["vocab_size"]
+    assert test_short and test_long, \
+        "test_short/test_long must be non-empty"
+    if not a.packed_data:
+        assert train_data, "train list empty and no --packed-data given"
     print(f"data: train={len(train_data)} short={len(test_short)} "
           f"long={len(test_long)} vocab={vocab_size}", flush=True)
 
@@ -102,7 +118,13 @@ def main():
     final_path = os.path.join(a.out_dir, f"{tag}.pt")
     train_ckpt = os.path.join(a.out_dir, f"{tag}_train_ckpt.pt")
 
-    source = GpuBatchSource(train_data, a.max_len, a.device, a.seed)
+    if a.packed_data:
+        from opera_lm.packed import PackedBatchSource
+        source = PackedBatchSource(a.packed_data, a.max_len, a.device,
+                                   a.seed)
+        print(f"  packed batch source: {source.N:,} seqs (mmap)", flush=True)
+    else:
+        source = GpuBatchSource(train_data, a.max_len, a.device, a.seed)
     if a.optimizer == "muon":
         muon_p, adam_p = split_muon_params(model)
         opt = Muon([
@@ -132,6 +154,19 @@ def main():
         print(f"  RESUMED from {train_ckpt} at step {start_step}",
               flush=True)
 
+    # AMP dtype gate, mirroring opera_lm.train: bf16 only where NATIVE
+    # (Ampere+ sm_80; MPS). Turing (T4, Kaggle) emulates bf16 slowly --
+    # use fp16 + GradScaler there instead.
+    if a.device == 'cuda':
+        cap = torch.cuda.get_device_capability()
+        amp_dtype = torch.bfloat16 if cap[0] >= 8 else torch.float16
+    else:
+        amp_dtype = torch.bfloat16
+    scaler = None
+    if amp_dtype == torch.float16:
+        scaler = torch.amp.GradScaler(a.device)
+    print(f"  AMP dtype: {amp_dtype}", flush=True)
+
     init_ppl = _oom_backstop(
         lambda b: compute_perplexity(model, test_short[:200], a.max_len, b, a.device),
         32, a.device)
@@ -139,8 +174,11 @@ def main():
           f"(chance ~ {vocab_size})", flush=True)
 
     t0 = time.time()
+    nan_skips = 0
+    last_loss_finite = True
     for step in range(start_step, a.steps):
-        lr = get_lr(step, a.warmup_steps, a.steps, a.max_lr)
+        lr = get_lr(step, a.warmup_steps, a.steps, a.max_lr,
+                    schedule=a.lr_schedule, wsd_decay_frac=a.wsd_decay_frac)
         for g in opt.param_groups:
             if a.optimizer == "muon" and g.get("use_muon"):
                 g["lr"] = lr * (a.muon_lr / a.max_lr)
@@ -148,19 +186,41 @@ def main():
                 g["lr"] = lr
 
         token_ids, lengths = source.sample(a.batch)
-        t_cur = curriculum_len(step, 64, 250, a.max_len)
+        t_cur = curriculum_len(step, a.curriculum_t0, a.curriculum_every,
+                               a.max_len)
         if t_cur < token_ids.shape[1]:
             token_ids = token_ids[:, :t_cur]
             lengths = lengths.clamp(max=t_cur)
 
-        with torch.autocast(device_type=a.device, dtype=torch.bfloat16):
+        with torch.autocast(device_type=a.device, dtype=amp_dtype):
             all_logits = model(token_ids, lengths)
             loss, _, _ = lm_loss(all_logits, token_ids, lengths)
 
+        # Divergence guard, same policy as opera_lm.train: a non-finite
+        # batch is skipped whole (no backward, no update); checkpoint
+        # writes are gated on a finite loss so a poisoned run never
+        # overwrites its last healthy checkpoint.
+        if not bool(torch.isfinite(loss).all().item()):
+            nan_skips += 1
+            if nan_skips == 1 or nan_skips % 50 == 0:
+                print(f"    WARNING: non-finite loss at step {step} "
+                      f"(batch skipped; {nan_skips} skips so far)",
+                      flush=True)
+            last_loss_finite = False
+            continue
+        last_loss_finite = True
+
         opt.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        opt.step()
+        if scaler is not None:
+            scaler.scale(loss).backward()
+            scaler.unscale_(opt)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(opt)
+            scaler.update()
+        else:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
 
         if step % 200 == 0 or step == a.steps - 1:
             el = time.time() - t0
@@ -168,7 +228,8 @@ def main():
             print(f"  step {step:5d}  loss {loss.item():.4f}  "
                   f"lr {lr:.5f}  ({el:.1f}s, {el / done:.2f}s/step)  "
                   f"T_cur {t_cur}", flush=True)
-        if a.save_every and step > 0 and step % a.save_every == 0:
+        if (a.save_every and step > 0 and last_loss_finite
+                and step % a.save_every == 0):
             torch.save({"model": model.state_dict(),
                         "opt": opt.state_dict(), "step": step,
                         "py_rng": random.getstate(),
@@ -202,6 +263,7 @@ def main():
                             if a.optimizer == "muon" else None),
             "params": npar, "d": a.d, "num_layers": a.num_layers,
             "vocab_size": vocab_size, "steps": a.steps, "seed": a.seed,
+            "lr_schedule": a.lr_schedule, "nan_skips": nan_skips,
             "test_perplexity_in_length": ppl,
             "extrapolation": {k: v[0] for k, v in extrap.items()},
         }) + "\n")

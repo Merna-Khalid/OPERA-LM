@@ -17,6 +17,7 @@ checks) immediately override it, so it's a no-op there; sections that don't
 reseed get the same reproducible starting state the original single
 `selftest()` function gave them when it seeded once at the top.
 """
+import os
 import random
 import math
 import numpy as np
@@ -30,6 +31,7 @@ from .losses import lm_loss, msup_loss
 from .data import doc_chunks, doc_chunk_sizes
 from .train import (curriculum_len, GpuBatchSource, extrapolation_eval,
                     rmt_states_diagnostic, train, get_lr)
+from .packed import pack_pool, PackedBatchSource, packed_stats
 from .incremental import OperaDecoder, fenwick_blocks_of
 from .muon import Muon, zeropower_via_newtonschulz5, split_muon_params
 
@@ -1336,6 +1338,43 @@ def test_gpu_batch_source_resume():
           "after restore (regression guard for the CUDA set_state crash)")
 
 
+def test_packed_batch_source():
+    # PackedBatchSource (mmap pool) must be a stream-exact twin of
+    # GpuBatchSource: same seed -> same randint stream, same padded rows
+    # and lengths (incl. >max_len truncation at pack time), and the
+    # generator state_dict round-trips ACROSS the two classes (a
+    # checkpoint written during a packed run resumes identically into
+    # either source -- the format is shared by construction).
+    import tempfile
+    torch.manual_seed(0)
+    rng16 = random.Random(16)
+    fake_train = [[rng16.randint(1, 100)
+                   for _ in range(rng16.randint(5, 20))]
+                  for _ in range(64)]
+    max_len16 = 12                      # some sequences exceed it
+    with tempfile.TemporaryDirectory() as td:
+        prefix = os.path.join(td, "pool")
+        stats = pack_pool(fake_train, prefix, max_len16)
+        assert stats["n_seqs"] == len(fake_train)
+        assert packed_stats(prefix)["n_seqs"] == len(fake_train)
+        gpu = GpuBatchSource(fake_train, max_len16, 'cpu', seed=7)
+        pck = PackedBatchSource(prefix, max_len16, 'cpu', seed=7)
+        for _ in range(10):
+            g_ids, g_len = gpu.sample(8)
+            p_ids, p_len = pck.sample(8)
+            assert torch.equal(g_ids, p_ids) and torch.equal(g_len, p_len)
+        # cross-class resume: state from GpuBatchSource into packed
+        st16 = gpu.state_dict()
+        pck2 = PackedBatchSource(prefix, max_len16, 'cpu', seed=99)
+        pck2.load_state_dict(st16.clone())
+        for _ in range(5):
+            g_ids, g_len = gpu.sample(8)
+            p_ids, p_len = pck2.sample(8)
+            assert torch.equal(g_ids, p_ids) and torch.equal(g_len, p_len)
+    print("  PackedBatchSource: stream-identical to GpuBatchSource "
+          "(10 draws), truncation at pack time, cross-class exact resume")
+
+
 def test_extrapolation_eval():
     # extrapolation_eval (opt7): length-scaled batch, bucket logic
     torch.manual_seed(0)
@@ -2039,6 +2078,7 @@ _ARMS = [
     test_fold_variants,
     test_node_surgery,
     test_gpu_batch_source_resume,
+    test_packed_batch_source,
     test_extrapolation_eval,
     test_rmt_diagnostic,
     test_gate_bias,

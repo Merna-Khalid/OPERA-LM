@@ -52,6 +52,19 @@ def main():
                         "(rot_free 3x3 maps, cross_mlp, head), AdamW on "
                         "embeddings/gates/gains")
     p.add_argument("--muon-lr", type=float, default=0.02)
+    p.add_argument("--accum", type=int, default=1,
+                   help="gradient accumulation micro-batches per update; "
+                        "effective batch = batch x world_size x accum. "
+                        "--save-every must be a multiple of this")
+    p.add_argument("--lr-schedule", default="cosine",
+                   choices=["cosine", "wsd"],
+                   help="wsd = warmup-stable-decay (MiniCPM): flat max_lr "
+                        "after warmup, linear decay over the final "
+                        "--wsd-decay-frac of steps; the stable phase "
+                        "extends cleanly when --steps grows across "
+                        "resumed sessions")
+    p.add_argument("--wsd-decay-frac", type=float, default=0.2,
+                   help="fraction of total steps in the wsd decay window")
     p.add_argument("--readout", default="none",
                    choices=["none", "multistate"],
                    help="multistate = roadmap T0.4: fixed learned reduction "
@@ -96,6 +109,14 @@ def main():
                         "docstring note); verified on CPU/gloo via "
                         "opera_lm.selftest, not yet on real multi-GPU "
                         "hardware -- report back what breaks.")
+    p.add_argument("--packed-data", default=None,
+                   help="path prefix of a packed train pool "
+                        "(<prefix>.tokens.npy/.offsets.npy, see "
+                        "opera_lm.packed). Replaces the in-RAM train list "
+                        "with an mmap source whose batch stream is "
+                        "IDENTICAL to the default. With this flag, the "
+                        "--data pkl may carry an empty 'train' list "
+                        "(eval pools only).")
     a = p.parse_args()
 
     with open(a.data, "rb") as f:
@@ -103,16 +124,20 @@ def main():
     train_data, test_short, test_long = (d["train"], d["test_short"],
                                          d["test_long"])
     vocab_size = d["vocab_size"]
-    assert train_data and test_short and test_long, \
-        "train/test_short/test_long must all be non-empty"
-    top = max(max(s) for s in train_data + test_short + test_long)
+    assert test_short and test_long, \
+        "test_short/test_long must be non-empty"
+    if not a.packed_data:
+        assert train_data, "train list empty and no --packed-data given"
+    top = max(max(s) for s in ((train_data or []) + test_short + test_long))
     assert top < vocab_size, f"token id {top} >= vocab_size {vocab_size}"
     if a.tokenizer:
         tv = load_tokenizer(a.tokenizer).get_vocab_size()
         assert tv == vocab_size, \
             f"tokenizer vocab {tv} != pkl vocab {vocab_size}"
-    print(f"data: train={len(train_data)} short={len(test_short)} "
-          f"long={len(test_long)} vocab={vocab_size}", flush=True)
+    packed_note = f" (packed: {a.packed_data})" if a.packed_data else ""
+    print(f"data: train={len(train_data)}{packed_note} "
+          f"short={len(test_short)} long={len(test_long)} "
+          f"vocab={vocab_size}", flush=True)
 
     from opera_lm.train import train
     fold_gate_bias = (2.0, 0.0, -2.0)
@@ -126,13 +151,16 @@ def main():
         save_every=a.save_every, resume=a.resume,
         compile_mode=a.compile, gpu_data=True, aux_frac=0.25,
         max_lr=a.max_lr, warmup_steps=a.warmup_steps,
+        lr_schedule=a.lr_schedule, wsd_decay_frac=a.wsd_decay_frac,
+        accum=a.accum,
         fold_gate_bias=fold_gate_bias,
         curriculum=None if a.no_curriculum else (a.curriculum_t0, a.curriculum_every),
         data=(train_data, test_short, test_long, vocab_size),
         idx2word=None, optimizer=a.optimizer, muon_lr=a.muon_lr,
         readout_mode=a.readout, mem_mode=a.mem, mem_dim=a.mem_dim,
         use_metal=a.metal, use_triton=a.triton, init_weights_from=a.init_weights_from,
-        ddp=a.ddp, grad_checkpoint=a.grad_checkpoint)
+        ddp=a.ddp, grad_checkpoint=a.grad_checkpoint,
+        packed_data=a.packed_data)
 
     # Under --ddp, train() returns None on every rank except 0 (see its
     # docstring note); only rank 0 does the post-training packaging
