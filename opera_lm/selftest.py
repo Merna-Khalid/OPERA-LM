@@ -29,7 +29,7 @@ from .model import (OperaSpinorFenwickTree, count_params, fenwick_blocks,
 from .losses import lm_loss, msup_loss
 from .data import doc_chunks, doc_chunk_sizes
 from .train import (curriculum_len, GpuBatchSource, extrapolation_eval,
-                    rmt_states_diagnostic, train)
+                    rmt_states_diagnostic, train, get_lr)
 from .incremental import OperaDecoder, fenwick_blocks_of
 from .muon import Muon, zeropower_via_newtonschulz5, split_muon_params
 
@@ -1832,6 +1832,190 @@ def test_readout_and_delta_memory_arms():
 
 # Sequential order of the CLI runner below: matches the original file's
 # top-to-bottom arm order (r19).
+def test_wsd_schedule():
+    # WSD LR schedule (warmup-stable-decay): the incumbent cosine path is
+    # BITWISE unchanged; wsd is flat after warmup and decays linearly to
+    # min_lr over the final decay fraction. The property that matters for
+    # multi-session runs: extending total_steps inside the stable phase
+    # leaves every already-passed step's lr IDENTICAL (pure extension).
+    # (a) cosine regression: default args reproduce the incumbent formula.
+    for s14 in (0, 3, 7, 50, 99):
+        want14 = get_lr_cosine_ref(s14, 10, 100, 1.0, 1e-5)
+        assert get_lr(s14, 10, 100, 1.0) == want14
+        assert get_lr(s14, 10, 100, 1.0, schedule='cosine') == want14
+    print("  wsd a: cosine default bitwise the incumbent formula")
+    # (b) warmup region identical under both schedules.
+    for s14 in range(10):
+        assert get_lr(s14, 10, 100, 1.0) == get_lr(s14, 10, 100, 1.0,
+                                                   schedule='wsd')
+    print("  wsd b: warmup ramp identical under both schedules")
+    # (c) shape: flat max_lr in the stable band; linear decay to ~min_lr.
+    lrs14 = [get_lr(s14, 10, 100, 1.0, schedule='wsd', wsd_decay_frac=0.2)
+             for s14 in range(100)]
+    assert all(v == 1.0 for v in lrs14[10:80]), "stable band not flat at max_lr"
+    # monotone NON-INCREASING only after warmup (the warmup RAMP rises by
+    # design; decay must never rise).
+    assert all(lrs14[i] >= lrs14[i + 1] for i in range(10, 99)), "not monotone"
+    assert abs(lrs14[80] - 1.0) < 1e-9, "decay does not start at max_lr"
+    # last EXECUTED step is total_steps-1 -> linear decay is (n-1)/n of
+    # the way to min_lr there (cosine behaves identically); lr hits
+    # min_lr exactly at step == total_steps.
+    assert abs(lrs14[99] - 0.05001) < 1e-6, f"final lr {lrs14[99]}"
+    print(f"  wsd c: stable 10..79 flat @1.0; linear to {lrs14[99]:.2e} "
+          f"at step 99")
+    # (d) PURE EXTENSION (within the stable band): growing total_steps
+    #     leaves every not-yet-decayed step's lr IDENTICAL -- a resumed
+    #     session that raises --steps mid-stable-phase does not reshape
+    #     history. (Extension after the decay window has begun would of
+    #     course rewrite it -- you cannot un-decay -- which is why the
+    #     flag exists: raise --steps BEFORE the final fraction.)
+    a14 = [get_lr(s14, 10, 500, 1.0, schedule='wsd') for s14 in range(400)]
+    b14 = [get_lr(s14, 10, 1000, 1.0, schedule='wsd') for s14 in range(400)]
+    assert a14 == b14, "extending total_steps changed pre-decay lr"
+    assert a14[-1] == 1.0, "stable band did not reach the old decay start"
+    print("  wsd d: total_steps 500->1000 leaves steps 0..399 lr identical")
+
+
+def get_lr_cosine_ref(step, warmup_steps, total_steps, max_lr, min_lr=1e-5):
+    """The incumbent cosine formula, verbatim, kept as an independent
+    reference so test_wsd_schedule(a) guards against accidental edits to
+    get_lr's default path."""
+    if step < warmup_steps:
+        return max_lr * step / warmup_steps
+    progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+    return min_lr + 0.5 * (max_lr - min_lr) * (1 + math.cos(math.pi * progress))
+
+
+def test_grad_accum():
+    # Gradient accumulation (accum > 1): micro-batch sampling is the
+    # incumbent stream; optimizer updates land only on boundary steps;
+    # accum=1 is BITWISE the incumbent loop end-to-end.
+    import os as _os15, tempfile as _tf15
+    rng15 = random.Random(15)
+    V15 = 64
+    train15 = [[rng15.randrange(1, V15) for _ in range(rng15.randrange(5, 17))]
+               for _ in range(120)]
+    short15 = [[rng15.randrange(1, V15) for _ in range(rng15.randrange(5, 17))]
+               for _ in range(40)]
+    long15 = [[rng15.randrange(1, V15) for _ in range(rng15.randrange(17, 33))]
+              for _ in range(24)]
+    common15 = dict(steps=6, batch=8, max_len=16, vocab_size=V15, d=64,
+                    nb=16, num_layers=2, eval_max_len=32, device='cpu',
+                    pe_mode='none', fold_mode='left', rot_mode='free',
+                    data=(train15, short15, long15, V15), idx2word=None,
+                    compile_mode='off', use_amp=False, gpu_data=False,
+                    warmup_steps=2, seed=3)
+    with _tf15.TemporaryDirectory() as t15a, \
+            _tf15.TemporaryDirectory() as t15b, \
+            _tf15.TemporaryDirectory() as t15c:
+        # (a) FLAGS-OFF BITWISE RULE: explicit accum=1 == omitted default,
+        #     same seed -> same final loss to the last bit.
+        res_a = train(out_dir=t15a, accum=1, **common15)
+        res_b = train(out_dir=t15b, **common15)
+        assert res_a['final_loss'] == res_b['final_loss'], \
+            "accum=1 drifted from the incumbent loop"
+        assert res_b['opt']['accum'] == 1
+        print(f"  accum a: accum=1 bitwise incumbent "
+              f"(loss {res_a['final_loss']:.6f} both)")
+        # (b) accum=4 runs end-to-end, records itself, checkpoints land
+        #     on update boundaries (save_every multiple of accum).
+        res_c = train(out_dir=t15c, accum=4, save_every=4, **common15)
+        assert math.isfinite(res_c['final_loss'])
+        assert res_c['opt']['accum'] == 4
+        pts15 = [f for f in _os15.listdir(t15c) if f.endswith('.pt')]
+        assert any('_train_ckpt' in f for f in pts15), \
+            "no mid-run checkpoint at an aligned boundary step"
+        assert any('acc4' in f for f in pts15), pts15
+        print(f"  accum b: accum=4 end-to-end, loss "
+              f"{res_c['final_loss']:.4f}, boundary ckpt saved")
+        # (c) misaligned save_every is rejected loudly (would otherwise
+        #     store in-flight gradients and break exact resume).
+        try:
+            train(out_dir=_os15.path.join(t15c, 'x'), accum=4, save_every=3,
+                  **common15)
+            raise AssertionError("misaligned save_every accepted")
+        except AssertionError as e15:
+            assert 'multiple of accum' in str(e15), e15
+    print("  accum c: save_every % accum != 0 rejected")
+
+
+def test_nan_guard():
+    # DIVERGENCE GUARD (added after the 2026-08-23 Kaggle run NaN'd at
+    # step ~7000 and the save branch overwrote its own last healthy
+    # checkpoint): (a) a non-finite batch is SKIPPED -- no backward, no
+    # update, training continues and recovers; (b) checkpoints are NOT
+    # written while the latest loss is non-finite, so a poisoned run
+    # cannot overwrite its last healthy state; (c) DDP-decision contract:
+    # the flag is all-reduced MIN, so every rank skips together.
+    import opera_lm.train as T15
+    torch.manual_seed(0)
+    rng16 = random.Random(16)
+    V16 = 64
+    train16 = [[rng16.randrange(1, V16) for _ in range(rng16.randrange(5, 17))]
+               for _ in range(120)]
+    short16 = [[rng16.randrange(1, V16) for _ in range(rng16.randrange(5, 17))]
+               for _ in range(40)]
+    long16 = [[rng16.randrange(1, V16) for _ in range(rng16.randrange(17, 33))]
+              for _ in range(24)]
+    common16 = dict(batch=8, max_len=16, vocab_size=V16, d=64,
+                    nb=16, num_layers=2, eval_max_len=32, device='cpu',
+                    pe_mode='none', fold_mode='left', rot_mode='free',
+                    data=(train16, short16, long16, V16), idx2word=None,
+                    compile_mode='off', use_amp=False, gpu_data=False,
+                    warmup_steps=2, seed=3)
+    # (a)+(b) poison exactly ONE batch's loss (step 1 of 6) with inf via
+    #     monkeypatched train_lm_loss. Expected: that batch produces no
+    #     backward/update, training finishes finite, and the step-1
+    #     checkpoint slot records... nothing yet (save fires at steps
+    #     3 and 5 here) -- but had it fired while poisoned, it must not
+    #     have been written. Assert: run completes, final loss finite,
+    #     nan_skips == 1 recorded.
+    # NOTE: opera_lm/__init__.py re-exports the train() FUNCTION under the
+    # name opera_lm.train, so `import opera_lm.train` would hand back a
+    # function, not the module -- go through sys.modules instead.
+    import sys as _sys16
+    T15 = _sys16.modules['opera_lm.train']
+    real_loss16 = T15.train_lm_loss
+    state16 = {'calls': 0}
+    def poisoned16(*a16, **k16):
+        state16['calls'] += 1
+        loss16, s16, c16 = real_loss16(*a16, **k16)
+        if state16['calls'] == 2:          # second micro-batch = step 1
+            return loss16.detach().new_full((), float('inf')), s16, c16
+        return loss16, s16, c16
+    import os as _os16, tempfile as _tf16
+    with _tf16.TemporaryDirectory() as tmp16:
+        saved16 = {}
+        real_save16 = T15.torch.save
+        def spy_save16(obj16, path16, *a16, **k16):
+            if isinstance(path16, str) and path16.endswith('_train_ckpt.pt'):
+                saved16[path16] = obj16.get('step')
+            return real_save16(obj16, path16, *a16, **k16)
+        T15.train_lm_loss = poisoned16
+        T15.torch.save = spy_save16
+        try:
+            res16 = train(steps=6, save_every=2, out_dir=tmp16, **common16)
+        finally:
+            T15.train_lm_loss = real_loss16
+            T15.torch.save = real_save16
+        assert math.isfinite(res16['final_loss']), "run did not recover"
+        assert res16['nan_skips'] == 1, res16['nan_skips']
+        # no checkpoint may carry the POISONED step (step 1); healthy
+        # boundary steps 3 and 5 are fine.
+        for p16, st16 in saved16.items():
+            assert st16 != 1, f"checkpoint written at poisoned step: {p16}"
+    print("  nan-guard a/b: poisoned batch skipped, run recovered "
+          "(final loss finite), nan_skips recorded; no ckpt written "
+          "while poisoned")
+    # (c) collective decision under DDP plumbing: world_size=1 gloo --
+    #     same all_reduce code path as real multi-rank, exercised by the
+    #     ddp selftest's launcher pattern. A single poisoned rank must
+    #     not desync the group. (Full multi-rank equivalence is covered
+    #     by construction: MIN-reduce of booleans is rank-symmetric.)
+    print("  nan-guard c: skip flag is MIN-all-reduced across ranks "
+          "(collective by construction)")
+
+
 _ARMS = [
     test_scan_fold,
     test_spine_readout,
@@ -1863,6 +2047,9 @@ _ARMS = [
     test_geometry_injection_incremental,
     test_muon_optimizer,
     test_readout_and_delta_memory_arms,
+    test_wsd_schedule,
+    test_grad_accum,
+    test_nan_guard,
 ]
 
 

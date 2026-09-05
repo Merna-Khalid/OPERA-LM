@@ -47,11 +47,28 @@ def _oom_backstop(fn, batch_size, device):
             print(f"    (OOM; retrying at batch {eff})", flush=True)
 
 
-def get_lr(step, warmup_steps, total_steps, max_lr, min_lr=1e-5):
+def get_lr(step, warmup_steps, total_steps, max_lr, min_lr=1e-5,
+           schedule='cosine', wsd_decay_frac=0.2):
+    """LR at `step`. schedule='cosine' (default) is bitwise the incumbent
+    formula. schedule='wsd' is warmup-STABLE-decay (MiniCPM/DeepSeek-v2):
+    flat max_lr after warmup, then LINEAR decay to min_lr over the final
+    wsd_decay_frac of total_steps. The stable phase is decoupled from any
+    notion of "how far along we are", which is the point: a multi-session
+    run (Kaggle quota) can extend total_steps on resume and simply stays
+    in the stable phase longer -- no re-planning the whole curve -- while
+    the final decay window still lands exactly where it should."""
     if step < warmup_steps:
         return max_lr * step / warmup_steps
-    progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
-    return min_lr + 0.5 * (max_lr - min_lr) * (1 + math.cos(math.pi * progress))
+    if schedule == 'cosine':
+        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+        return min_lr + 0.5 * (max_lr - min_lr) * (1 + math.cos(math.pi * progress))
+    assert schedule == 'wsd', f"unknown lr schedule {schedule!r}"
+    decay_start = max(warmup_steps,
+                      int(total_steps * (1.0 - wsd_decay_frac)))
+    if step < decay_start:
+        return max_lr
+    progress = (step - decay_start) / max(1, total_steps - decay_start)
+    return max_lr + (min_lr - max_lr) * progress
 
 
 def curriculum_len(step, cur0, every, max_len):
@@ -359,8 +376,9 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
           data_mode='sentences', docs_limit=100000, out_dir='.',
           save_every=0, resume=False,
           compile_mode='default', gpu_data=True, aux_frac=0.25,
-          max_lr=1e-3, warmup_steps=500,
-          oam_k=4, oam_charges='auto', oam_phi=0.7853981633974483,
+           max_lr=1e-3, warmup_steps=500, lr_schedule='cosine',
+           wsd_decay_frac=0.2, accum=1,
+           oam_k=4, oam_charges='auto', oam_phi=0.7853981633974483,
           oam_shared_gate=False, oam_combine='compose', oam_pair='seq',
           rack_exitnorm=False, oam_transport='rack', oam_levelgate=False,
           oam_chan_emb=False, scan_salience=False, scan_decay_bias=-3.0,
@@ -411,6 +429,15 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
     if curriculum is not None:
         assert 8 <= curriculum[0] <= max_len and curriculum[1] >= 1, \
             "--curriculum T0:EVERY needs 8 <= T0 <= max_len, EVERY >= 1"
+    assert accum >= 1, "--accum must be >= 1"
+    if save_every and accum > 1:
+        # Checkpoint/step-boundary alignment: optimizer updates land on
+        # steps with (step+1) % accum == 0; the save branch below fires
+        # on step % save_every == accum-1, which is always a boundary
+        # step when save_every is a multiple of accum -- so a train ckpt
+        # NEVER stores in-flight gradients and --resume stays exact.
+        assert save_every % accum == 0, \
+            f"save_every ({save_every}) must be a multiple of accum ({accum})"
     if data_mode != 'sentences': tag.append(f'data-{data_mode}')
     if data_mode == 'docs-en' and docs_limit != 100000:
         tag.append(f'lim{docs_limit}')
@@ -430,6 +457,10 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
     if aux_frac != 1.0: tag.append(f'aux{aux_frac}')
     if max_lr != 1e-3: tag.append(f'lr{max_lr}')
     if warmup_steps != 500: tag.append(f'wu{warmup_steps}')
+    if lr_schedule != 'cosine':
+        tag.append(lr_schedule)
+        if wsd_decay_frac != 0.2: tag.append(f'wsdf{wsd_decay_frac}')
+    if accum > 1: tag.append(f'acc{accum}')
     if fold_mode != 'left': tag.append(f'fold-{fold_mode}')
     if fold_mode == 'oam':
         tag.append(f'k{oam_k}')
@@ -467,6 +498,12 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
     if is_main:
         print(f"=== OPERA-LM v9.0 (Spinor Tree, tree-training line) [{tag}] ===", flush=True)
         print(f"  steps={steps}, batch={batch} (per-rank), train max_len={max_len}, eval_max_len={eval_max_len}", flush=True)
+        if accum > 1 or ddp:
+            print(f"  effective batch = {batch} x {world_size} ranks "
+                  f"x {accum} accum = {batch * world_size * accum}", flush=True)
+        if lr_schedule != 'cosine':
+            print(f"  LR schedule: {lr_schedule} (decay over final "
+                  f"{wsd_decay_frac:.0%} of steps)", flush=True)
         print(f"  d={d}, nb={nb}, num_layers={num_layers}, lock={lock_mode}, device={device}", flush=True)
         if ddp:
             print(f"  DDP: world_size={world_size}, effective batch="
@@ -735,8 +772,11 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
               f"if this is >> chance, STOP - init is broken)", flush=True)
 
     t0 = time.time()
+    nan_skips = 0            # batches skipped by the divergence guard
+    last_loss_finite = True  # gates checkpointing (see guard comment below)
     for step in range(start_step, steps):
-        lr = get_lr(step, warmup, steps, max_lr)
+        lr = get_lr(step, warmup, steps, max_lr, schedule=lr_schedule,
+                    wsd_decay_frac=wsd_decay_frac)
         for g in opt.param_groups:
             # Muon groups follow the same warmup/decay schedule, rescaled
             # to their own base lr (muon_lr).
@@ -765,7 +805,21 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
                 token_ids = token_ids[:, :t_cur]
                 lengths = lengths.clamp(max=t_cur)
 
-        with amp_ctx():
+        # GRADIENT ACCUMULATION (accum > 1): micro-batches are sampled
+        # EXACTLY as the incumbent stream (same RNG draws per step, so the
+        # batch stream and --resume semantics are untouched); the optimizer
+        # applies the averaged gradient only on BOUNDARY steps
+        # ((step+1) % accum == 0, plus a flush on the final step so a
+        # short trailing window is not silently dropped). At accum=1 every
+        # step is a boundary and this block is bitwise the incumbent loop.
+        # Under DDP, non-boundary micro-steps run under no_sync(): grads
+        # accumulate locally and are all-reduced once per update instead
+        # of once per micro-batch. The loss logged below is still the raw
+        # micro-batch loss (not divided by accum).
+        boundary = ((step + 1) % accum == 0) or (step == steps - 1)
+        sync_ctx = (model_c.no_sync() if (ddp and not boundary)
+                    else contextlib.nullcontext())
+        with sync_ctx, amp_ctx():
             if msup:
                 out = model_c(token_ids, lengths, return_levels=True)
                 loss, _, _ = lm_loss(out.logits, token_ids, lengths)
@@ -795,26 +849,76 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
                     head_model, states, token_ids, lengths,
                     aux_frac=aux_frac, final_logits=all_logits[0])
 
-        opt.zero_grad()
+        # DIVERGENCE GUARD (added after the 2026-08-23 Kaggle 2xT4 run
+        # NaN'd at ~step 7000 and the save branch then overwrote the last
+        # healthy checkpoint with poisoned weights). A non-finite loss
+        # means THIS batch's forward already blew up: backwarding it would
+        # write inf/nan into .grad and (at a boundary) into the weights,
+        # from which training never recovers. Instead the whole batch is
+        # skipped -- no backward, no update, grads untouched. Under DDP
+        # the skip decision is COLLECTIVE (all-reduced MAX of the finite
+        # flag): if only one rank's batch went non-finite, the others
+        # must skip too, or the next gradient all-reduce deadlocks.
+        # The batch stream does NOT rewind -- the RNG draws for this step
+        # are consumed, same as any other skipped-data policy, so resume
+        # stays deterministic. `last_loss_finite` gates CHECKPOINTING:
+        # once weights are poisoned the loss stays nan on every later
+        # batch, so refusing to save while it is nan keeps the last
+        # healthy state on disk instead of overwriting it (the exact loss
+        # suffered on the run above).
+        finite = bool(torch.isfinite(loss).all().item())
+        if ddp and world_size > 1:
+            import torch.distributed as dist
+            t_flag = torch.tensor([float(finite)], device=torch_device)
+            dist.all_reduce(t_flag, op=dist.ReduceOp.MIN)
+            finite = bool(t_flag.item() > 0.5)
+        if not finite:
+            nan_skips += 1
+            if is_main and (nan_skips == 1 or nan_skips % 50 == 0):
+                print(f"    WARNING: non-finite loss at step {step} "
+                      f"(batch skipped, no update; {nan_skips} skips so "
+                      f"far)", flush=True)
+            last_loss_finite = False
+            continue
+        last_loss_finite = True
+
         if scaler is not None:
-            scaler.scale(loss).backward()
-            scaler.unscale_(opt)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            scaler.step(opt)
-            scaler.update()
+            scaler.scale(loss / accum).backward()
+            if boundary:
+                scaler.unscale_(opt)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(opt)
+                scaler.update()
+                opt.zero_grad()
         else:
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            opt.step()
+            (loss / accum).backward()
+            if boundary:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                opt.step()
+                opt.zero_grad()
 
         if is_main and (step % 200 == 0 or step == steps - 1):
             elapsed = time.time() - t0
             done = step - start_step + 1
             cur_txt = f"  T_cur {t_cur}" if t_cur is not None else ""
+            skip_txt = f"  [nan-skips {nan_skips}]" if nan_skips else ""
             print(f"  step {step:5d}  loss {loss.item():.4f}  lr {lr:.5f}  "
-                  f"({elapsed:.1f}s, {elapsed/done:.2f}s/step){cur_txt}", flush=True)
+                  f"({elapsed:.1f}s, {elapsed/done:.2f}s/step){cur_txt}{skip_txt}",
+                  flush=True)
 
-        if save_every and step > 0 and step % save_every == 0:
+        # Save cadence under accumulation: fires on step % save_every ==
+        # accum-1, which is always a boundary step (see the assert at the
+        # top), so checkpoints land right AFTER an optimizer update and
+        # never store in-flight gradients -- resume stays exact. At
+        # accum=1 this is bitwise the incumbent cadence (step % save_every == 0).
+        # GATED ON last_loss_finite: a poisoned run must not overwrite its
+        # own last healthy checkpoint (2026-08-23 Kaggle lesson -- see the
+        # divergence-guard comment above). The rank-tagged stream state is
+        # still written: it carries no weights, and keeping it current
+        # means a resumed-from-healthy-checkpoint run continues the same
+        # batch streams.
+        if (save_every and step > 0 and last_loss_finite
+                and step % save_every == (accum - 1) % save_every):
             if is_main:
                 torch.save({
                     'model': model.state_dict(), 'opt': opt.state_dict(),
@@ -908,6 +1012,7 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
         'vocab_size': actual_vocab_size, 'max_len': max_len,
         'eval_max_len': eval_max_len, 'steps': steps,
         'final_loss': loss.item(),
+        'nan_skips': nan_skips,
         'test_perplexity_in_length': ppl, 'test_perplexity_1k_legacy': ppl_1k,
         'extrapolation': {k: v[0] for k, v in extrap.items()},
         'init_perplexity': init_ppl,
@@ -918,6 +1023,10 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
                 'lr': max_lr, 'warmup': warmup_steps,
                 'foreach': use_foreach,
                 'optimizer': optimizer,
+                'lr_schedule': lr_schedule,
+                'wsd_decay_frac': (wsd_decay_frac
+                                   if lr_schedule != 'cosine' else None),
+                'accum': accum,
                 'muon_lr': (muon_lr if optimizer == 'muon' else None),
                 'oam': {'k': oam_k, 'charges': str(oam_charges),
                         'phi': oam_phi, 'shared_gate': oam_shared_gate,
