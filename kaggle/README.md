@@ -59,11 +59,15 @@ Recommended session order (the engine does this automatically with
 | # | accelerator | what happens | ~time |
 |---|---|---|---|
 | 1 | **none (CPU)** | env selftests; tokenizer 2M lines (RAM fix, peak RSS logged); saturation check; smoltalk + FineWeb prep at 512/8192; pack to mmap pools; bucket report; data-dataset push | 3–5 h (free, no GPU quota) |
-| 2 | T4 x2 | 20M/500-step end-to-end smoke (packed source, 8k eval, position curve) + 155M throughput measurements → s/step recorded | ~1 h |
-| 3–5 | T4 x2 | OPERA pretrain 15,000 steps (DDP), governor-limited resumes | ~3 weekly quotas |
-| 6 | T4 x2 | TF RoPE + TF NoPE pretrains concurrently (one per GPU) | ~1–2 sessions |
-| 7 | T4 x2 | SFT ×3 (opera 2,500 steps; then the TF pair) | ~1 session |
-| 8 | T4 x2 | position curves ×3 to 8192, gates H1–H4, long-context samples | <1 h |
+| 2 | T4 x2, `--stages smoke` ONLY | 20M/500-step end-to-end smoke (packed source, 8k eval, position curve) + 155M throughput measurements → s/step recorded. NOT `auto`: don't start pretraining on a small FineWeb pool | ~1 h |
+| 3 | **none (CPU)**, `--stages data` | FineWeb re-stream at the 1B cap (the 250M stream lands only ~22M unique ≤512 tokens — see the prereg's 2026-09-06 amendment); repack + push | ~4–7 h (free) |
+| 4+ | T4 x2, `--stages auto` | OPERA pretrain 15,000 steps (DDP), governor-limited resumes | ~3 weekly quotas |
+| — | T4 x2 | TF RoPE + TF NoPE pretrains concurrently (one per GPU) | ~1–2 sessions |
+| — | T4 x2 | SFT ×3 (opera 2,500 steps; then the TF pair) | ~1 session |
+| — | T4 x2 | position curves ×3 to 8192, gates H1–H4, long-context samples | <1 h |
+
+After session 3's push: re-attach the updated `opera-lm-patha-data`
+dataset (the mount is a snapshot; re-adding picks up the bigger pool).
 
 ## What to watch between sessions
 
@@ -96,4 +100,6 @@ python kaggle/patha_session.py --stages pretrain_opera
 python kaggle/patha_session.py --stages curves
 GOVERNOR_HOURS=8 python kaggle/patha_session.py         # shorter day
 SKIP_SELFTEST=1 python kaggle/patha_session.py          # skip full selftest
+PATHA_FINWEB_TOKENS=250000000 PATHA_FINWEB_POOL_MIN=0 \
+  python kaggle/patha_session.py --stages data          # skip the 1B extension
 ```

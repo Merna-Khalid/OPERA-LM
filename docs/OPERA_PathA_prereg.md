@@ -185,4 +185,20 @@ NaN-skip divergence guard is active and its skip counts are reported).
 
 ## Amendments log (append-only)
 
-*(nothing yet)*
+**2026-09-06 — FineWeb pool semantics corrected; stream target raised
+(before any GPU training ran).** The data session's uploads revealed
+that `prepare_fineweb.py --max-tokens` caps *streamed* tokens, and
+`doc_chunks(long_first=True)` routes only ~9% of FineWeb-Edu's streamed
+tokens into ≤512 train chunks (measured: 250M streamed → 22.1M-token
+pool; §4.8 had the same shape: 500M → 19.9M). §2.1's "250M-token pool"
+wording was wrong about pool size; §2.3's "246M trained tokens, 3× §4.8"
+stands as *trained*-token accounting, but unique-token exposure would
+have been ~1.1× §4.8 with ~11 epochs — not the intended budget increase.
+Amendment: stream cap raised to 1.0B (target pool ≥ 80M unique train
+tokens; ~3 epochs at 15,000 steps). Engine knobs:
+`PATHA_FINWEB_TOKENS` / `PATHA_FINWEB_POOL_MIN`. The smoltalk SFT pool
+measured 114M train tokens (T=512 admits far more whole conversations
+than T=256 did); SFT remains 2,500 steps ≈ 41M trained tokens —
+token-matched to §4.8's SFT. H1–H4 are unchanged; H3's "3× budget"
+reading now covers both trained tokens AND ~4× unique pretraining
+tokens versus §4.8.

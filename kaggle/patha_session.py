@@ -367,26 +367,49 @@ def stage_data(st):
         assert rc == 0, "smoltalk prep failed"
         push_all(st, "data: smoltalk pool built")
 
-    # (4) FineWeb-Edu 250M-token pool
-    if not have_data("data_fineweb_512.pkl"):
+    # (4) FineWeb-Edu pretrain pool. prepare_fineweb's --max-tokens caps
+    # STREAMED tokens; doc_chunks(long_first=True) routes only ~9% of
+    # them into <=512 train chunks (measured 2026-09-05: 250M streamed
+    # -> 22.1M-token pool; §4.8 had the same shape, 500M -> 19.9M). So
+    # the pool is judged by its own packed size against
+    # PATHA_FINWEB_POOL_MIN (default 80M), streaming up to
+    # PATHA_FINWEB_TOKENS (default 1B) to get there. A session with an
+    # outdated smaller pool attached rebuilds + pushes; the NEXT
+    # session's re-attached dataset then passes the check.
+    fw_name = "data_fineweb_512"
+    fin_stream = int(os.environ.get("PATHA_FINWEB_TOKENS", "1000000000"))
+    fin_pool_min = int(os.environ.get("PATHA_FINWEB_POOL_MIN", "80000000"))
+    pool_stats = None
+    if have_data(fw_name + ".pack.json"):
+        with open(find_data(fw_name + ".pack.json")) as f:
+            pool_stats = json.load(f)
+        log(f"fineweb pool on hand: {pool_stats['total_tokens']:,} "
+            f"unique train tokens (min {fin_pool_min:,})")
+    rebuilt_fw = False
+    if not (pool_stats and pool_stats["total_tokens"] >= fin_pool_min):
         rc = run([PY, "opera-chat/prepare_fineweb.py",
                   "--tokenizer", find_data("tokenizer.json"),
-                  "--out", os.path.join(WORK_DATA, "data_fineweb_512.pkl"),
-                  "--max-tokens", "250000000", "--max-len", str(MAX_LEN),
+                  "--out", os.path.join(WORK_DATA, fw_name + ".pkl"),
+                  "--max-tokens", str(fin_stream),
+                  "--max-len", str(MAX_LEN),
                   "--eval-max-len", str(EVAL_MAX)],
                  "data_prepare_fineweb.log")
         assert rc == 0, "fineweb prep failed"
-        push_all(st, "data: fineweb pool built")
+        rebuilt_fw = True
+        push_all(st, "data: fineweb pool rebuilt (bigger stream)")
 
     # (5) pack both train pools -> eval-only pkl + npy pair. The source
     # pkl may sit on the read-only dataset mount (read is fine); pack
-    # OUTPUTS always go to the writable WORK_DATA, then push.
-    for name in ("data_smoltalk_512", "data_fineweb_512"):
+    # OUTPUTS always go to the writable WORK_DATA, then push. A freshly
+    # rebuilt fineweb pool MUST repack from the local pkl (the mounted
+    # one is the stale small version), hence force=rebuilt_fw.
+    for name, force in (("data_smoltalk_512", False), (fw_name, rebuilt_fw)):
         prefix = os.path.join(WORK_DATA, name)
-        if not have_data(name + ".tokens.npy"):
+        if force or not have_data(name + ".tokens.npy"):
+            pkl_src = (os.path.join(WORK_DATA, name + ".pkl") if force
+                       else find_data(name + ".pkl"))
             rc = run([PY, os.path.join(REPO, "kaggle", "pack_data.py"),
-                      "--pkl", find_data(name + ".pkl"),
-                      "--prefix", prefix,
+                      "--pkl", pkl_src, "--prefix", prefix,
                       "--max-len", str(MAX_LEN)], "data_pack.log")
             assert rc == 0, f"packing {name} failed"
             push_all(st, f"data: {name} packed")
