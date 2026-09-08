@@ -70,6 +70,50 @@ ARMS = {
     'bpe_d256':   ('bpe',    290, 256, 64),
 }
 
+# Bistable-fold arms (docs/OPERA_Bistable_prereg.md). Same rung as
+# bytes_d512 so its BPB (2.1317) is the incumbent number. 'mono' is the
+# capacity-matched control: identical parameters, gain capped below 1 so
+# bistability is unreachable. The contrast bi - mono isolates
+# bistability rather than added capacity.
+BIST = {'bist_off': 'off', 'bist_mono': 'mono', 'bist_bi': 'bi',
+        'bist_bi_r1': 'bi', 'bist_bi_r4': 'bi'}
+# rank of the gain bottleneck: 0 = per-block (falsified 2026-09-08),
+# r>0 = the nb gains forced through r dimensions so they move together.
+BIST_RANK = {'bist_bi_r1': 1, 'bist_bi_r4': 4}
+
+# Over-relaxation arms (docs/OPERA_Relax_prereg.md). 'under' is the
+# capacity-matched control: identical params, identical bitwise-incumbent
+# init, gamma clamped at 1 so overshoot is unreachable.
+RELAX = {'relax_off': 'off', 'relax_under': 'under', 'relax_over': 'over'}
+# Level-balanced gradient (docs/OPERA_LevelGrad_prereg.md). beta=1.0 is
+# bitwise the incumbent in BOTH forward and backward; beta>1 shifts the
+# shared compose weights' gradient from shallow levels toward deep ones,
+# normalised to mean 1 so it rebalances rather than rescales.
+LGB = {'lgb_1_25': 1.25, 'lgb_1_5': 1.5, 'lgb_2_0': 2.0}
+for _n in LGB:
+    ARMS[_n] = ('bytes', 1024, 512, 128)
+
+# RECIPE arms. Every byte run so far used train()'s defaults -- AdamW,
+# cosine, no msup, no curriculum -- i.e. NONE of the improvements this
+# project has already validated:
+#   Muon lr 0.02 : 186.45 vs AdamW 224.88 (+38.4 PPL, pre-registered)
+#   msup         : -9.87 PPL at the toy rung
+#   curriculum   : parity on fewer tokens, stacks with msup
+# RECIPE = the stacked recipe; the singles isolate each contribution.
+RECIPE = {
+    'rx_muon':   dict(optimizer='muon', muon_lr=0.02),
+    'rx_msup':   dict(msup=True, msup_weight=0.1),
+    'rx_full':   dict(optimizer='muon', muon_lr=0.02, msup=True,
+                      msup_weight=0.1, curriculum=(128, 250),
+                      lr_schedule='wsd'),
+}
+for _n in RECIPE:
+    ARMS[_n] = ('bytes', 1024, 512, 128)
+for _n in RELAX:
+    ARMS[_n] = ('bytes', 1024, 512, 128)
+for _n, _m in BIST.items():
+    ARMS[_n] = ('bytes', 1024, 512, 128)
+
 
 def load_corpus(repr_mode, T, max_articles):
     cache = os.path.join(
@@ -142,7 +186,12 @@ def main():
             num_layers=args.layers, eval_max_len=eml,
             device=args.device, pe_mode='none', fold_mode='left',
             rot_mode='free', data=data, seed=args.seed,
-            out_dir=arm_dir, tie=False)
+            out_dir=arm_dir, tie=False,
+            fold_bistable=BIST.get(name, 'off'),
+            bist_rank=BIST_RANK.get(name, 0),
+            fold_relax=RELAX.get(name, 'off'),
+            level_grad_balance=LGB.get(name, 1.0),
+            **RECIPE.get(name, {}))
         mins = (time.time() - t0) / 60
 
         ppl = res['test_perplexity_in_length']
@@ -159,6 +208,10 @@ def main():
             'bpb': bpb, 'minutes': mins,
             'raw_bytes_train': meta['raw_bytes_train'],
             'ckpt_dir': arm_dir, 'config': res.get('config'),
+            'fold_bistable': BIST.get(name, 'off'),
+            'bist_rank': BIST_RANK.get(name, 0),
+            'fold_relax': RELAX.get(name, 'off'),
+            'level_grad_balance': LGB.get(name, 1.0),
         }
         with open(summary_path, 'w') as f:
             json.dump(summary, f, indent=2)

@@ -279,6 +279,31 @@ def associative_scan(q, b):
     return q, b
 
 
+class _GradScale(torch.autograd.Function):
+    """Identity forward; scales the gradient backward.
+
+    Used to reweight how much each TREE LEVEL contributes to the SHARED
+    compose weights. Scaling a level's output gradient directly would be
+    wrong -- that gradient also flows down to every level beneath it, so
+    the factors would compound geometrically. Scaling the WEIGHTS the
+    level sees touches only that level's contribution to dL/dW and
+    leaves the input path untouched.
+    """
+
+    @staticmethod
+    def forward(ctx, x, s):
+        ctx.s = s
+        return x
+
+    @staticmethod
+    def backward(ctx, g):
+        return g * ctx.s, None
+
+
+def grad_scale(x, s):
+    return x if s == 1.0 else _GradScale.apply(x, s)
+
+
 class OperaOutput(NamedTuple):
     """forward()'s return value: fields absent from a given call (the
     corresponding return_* flag was False) are None rather than the field
@@ -315,7 +340,9 @@ class OperaSpinorFenwickTree(nn.Module):
                  workspace=False, fold_gate_bias=None,
                  readout_mode='none', readout_max_slots=16,
                  mem_mode='none', mem_dim=128, homeo_mode='off',
-                 node_paths=3, fold_adapt='off'):
+                 node_paths=3, fold_adapt='off', fold_bistable='off',
+                 bist_rank=0, fold_relax='off',
+                 level_grad_balance=1.0):
         super().__init__()
         assert d == 4 * nb, f"d must equal 4*nb (got d={d}, nb={nb})"
         assert lock_mode in ('none', 'interference')
@@ -365,6 +392,40 @@ class OperaSpinorFenwickTree(nn.Module):
                 "node kernels hard-code 3 gate channels)"
             assert fold_mode != 'scan', \
                 "--node-paths tunes the compose node; --fold scan builds none"
+        # LEVEL-BALANCED GRADIENT (docs/OPERA_LevelGrad_prereg.md).
+        # OPERA ties one compose operator across the whole scale
+        # hierarchy: the same weights join two bytes at level 0 and two
+        # 128-byte spans at level 7. Level k has T/2^k nodes, so the
+        # shared weights receive geometrically less gradient from deeper
+        # levels. MEASURED on the byte-d512 incumbent (T=256, layer 0):
+        # gradient share 34.1 / 25.3 / 14.8 / 9.6 / 6.3 / 4.4 / 3.1 /
+        # 2.3 / 0.0 % for levels 0..8 -- a 15:1 imbalance across trained
+        # levels, and EXACTLY ZERO at the root (the only prefix reading
+        # it is L=T, whose prediction target is masked).
+        #
+        # beta = 1.0 is the incumbent exactly (grad_scale is identity).
+        # Level l's contribution to dL/dW is scaled by beta**l:
+        # beta=2 cancels the node-count halving exactly; the measured
+        # decay is ~1.5x per level (per-node gradient GROWS with depth,
+        # partly self-correcting), so beta~1.5 equalises.
+        #
+        # This is not depth-recursion weight tying (Universal
+        # Transformer, Mixture-of-Recursions), where the tied layer is
+        # applied N times to a same-length sequence and node counts are
+        # equal. The imbalance is specific to tying across SCALE.
+        assert level_grad_balance > 0
+        self.level_grad_balance = float(level_grad_balance)
+        assert fold_relax in ('off', 'under', 'over')
+        if fold_relax != 'off':
+            assert fold_mode == 'left', \
+                "fold_relax is implemented for the left fold"
+            assert fold_bistable == 'off', \
+                "fold_relax and fold_bistable both rewrite the fold " \
+                "accumulator; enabling both makes attribution impossible"
+        assert fold_bistable in ('off', 'mono', 'bi')
+        if fold_bistable != 'off':
+            assert fold_mode == 'left', \
+                "fold_bistable is implemented for the left fold"
         assert fold_adapt in ('off', 'on')
         if fold_adapt == 'on':
             assert fold_mode != 'scan', \
@@ -975,6 +1036,124 @@ class OperaSpinorFenwickTree(nn.Module):
         else:
             self.fold_adapt_w = None
 
+        # BISTABLE FOLD (docs/OPERA_Bistable_prereg.md). The fold's
+        # accumulator update becomes the BRC recurrence (Vecoven, Ernst
+        # & Drion, arXiv:2006.05252):
+        #
+        #     acc <- (1 - c) * composed + c * tanh(a (*) acc)
+        #
+        # per block. `a` is the feedback GAIN: the map x -> tanh(a x)
+        # is monotonic (one stable fixed point) for a <= 1 and acquires
+        # a negative-slope region with TWO stable fixed points for
+        # a > 1. So bistability is reachable iff the gain range admits
+        # a > 1 -- which is exactly what separates the two arms:
+        #
+        #   'mono' : a = sigmoid(z)     in (0, 1)  -- CONTROL, never bistable
+        #   'bi'   : a = 1 + tanh(z)    in (0, 2)  -- BRC's range
+        #
+        # Identical parameter count and identical init; the ONLY
+        # difference is whether a can exceed 1. The contrast therefore
+        # isolates bistability rather than "a new module".
+        #
+        # WARM INIT, on purpose. b_c = 0 (c ~ 0.5) and the gain head is
+        # zero-init so a ~ 1.0 ('bi') / 0.5 ('mono') at step 0. Phase 1's
+        # homeo and quotient arms both nulled with gates stuck at
+        # sigmoid(-6) = 0.0025 -- a multiplicative gate that small has
+        # its own gradient suppressed by g(1-g), so it cannot open: the
+        # null was a property of the init, not of the mechanism. Flags-on
+        # is therefore NOT bitwise the incumbent here; 'off' is the
+        # incumbent and 'mono' is the capacity-matched control.
+        # bist_rank: 0 = one independent gain per block (the registered
+        # 2026-09-08 arm, FALSIFIED); r > 0 = the nb gains are forced
+        # through an r-dimensional bottleneck, so they can only move
+        # together.
+        #
+        # WHY: the per-block arm used bistability heavily (66% of updates
+        # at median gain 1.65) and produced no trajectory excursions. The
+        # diagnosis was that nb=128 INDEPENDENT commitments average out
+        # in the norm -- hypercube corners are all at similar distance,
+        # so switching one changes little. Metastable-attractor models
+        # (Recanatesi et al., Neuron 2021) produce lingering-then-abrupt
+        # dynamics by coupling a high-dimensional state to a
+        # LOW-DIMENSIONAL modulator, which is exactly the correlation
+        # this bottleneck imposes. rank=1 is the extreme: a single
+        # scalar drives all nb gains through one fixed profile.
+        self.fold_bistable = fold_bistable
+        self.bist_rank = bist_rank
+        if fold_bistable != 'off':
+            def _gain_head():
+                if bist_rank > 0:
+                    return nn.Sequential(
+                        nn.Linear(2 * d, bist_rank, bias=False),
+                        nn.Linear(bist_rank, nb))
+                return nn.Linear(2 * d, nb)
+            self.bist_a = nn.ModuleList(
+                [_gain_head() for _ in range(num_layers)])
+            self.bist_c = nn.ModuleList(
+                [nn.Linear(2 * d, nb) for _ in range(num_layers)])
+            for la, lc in zip(self.bist_a, self.bist_c):
+                # Output zero at init -> a is exactly 1.0 ('bi') / 0.5
+                # ('mono'), i.e. exactly ON the bifurcation point, so any
+                # bistability is attributable to training.
+                #
+                # LoRA convention for the factored head: the DOWN
+                # projection keeps its random init and only the UP
+                # projection is zeroed. Zeroing both would make
+                # dL/dW_down proportional to W_up = 0 and the factor
+                # would never receive gradient at all -- the same
+                # cold-start failure that produced phase 1's two
+                # uninformative nulls. With this init only the first
+                # step is blind.
+                last = la[-1] if isinstance(la, nn.Sequential) else la
+                nn.init.zeros_(last.weight)
+                nn.init.zeros_(last.bias)
+                nn.init.zeros_(lc.bias)
+        else:
+            self.bist_a = None
+            self.bist_c = None
+
+        # OVER-RELAXATION on the fold accumulator.
+        #
+        #     acc <- acc + gamma (*) (composed - acc)
+        #
+        # gamma = 1 is EXACTLY the incumbent (acc <- composed); gamma < 1
+        # under-relaxes (lands short of composed); gamma > 1 OVERSHOOTS
+        # past it. This is successive over-relaxation, per block.
+        #
+        # WHY THIS CLASS AND NOT ANOTHER GATE. Four mechanisms have now
+        # failed to move the step distribution -- fold_adapt (sigmoid),
+        # Mamba's Delta (softplus), bistable per-block, bistable
+        # low-rank. They differ in smoothness, granularity and stability
+        # structure, and share exactly one property: every one is a gate
+        # on a CONVEX blend, acc <- (1-c) X + c Y, which lands strictly
+        # BETWEEN X and Y. A gate chooses where in that interval to
+        # land; it can never pass either endpoint. No amount of gating
+        # can therefore increase displacement -- that is arithmetic, not
+        # a training failure. Over-relaxation is the one operation class
+        # that escapes it, and phase 2 measured 41-58% of the
+        # geometrically available step range going unused.
+        #
+        # THE INCUMBENT IS INTERIOR. gamma = 1 + tanh(z) with z zero-init
+        # gives gamma = 1 exactly -> bitwise the incumbent, while
+        # gradients flow in BOTH directions. Neither the cold-gate
+        # failure (phase 1's homeo/quotient) nor the warm-init/not-
+        # bitwise compromise (the bistable arms) applies here.
+        #
+        # CONTROL. 'under' clamps the same expression at 1:
+        # gamma = 1 + min(tanh(z), 0) in (0, 1]. Identical parameters,
+        # identical init, identical dynamics at step 0 -- the ONLY
+        # difference is whether gamma can exceed 1. The contrast
+        # therefore isolates OVERSHOOT, not capacity.
+        self.fold_relax = fold_relax
+        if fold_relax != 'off':
+            self.relax_g = nn.ModuleList(
+                [nn.Linear(2 * d, nb) for _ in range(num_layers)])
+            for lg in self.relax_g:
+                nn.init.zeros_(lg.weight)
+                nn.init.zeros_(lg.bias)
+        else:
+            self.relax_g = None
+
         # QUOTIENT PATH gate (node_paths=4): separate module created
         # LAST so the incumbent fusion_gate and RNG stream are exactly
         # the incumbent's. Bias -6 -> sigmoid ~= 0.0025: flags-on is
@@ -1049,6 +1228,7 @@ class OperaSpinorFenwickTree(nn.Module):
         return ent[1]
 
     def _compose(self, h_left, h_right, layer_idx, R_L, R_R, R_O,
+                 gate_scale=1.0,
                  gate_bias=None):
         """compose_pair_batch, optionally under activation checkpointing:
         backward recomputes the node's ~18 intermediates from its two
@@ -1060,12 +1240,13 @@ class OperaSpinorFenwickTree(nn.Module):
             from torch.utils.checkpoint import checkpoint
             return checkpoint(self.compose_pair_batch, h_left, h_right,
                               layer_idx, R_L, R_R, R_O, gate_bias,
-                              use_reentrant=False)
+                              gate_scale, use_reentrant=False)
         return self.compose_pair_batch(h_left, h_right, layer_idx,
-                                       R_L, R_R, R_O, gate_bias)
+                                       R_L, R_R, R_O, gate_bias,
+                                       gate_scale)
 
     def compose_pair_batch(self, h_left, h_right, layer_idx, R_L, R_R, R_O,
-                           gate_bias=None):
+                           gate_bias=None, gate_scale=1.0):
         N = h_left.shape[0]
         nb = self.nb
         gb = (self.fusion_gate[layer_idx].bias if gate_bias is None
@@ -1155,8 +1336,8 @@ class OperaSpinorFenwickTree(nn.Module):
         # tensor written and saved for backward at EVERY node. Chained
         # addmm: (b + h_left@W1^T) + h_right@W2^T in 2 kernel launches
         # (float-op reordering only).
-        W = self.fusion_gate[layer_idx].weight
-        b = gb
+        W = grad_scale(self.fusion_gate[layer_idx].weight, gate_scale)
+        b = grad_scale(gb, gate_scale) if gate_scale != 1.0 else gb
         g = torch.addmm(torch.addmm(b, h_left, W[:, :self.d].t()),
                         h_right, W[:, self.d:].t())
         g = torch.sigmoid(g.reshape(N, 3, nb))
@@ -1274,14 +1455,31 @@ class OperaSpinorFenwickTree(nn.Module):
         locks = []
         energies = []
         current = states
+        lvl_i = 0
+        beta = self.level_grad_balance
+        # NORMALISE the per-level weights to mean 1 over the levels this
+        # tree actually has. Without this, beta>1 would simply inflate
+        # every compose gradient -- indistinguishable from raising the
+        # learning rate on those parameters, and any effect would be an
+        # LR effect rather than a BALANCE effect. With it, beta purely
+        # redistributes a fixed total between shallow and deep levels.
+        _n_lv = max(1, int(math.floor(math.log2(max(states.shape[1], 2)))))
+        _z = (sum(beta ** i for i in range(1, _n_lv + 1)) / _n_lv
+              if beta != 1.0 else 1.0)
         while current.shape[1] >= 2:
             n = current.shape[1]
             m = n // 2
             left = current[:, 0:2 * m:2, :]
             right = current[:, 1:2 * m:2, :]
             N = B * m
+            lvl_i += 1
+            # Level lvl_i's share of dL/dW is scaled by beta**lvl_i.
+            gs = (beta ** lvl_i) / _z
+            rl, rr, ro = (grad_scale(R_L, gs), grad_scale(R_R, gs),
+                          grad_scale(R_O, gs))
             parent, lock, energy = self._compose(
-                left.reshape(N, d), right.reshape(N, d), layer_idx, R_L, R_R, R_O)
+                left.reshape(N, d), right.reshape(N, d), layer_idx,
+                rl, rr, ro, gate_scale=gs)
             if self.homeo_mode == 'on':
                 # spinor homeostasis: relax the new parents toward the
                 # level's anchor (level 1 = span-2 nodes; leaves untouched)
@@ -1731,6 +1929,14 @@ class OperaSpinorFenwickTree(nn.Module):
                 composed, _, _ = self._compose(
                     a.reshape(B * m, d), nxt.reshape(B * m, d),
                     layer_idx, R_L, R_R, R_O, gate_bias=fgb)
+                if self.bist_a is not None:
+                    composed = self._bistable_update(
+                        a.reshape(B * m, d), nxt.reshape(B * m, d),
+                        composed, layer_idx)
+                if self.relax_g is not None:
+                    composed = self._relax_update(
+                        a.reshape(B * m, d), nxt.reshape(B * m, d),
+                        composed, layer_idx)
                 acc = acc.index_copy(1, act, composed.reshape(B, m, d))
             if self.readout_mode == 'multistate':
                 acc = acc + self._multistate_readout(gathered, lvl, count,
@@ -1787,6 +1993,109 @@ class OperaSpinorFenwickTree(nn.Module):
             slots, valid = merged, new_valid
             S = slots.shape[2]
         return slots[:, :, 0, :]
+
+    def _bistable_update(self, acc, nxt, composed, layer_idx):
+        """BRC recurrence on the fold accumulator (arXiv:2006.05252).
+
+            acc <- (1 - c) * composed + c * tanh(a (*) acc)
+
+        acc/nxt/composed: [N, d]. `a` and `c` are per BLOCK ([N, nb]),
+        broadcast over each block's 4 spinor components, so a block
+        commits or does not commit as a unit -- the same granularity the
+        fusion gate already uses.
+
+        WHY THE GAIN GOES HERE AND NOT INSIDE THE NODE: `composed` is
+        already past comp_norm, and every norm_mode rescales the node's
+        output. A gain applied to the node's INPUT would be renormalized
+        away before it could bend anything. The fold's accumulator
+        update is the one point on this path where a > 1 survives.
+
+        WHY IT CANNOT DIVERGE: the positive feedback sits inside a tanh,
+        so |tanh(a*acc)| < 1 regardless of a. The bound is structural,
+        not a clamp -- no gradient is discarded.
+
+        Bistability: x -> tanh(a x) has one stable fixed point for
+        a <= 1 and two for a > 1 (the negative-slope region opens at
+        a = 1). 'mono' caps a below 1 by construction and is the
+        capacity-matched control; 'bi' uses BRC's (0, 2).
+        """
+        N = acc.shape[0]
+        h = torch.cat([acc, nxt], dim=-1)
+        z = self.bist_a[layer_idx](h)                        # [N, nb]
+        if self.fold_bistable == 'bi':
+            a = 1.0 + torch.tanh(z)                          # (0, 2)
+        else:
+            a = torch.sigmoid(z)                             # (0, 1)
+        c = torch.sigmoid(self.bist_c[layer_idx](h))         # [N, nb]
+        ab = a.unsqueeze(-1)                                 # [N, nb, 1]
+        cb = c.unsqueeze(-1)
+        accb = acc.reshape(N, self.nb, 4)
+        fb = composed.reshape(N, self.nb, 4)
+        out = (1.0 - cb) * fb + cb * torch.tanh(ab * accb)
+        return out.reshape(N, -1)
+
+    def _relax_update(self, acc, nxt, composed, layer_idx):
+        """acc <- acc + gamma (*) (composed - acc), per block.
+
+        gamma = 1 reproduces the incumbent exactly. gamma > 1 overshoots
+        PAST composed -- the only tested operation that can place the new
+        state outside the interval [acc, composed], and therefore the
+        only one that can increase displacement rather than redistribute
+        it."""
+        N = acc.shape[0]
+        z = torch.tanh(self.relax_g[layer_idx](
+            torch.cat([acc, nxt], dim=-1)))               # [N, nb]
+        if self.fold_relax == 'under':
+            z = torch.clamp(z, max=0.0)                   # gamma <= 1
+        g = (1.0 + z).unsqueeze(-1)                       # [N, nb, 1]
+        ab = acc.reshape(N, self.nb, 4)
+        fb = composed.reshape(N, self.nb, 4)
+        # Written as (1-g)*acc + g*composed rather than the algebraically
+        # identical acc + g*(composed-acc): at g=1 the first form yields
+        # `composed` EXACTLY (0*acc + 1*composed), while the second
+        # rounds (a + (b-a)) != b in floating point. That exactness is
+        # what makes flags-on bitwise the incumbent at init, which is the
+        # property the whole design rests on.
+        #
+        # This is NOT the convex blend that the four falsified arms used.
+        # There c was a sigmoid in (0,1), so both coefficients were
+        # positive and the result was pinned between the endpoints. Here
+        # g > 1 makes (1-g) NEGATIVE -- the state is pushed AWAY from
+        # acc, past composed. A negative coefficient is exactly what
+        # extrapolation means and what no gate can produce.
+        return ((1.0 - g) * ab + g * fb).reshape(N, -1)
+
+    @torch.no_grad()
+    def relax_stats(self, acc, nxt, layer_idx):
+        """Usage report: is gamma actually driven past 1? An 'over' arm
+        that never overshoots is a cold-parameter null, not a failed
+        mechanism -- the same distinction that decided the bistable
+        study."""
+        z = torch.tanh(self.relax_g[layer_idx](
+            torch.cat([acc, nxt], dim=-1)))
+        if self.fold_relax == 'under':
+            z = torch.clamp(z, max=0.0)
+        g = 1.0 + z
+        return {'gamma_mean': g.mean().item(), 'gamma_max': g.max().item(),
+                'frac_overshoot': (g > 1.0).float().mean().item(),
+                'frac_deep': (g > 1.5).float().mean().item()}
+
+    @torch.no_grad()
+    def bistable_stats(self, acc, nxt, layer_idx):
+        """Usage report for H3: what fraction of blocks are actually in
+        the bistable regime (a > 1), and the gain/retention means. The
+        arm reporting its own usage is what made the phase-1 nulls
+        interpretable -- 'bi' that never leaves a <= 1 is a null by cold
+        parameters, not a failed mechanism, and the two must not be
+        confused."""
+        h = torch.cat([acc, nxt], dim=-1)
+        z = self.bist_a[layer_idx](h)
+        a = (1.0 + torch.tanh(z) if self.fold_bistable == 'bi'
+             else torch.sigmoid(z))
+        c = torch.sigmoid(self.bist_c[layer_idx](h))
+        return {'a_mean': a.mean().item(), 'a_max': a.max().item(),
+                'frac_bistable': (a > 1.0).float().mean().item(),
+                'c_mean': c.mean().item()}
 
     def _multistate_readout(self, gathered, lvl, count, layer_idx):
         """T0.4 (roadmap): the head ALSO reads the prefix's <= log T + 1

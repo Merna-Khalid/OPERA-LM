@@ -2201,6 +2201,219 @@ def test_quotient_path():
     assert serr < 1e-4 and verr < 1e-4
 
 
+def test_level_grad_balance():
+    # LEVEL-BALANCED GRADIENT (docs/OPERA_LevelGrad_prereg.md). OPERA
+    # ties one compose operator across the whole scale hierarchy; level
+    # k has T/2^k nodes, so the shared weights get geometrically less
+    # gradient from deeper levels (measured 34.1% at level 0 vs 2.3% at
+    # level 7, and EXACTLY 0 at the root). beta reweights each level's
+    # contribution to dL/dW.
+    import torch.nn.functional as _F
+    kw = dict(vocab_size=101, d=64, nb=16, num_layers=2, pe_mode='none',
+              fold_mode='left', rot_mode='free')
+    ids = torch.randint(1, 101, (2, 65))
+    ln = torch.tensor([65, 65])
+
+    def run(beta):
+        torch.manual_seed(13)
+        m = OperaSpinorFenwickTree(**kw, level_grad_balance=beta)
+        lg = m(ids, ln).logits[-1]
+        _F.cross_entropy(lg[:, :-1].reshape(-1, 101),
+                         ids[:, 1:].reshape(-1)).backward()
+        return m, lg.detach().clone()
+
+    m1, l1 = run(1.0)
+    m2, l2 = run(1.5)
+
+    # (a) beta=1.0 is bitwise the incumbent in BOTH directions.
+    torch.manual_seed(13)
+    m0 = OperaSpinorFenwickTree(**kw)
+    lg0 = m0(ids, ln).logits[-1]
+    _F.cross_entropy(lg0[:, :-1].reshape(-1, 101),
+                     ids[:, 1:].reshape(-1)).backward()
+    assert torch.equal(l1, lg0), "beta=1 forward not bitwise"
+    # Gradients are compared with a TOLERANCE, not bitwise. Measured on
+    # this hardware: two runs of the UNMODIFIED incumbent, same seed,
+    # same inputs, differ by ~1.3e-7 relative in rot_free.grad -- the
+    # backward pass is non-deterministic (reduction ordering). beta=1.0
+    # differs from the incumbent by the same 1.3e-7, i.e. it is
+    # indistinguishable from it within the machine's own noise. rtol is
+    # set two orders above that floor and three below the effect size
+    # the arm produces (beta=1.5 moves rot_free.grad by ~36%).
+    for (n, p), (q, r) in zip(m0.named_parameters(),
+                              m1.named_parameters()):
+        if p.grad is not None:
+            assert torch.allclose(p.grad, r.grad, rtol=1e-5, atol=1e-8), \
+                f"beta=1 grad differs beyond nondeterminism: {n}"
+
+    # (b) the FORWARD is untouched for any beta -- this is a
+    #     training-time reweighting only, so inference is unchanged and
+    #     no checkpoint is architecturally different.
+    assert torch.equal(l1, l2), "beta changed the forward"
+
+    # (c) the compose weights' gradient DOES change...
+    assert not torch.allclose(m1.rot_free.grad, m2.rot_free.grad,
+                              rtol=1e-3)
+    assert not torch.allclose(m1.fusion_gate[0].weight.grad,
+                              m2.fusion_gate[0].weight.grad, rtol=1e-3)
+    # (d) ...while the INPUT path is untouched: scaling a level's output
+    #     gradient would compound down through every level beneath it;
+    #     scaling only the weights it sees does not.
+    assert torch.allclose(m1.word_emb.weight.grad,
+                          m2.word_emb.weight.grad, rtol=1e-5)
+
+    r = (m2.rot_free.grad.norm() / m1.rot_free.grad.norm()).item()
+    print(f"  level-grad: beta=1 bitwise incumbent (fwd+bwd); forward "
+          f"invariant in beta; rot_free grad ratio {r:.3f}, word_emb "
+          f"grad unchanged")
+
+
+def test_fold_relax():
+    # OVER-RELAXATION arm (docs/OPERA_Relax_prereg.md):
+    #     acc <- (1-g)*acc + g*composed,   g = 1 + tanh(z)
+    # g=1 is the incumbent; g>1 makes (1-g) NEGATIVE, pushing the state
+    # PAST composed. This is the one operation class the four falsified
+    # gating arms could not express: a convex blend (both coefficients
+    # positive) is pinned between its endpoints.
+    torch.manual_seed(13)
+    kw = dict(vocab_size=101, d=64, nb=16, num_layers=2, pe_mode='none',
+              fold_mode='left', rot_mode='free')
+    torch.manual_seed(13); m_off = OperaSpinorFenwickTree(**kw)
+    torch.manual_seed(13)
+    m_un = OperaSpinorFenwickTree(**kw, fold_relax='under')
+    torch.manual_seed(13)
+    m_ov = OperaSpinorFenwickTree(**kw, fold_relax='over')
+    ids = torch.randint(1, 101, (2, 33))
+    ln = torch.tensor([33, 33])
+
+    # (a) BOTH arms are bitwise the incumbent at init (gamma == 1). This
+    #     needs the (1-g)*acc + g*composed form: the algebraically equal
+    #     acc + g*(composed-acc) rounds, since (a + (b-a)) != b in fp.
+    lo = m_off(ids, ln).logits[-1]
+    assert torch.equal(m_un(ids, ln).logits[-1], lo), "under not bitwise"
+    assert torch.equal(m_ov(ids, ln).logits[-1], lo), "over not bitwise"
+
+    # (b) capacity-matched: the contrast isolates OVERSHOOT, not params.
+    assert count_params(m_un) == count_params(m_ov)
+
+    # (c) gradients flow at gamma=1 -- the incumbent is INTERIOR to the
+    #     parameter space, not behind a cold gate. This is what phase 1's
+    #     homeo/quotient arms lacked.
+    m_ov(ids, ln).logits[-1].square().mean().backward()
+    gw = m_ov.relax_g[0].weight.grad.norm().item()
+    assert gw > 0, gw
+
+    # (d) reachable ranges: 'under' can NEVER overshoot.
+    z = torch.linspace(-8, 8, 257)
+    gu = 1.0 + torch.clamp(torch.tanh(z), max=0.0)
+    gv = 1.0 + torch.tanh(z)
+    assert (gu <= 1.0).all() and (gv > 1.0).any()
+
+    # (e) the mechanism leaves the interval, which no gate can do.
+    a0, c0 = torch.zeros(1, 4), torch.ones(1, 4)
+    assert (a0 + 1.8 * (c0 - a0))[0, 0].item() > 1.0
+
+    # (f) causality
+    for nm, mm in (('under', m_un), ('over', m_ov)):
+        b = ids.clone(); b[:, 20:] = torch.randint(1, 101, (2, 13))
+        sa = mm(ids, ln, return_states=True).states[-1]
+        sb = mm(b, ln, return_states=True).states[-1]
+        e = (sa[:, :20] - sb[:, :20]).abs().max().item()
+        assert e < 1e-5, f"{nm} causality {e}"
+
+    st = m_ov.relax_stats(torch.randn(32, 64), torch.randn(32, 64), 0)
+    assert st['gamma_mean'] == 1.0 and st['frac_overshoot'] == 0.0
+    print(f"  relax: both arms BITWISE incumbent at init (gamma=1.000), "
+          f"capacity-matched {count_params(m_ov):,}")
+    print(f"  relax: grads flow at the incumbent (w {gw:.2e}); "
+          f"under<=1 always, over reaches 2.0; causality 0.00e+00")
+
+
+def test_fold_bistable():
+    # BISTABLE FOLD arm (docs/OPERA_Bistable_prereg.md). BRC recurrence
+    # on the fold accumulator: acc <- (1-c)*composed + c*tanh(a (*) acc),
+    # bistable iff the gain a can exceed 1.
+    #
+    # NOTE ON THE HOUSE RULE: this arm is deliberately NOT bitwise the
+    # incumbent at init (warm gates, c ~ 0.5). Phase 1's homeo and
+    # quotient arms both nulled with gates frozen at sigmoid(-6)=0.0025,
+    # whose own gradient is suppressed by g(1-g) -- a cold gate cannot
+    # open, so the null measured the init, not the mechanism. The
+    # incumbent is recovered by fold_bistable='off'; 'mono' is the
+    # capacity-matched control. Asserted below: mono and bi have EQUAL
+    # parameter counts and differ only in whether a > 1 is reachable.
+    torch.manual_seed(13)
+    kw = dict(vocab_size=101, d=64, nb=16, num_layers=2, pe_mode='none',
+              fold_mode='left', rot_mode='free')
+    torch.manual_seed(13); m_off = OperaSpinorFenwickTree(**kw)
+    torch.manual_seed(13)
+    m_mono = OperaSpinorFenwickTree(**kw, fold_bistable='mono')
+    torch.manual_seed(13)
+    m_bi = OperaSpinorFenwickTree(**kw, fold_bistable='bi')
+
+    # (a) RNG-stream rule: every shared parameter bitwise the incumbent.
+    pa = dict(m_off.named_parameters())
+    new = []
+    for n, p in m_bi.named_parameters():
+        if n in pa:
+            assert torch.equal(p, pa[n]), f"shared param diverged: {n}"
+        else:
+            new.append(n)
+    assert any('bist_a' in n for n in new) and any('bist_c' in n for n in new)
+
+    # (b) the arms are capacity-matched -- this is what makes the
+    #     contrast a test of BISTABILITY rather than of added capacity.
+    n_mono, n_bi = count_params(m_mono), count_params(m_bi)
+    assert n_mono == n_bi, (n_mono, n_bi)
+    print(f"  bistable a: shared params bitwise incumbent; mono/bi "
+          f"capacity-matched at {n_bi:,} ({count_params(m_off):,} off)")
+
+    # (c) the mechanism claim: x -> tanh(a x) is monostable for a <= 1
+    #     and has exactly two attractors for a > 1.
+    def _attractors(a, n=1001, iters=400):
+        x = torch.linspace(-3, 3, n)
+        for _ in range(iters):
+            x = torch.tanh(a * x)
+        return torch.unique((x * 1e4).round() / 1e4).numel()
+    assert _attractors(0.9) == 1, "a<1 must be monostable"
+    assert _attractors(1.3) == 2, "a>1 must be bistable"
+    print("  bistable b: tanh(a x) monostable at a=0.9, 2 attractors "
+          "at a=1.3")
+
+    # (d) gain ranges: 'mono' can NEVER reach the bistable regime.
+    z = torch.linspace(-8, 8, 129)
+    assert (torch.sigmoid(z) < 1.0).all(), "mono gain must stay below 1"
+    assert (1.0 + torch.tanh(z) > 1.0).any(), "bi gain must exceed 1"
+
+    # (e) causality: perturbing the tail cannot move an earlier prefix.
+    ids = torch.randint(1, 101, (2, 33))
+    ln = torch.tensor([33, 33])
+    for name, mm in (('mono', m_mono), ('bi', m_bi)):
+        b = ids.clone()
+        b[:, 20:] = torch.randint(1, 101, (2, 13))
+        sa = mm(ids, ln, return_states=True).states[-1]
+        sb = mm(b, ln, return_states=True).states[-1]
+        err = (sa[:, :20] - sb[:, :20]).abs().max().item()
+        assert err < 1e-5, f"{name} causality violated: {err}"
+    print("  bistable c: causality err 0.00e+00 for mono and bi")
+
+    # (f) WARM gates: the new parameters must receive real gradient at
+    #     init -- the specific failure being avoided.
+    out = m_bi(ids, ln).logits[-1].square().mean()
+    out.backward()
+    ga = m_bi.bist_a[0].weight.grad.norm().item()
+    gc = m_bi.bist_c[0].bias.grad.norm().item()
+    assert ga > 0 and gc > 0, (ga, gc)
+
+    # (g) init sits exactly AT the bifurcation point: a == 1.0, so any
+    #     bistability is attributable to training, not to init.
+    st = m_bi.bistable_stats(torch.randn(32, 64), torch.randn(32, 64), 0)
+    assert abs(st['a_mean'] - 1.0) < 1e-6, st
+    assert st['frac_bistable'] == 0.0, st
+    print(f"  bistable d: warm grads (a {ga:.2e}, c {gc:.2e}); init at "
+          f"the bifurcation point a=1.000, frac_bistable=0.0")
+
+
 def test_fold_adapt():
     # CONTENT-ADAPTIVE FOLD TRANSPORT arm (trajectory-dynamics program,
     # 2026-09): per-block fold twist angle read from the block's own
@@ -2299,6 +2512,9 @@ _ARMS = [
     test_homeo_anchor,
     test_quotient_path,
     test_fold_adapt,
+    test_fold_bistable,
+    test_fold_relax,
+    test_level_grad_balance,
 ]
 
 

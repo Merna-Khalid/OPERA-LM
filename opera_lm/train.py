@@ -388,6 +388,8 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
           readout_mode='none', readout_max_slots=16,
           mem_mode='none', mem_dim=128, init_weights_from=None,
           homeo_mode='off', node_paths=3, fold_adapt='off',
+          fold_bistable='off', bist_rank=0, fold_relax='off',
+          level_grad_balance=1.0,
           packed_data=None, ddp=False):
     # DDP (multi-GPU data parallelism, added for the Kaggle 2xT4 tier --
     # a single T4 measured ~8.5x slower than the project's A100, so real
@@ -497,6 +499,11 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
     if homeo_mode != 'off': tag.append('homeo')
     if node_paths != 3: tag.append(f'np{node_paths}')
     if fold_adapt != 'off': tag.append('fadpt')
+    if fold_relax != 'off': tag.append(f'relax-{fold_relax}')
+    if level_grad_balance != 1.0: tag.append(f'lgb{level_grad_balance:g}')
+    if fold_bistable != 'off':
+        tag.append(f'bist-{fold_bistable}'
+                   + (f'-r{bist_rank}' if bist_rank else ''))
     if lock_mode != 'none': tag.append(lock_mode)
     tag = '+'.join(tag)
 
@@ -576,7 +583,12 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
                                    mem_dim=mem_dim,
                                    homeo_mode=homeo_mode,
                                    node_paths=node_paths,
-                                   fold_adapt=fold_adapt).to(torch_device)
+                                   fold_adapt=fold_adapt,
+                                   fold_bistable=fold_bistable,
+                                   bist_rank=bist_rank,
+                                   fold_relax=fold_relax,
+                                   level_grad_balance=level_grad_balance
+                                   ).to(torch_device)
     npar = count_params(model)
     if is_main:
         print(f"  Model params: {npar:,}", flush=True)
@@ -1037,6 +1049,10 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
         'mem_dim': (mem_dim if mem_mode != 'none' else None),
         'homeo_mode': homeo_mode, 'node_paths': node_paths,
         'fold_adapt': fold_adapt,
+        'fold_bistable': fold_bistable,
+        'bist_rank': bist_rank,
+        'fold_relax': fold_relax,
+        'level_grad_balance': level_grad_balance,
         'vocab_size': actual_vocab_size, 'max_len': max_len,
         'eval_max_len': eval_max_len, 'steps': steps,
         'final_loss': loss.item(),
