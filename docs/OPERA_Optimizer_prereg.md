@@ -222,3 +222,25 @@ Stage 0c's AdamW-everywhere arm re-uses the falsified incumbent
 recipe on purpose (it is the control leg, not a proposal).
 
 ## Amendments log (append-only)
+
+**2026-09-09 — literature survey (docs/OPERA_Optimizer_survey.md)
+landed before any stage ran; three protocol updates.** (1) Stage 1 now
+has TWO treatment arms, one mechanism: `lo_uniform` (w_ℓ = 1, the
+original v1) and `lo_derived` (w_ℓ ∝ 1/x̄_ℓ, the running mean input
+RMS at level ℓ) — the latter is *derived*, not guessed: Bernstein's
+RMS→RMS operator-norm steepest-descent derivation assumes one input
+distribution per layer, and repairing that assumption for a
+scale-tied operator yields exactly the per-level inverse-norm
+weighting (survey §2; Gluon's layer-wise smoothness is the
+layer-granularity version of the same correction). `lo_derived` is
+predicted-primary by theory; `lo_uniform` is the theory-free ablation.
+O-H1 applies to each arm separately with the same 1.0% bar. The
+pre-registered single retry (momentum placement) is unchanged and
+still one. (2) Stage 2's exact-polar arm may be replaced by a
+Scion-style spectral-norm **constraint** on the 3×3 blocks if that is
+cheaper to implement — same gate structure (measurement, expected
+null); whichever variant runs is named in the outcomes. (3)
+Implementation note, not a protocol change: per-level NS should use
+Gram Newton–Schulz (Dao-AILab, 40–50% off the orthogonalization step)
+if cost is ever measurable; at this rung it will not be. The §4.1
+kill-switch runs first and binds both treatment arms.
