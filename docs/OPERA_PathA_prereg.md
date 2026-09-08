@@ -202,3 +202,66 @@ than T=256 did); SFT remains 2,500 steps ≈ 41M trained tokens —
 token-matched to §4.8's SFT. H1–H4 are unchanged; H3's "3× budget"
 reading now covers both trained tokens AND ~4× unique pretraining
 tokens versus §4.8.
+
+**2026-09-07 — Level-exposure measurement; pre-stated interpretation of
+H1/H2 (no protocol change, recorded BEFORE any GPU training ran).**
+A combinatorial audit of which parts of the circuit this protocol's
+training actually visits (`opera_lm/level_exposure.py`; no model, no
+data, no GPU — pure counting over the shipped `fenwick_blocks`) is
+recorded here so that H1/H2 are read against it rather than after it.
+Measured at this study's exact settings (train T=512, curriculum
+(64, 250), 15,000 steps, batch 32, eval T=8192):
+
+- **Training exposure is uniform across scales, levels 0–8.** Each level
+  0–8 receives exactly 0.50 fold entries per position (~half of all
+  prefixes have any given bit set). This is a property of the Fenwick
+  decomposition and is reported as a positive architectural finding: no
+  scale is starved relative to another.
+- **The top level of the training tree is not.** Level 9 (span 512 = the
+  full training sequence) is reachable by exactly one prefix (L=512), so
+  it sees ~256× less signal than every level below it. The deepest
+  *well*-trained level is therefore **8 (span 256)**, not 9. `msup` does
+  not compensate: `msup_loss` breaks at `span >= T` (`losses.py:118`),
+  and its target — the first token *after* the node's span — lies outside
+  the sequence for the root by definition. No objective defined on a
+  length-T sequence can supervise the composition of a length-T span.
+- **The curriculum is not implicated.** 95% of steps run at the full
+  T=512 (250 steps each at 64/128/256). Any level-exposure effect here
+  is a property of training length, not of arm C.
+- **Levels 10–13 are never built during training** and are required at
+  eval T=8192, where levels 10/11/12 each receive 4,096 fold entries —
+  the *same* frequency as every trained level. **87.5%** of eval
+  positions read at least one never-built-level block (**93.8%**
+  counting from the deepest well-trained level 8); **23.1%** of all eval
+  fold entries sit at never-built levels (**30.8%** from level 8).
+- **Fold chain depth is a minor axis.** Deepest accumulator chain is 8
+  composes trained vs 12 at eval, but only 4.6% of eval positions fold
+  deeper than training ever produced.
+
+*Scope, stated precisely.* This counts EXPOSURE, not learning. OPERA
+ties the compose weights across all levels and, under this study's
+`fold_mode='left'` configuration, has **no level-indexed parameters at
+all** — nothing is randomly initialised at eval, and a level-12 node is
+a trained function applied at an unseen recursion depth, not an
+untrained module. The audit establishes only that the input regime at
+8192 was never visited during training.
+
+*Pre-stated interpretation (binding on how the outcomes are written
+up).* H1 and H2 at 8192 measure the positional mechanism **confounded
+with** depth extrapolation of the tied compose function into a
+never-visited input regime; the two cannot be separated by this
+protocol. The confound is not unique to OPERA — the RoPE arm meets
+unseen rotation angles and the NoPE arm unseen mask lengths — so the
+three-arm comparison stands as pre-registered and **no gate, hypothesis,
+or decision rule is modified**. What changes is the write-up: an OPERA
+H1 failure may not be evidenced against "position is structure," and an
+H1 pass is the stronger result for having been obtained under this
+handicap. Either outcome is reported with these counts alongside.
+
+*Remedy, explicitly OUT of scope for Path A.* The state-passing
+intervention (concatenation augmentation, Buitrago Ruiz & Gu,
+arXiv:2507.02782; `opera-chat/prep_statepassing_data.py`) targets this
+exact regime and is **not** part of this protocol. It belongs to a
+separate, separately pre-registered study, and is named here only so
+that the record shows it was identified before the outcomes, not after
+them.
