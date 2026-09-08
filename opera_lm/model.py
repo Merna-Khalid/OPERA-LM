@@ -15,6 +15,10 @@ if torch.cuda.is_available():
 # UTILITIES
 # ============================================================================
 
+# Spinor-homeostasis anchor table depth (homeo_mode='on'): covers tree
+# spans to 2^16 tokens; deeper parents reuse the deepest anchor.
+HOMEO_MAX_LEVELS = 16
+
 def sinusoidal_pos_enc(T, d, device):
     pos = torch.arange(T, device=device, dtype=torch.float32).unsqueeze(1)
     i = torch.arange(0, d, 2, device=device, dtype=torch.float32)
@@ -148,6 +152,18 @@ def geometric_product(s0, v0, s1, v1):
     s_out = s0 * s1 - dot
     v_out = s0.unsqueeze(-1) * v1 + s1.unsqueeze(-1) * v0 + cross
     return s_out, v_out
+
+
+def quat_quotient(s0, v0, s1, v1):
+    """q_L (x) q_R^{-1} per block: the relative transform between
+    siblings -- the node's only operation that BACKS OUT rather than
+    accumulates (quotient arm, node_paths=4). q^{-1} = conj(q)/|q|^2,
+    eps-guarded. Note: for near-unit blocks this degenerates toward a
+    sign flip on the vector part -- the expected effect is modest; that
+    is the bet, stated."""
+    n2 = (s1 * s1 + (v1 * v1).sum(dim=-1)).clamp(min=1e-8)
+    return geometric_product(s0, v0, s1 / n2,
+                             -v1 / n2.unsqueeze(-1))
 
 
 def relative_lock(s0, v0, s1, v1, eps=1e-8):
@@ -298,7 +314,8 @@ class OperaSpinorFenwickTree(nn.Module):
                  oam_chan_emb=False, scan_salience=False, scan_decay_bias=-3.0,
                  workspace=False, fold_gate_bias=None,
                  readout_mode='none', readout_max_slots=16,
-                 mem_mode='none', mem_dim=128):
+                 mem_mode='none', mem_dim=128, homeo_mode='off',
+                 node_paths=3, fold_adapt='off'):
         super().__init__()
         assert d == 4 * nb, f"d must equal 4*nb (got d={d}, nb={nb})"
         assert lock_mode in ('none', 'interference')
@@ -333,6 +350,26 @@ class OperaSpinorFenwickTree(nn.Module):
                 "--fold scan readout is fixed LN + tanh(+0.1x)"
             assert grad_checkpoint != 'level', \
                 "--checkpoint level wraps compose nodes; use 'layer' with scan"
+        assert homeo_mode in ('off', 'on')
+        if homeo_mode == 'on':
+            assert fold_mode != 'scan', \
+                "--homeo anchors tree levels; --fold scan builds no tree"
+        assert node_paths in (3, 4)
+        if node_paths == 4:
+            # QUOTIENT PATH (trajectory-dynamics arm, 2026-09): a fourth
+            # gated path h_L (x) h_R^{-1}. The V2 whole-node kernels
+            # (metal/triton) hard-code three gate channels, so this arm
+            # is eager-only in v1.
+            assert not (use_metal or use_triton), \
+                "--node-paths 4 is eager-only (the fused metal/triton " \
+                "node kernels hard-code 3 gate channels)"
+            assert fold_mode != 'scan', \
+                "--node-paths tunes the compose node; --fold scan builds none"
+        assert fold_adapt in ('off', 'on')
+        if fold_adapt == 'on':
+            assert fold_mode != 'scan', \
+                "--fold-adapt modulates the Fenwick fold; --fold scan " \
+                "replaces it"
         assert oam_combine in ('compose', 'sum')
         assert oam_pair in ('seq', 'conj')
         assert oam_transport in ('rack', 'node')
@@ -345,6 +382,8 @@ class OperaSpinorFenwickTree(nn.Module):
             "Silicon vs CUDA); pass at most one"
         self.norm_mode = norm_mode
         self.act_mode = act_mode
+        self.node_paths = node_paths
+        self.fold_adapt = fold_adapt
         self.node_residual = node_residual
         self.tree_drop = tree_drop
         self.grad_checkpoint = grad_checkpoint
@@ -467,7 +506,9 @@ class OperaSpinorFenwickTree(nn.Module):
             self.comp_norm = None
             self.block_gain = None
         else:
-            self.fusion_gate = nn.ModuleList([nn.Linear(2 * d, 3 * nb) for _ in range(num_layers)])
+            self.fusion_gate = nn.ModuleList(
+                [nn.Linear(2 * d, 3 * nb)
+                 for _ in range(num_layers)])
             if norm_mode == 'layer':
                 self.comp_norm = nn.ModuleList([nn.LayerNorm(d) for _ in range(num_layers)])
                 self.block_gain = None
@@ -894,6 +935,59 @@ class OperaSpinorFenwickTree(nn.Module):
             assert mem_mode == 'none', mem_mode
             self.mem_dim = 0
 
+        # SPINOR HOMEOSTASIS (trajectory-dynamics arm, 2026-09): per
+        # (layer, tree level) anchor spinor q* in the model's own state
+        # space; after each tree composition the parent block is rotated
+        # a gated fraction of the way toward the anchor along the
+        # quaternion geodesic (slerp), magnitude preserved. Semantics:
+        # each level has a resting orientation -- predictable content
+        # stays near it (small excursion), reinterpretive content lands
+        # far from it (large excursion, then relaxation). Gate logits
+        # init -6.0 (sigmoid ~= 0.0025) so flags-on is ~incumbent at
+        # init; flags-off skips the code path entirely and stays
+        # bitwise/parameter identical to the incumbent. 16 anchor levels
+        # cover spans to 2^16 tokens; deeper parents (eval-time
+        # extrapolation) reuse the deepest anchor. Created last
+        # (RNG-stream rule).
+        self.homeo_mode = homeo_mode
+        if homeo_mode == 'on':
+            anchors = torch.randn(num_layers, HOMEO_MAX_LEVELS, nb, 4)
+            anchors = anchors / anchors.norm(dim=-1, keepdim=True)
+            self.homeo_anchor = nn.Parameter(anchors)
+            self.homeo_gate = nn.Parameter(torch.full(
+                (num_layers, HOMEO_MAX_LEVELS, nb), -6.0))
+        else:
+            self.homeo_anchor = None
+            self.homeo_gate = None
+
+        # CONTENT-ADAPTIVE FOLD TRANSPORT (trajectory-dynamics arm,
+        # 2026-09): the fold's transport twist per block is READ FROM
+        # THE BLOCK'S OWN STATE -- ang = <h_block, w> -- instead of the
+        # static per-level angle of --fold-scale. The tree decides per
+        # node how far to rotate based on what is being composed:
+        # predictable content -> angle ~0 (the state coasts); marked
+        # content -> a real turn. w is ZERO-INIT: flags-on is bitwise
+        # the incumbent at init AND consumes no RNG (zeros), so the
+        # RNG-stream rule holds trivially. Created last.
+        if fold_adapt == 'on':
+            self.fold_adapt_w = nn.Parameter(
+                torch.zeros(num_layers, nb, 4))
+        else:
+            self.fold_adapt_w = None
+
+        # QUOTIENT PATH gate (node_paths=4): separate module created
+        # LAST so the incumbent fusion_gate and RNG stream are exactly
+        # the incumbent's. Bias -6 -> sigmoid ~= 0.0025: flags-on is
+        # ~incumbent at init.
+        if node_paths == 4:
+            self.quotient_gate = nn.ModuleList(
+                [nn.Linear(2 * d, nb) for _ in range(num_layers)])
+            with torch.no_grad():
+                for qg in self.quotient_gate:
+                    qg.bias.fill_(-6.0)
+        else:
+            self.quotient_gate = None
+
     def apply_head(self, h):
         logits = self.head(h)
         if self.logit_scale is not None:
@@ -1089,6 +1183,19 @@ class OperaSpinorFenwickTree(nn.Module):
         fv = torch.addcmul(torch.addcmul(g0.unsqueeze(-1) * v0,
                                          g1.unsqueeze(-1), v1),
                            g2.unsqueeze(-1), gv)
+        if self.node_paths == 4:
+            # quotient path: g3 gates h_L (x) h_R^{-1}, the relative
+            # transform between siblings. Own gate module (created last
+            # in __init__, bias -6 -> ~incumbent at init) so the
+            # incumbent fusion_gate and the RNG stream are untouched.
+            Wq = self.quotient_gate[layer_idx].weight
+            g3 = torch.sigmoid(torch.addmm(
+                torch.addmm(self.quotient_gate[layer_idx].bias,
+                            h_left, Wq[:, :self.d].t()),
+                h_right, Wq[:, self.d:].t()))
+            qs, qv = quat_quotient(s0, v0, s1, v1)
+            fs = fs + g3 * qs
+            fv = fv + g3.unsqueeze(-1) * qv
         M_O = self._dense_rot(R_O)
         if M_O is not None:
             fv = (fv.reshape(N, -1) @ M_O).reshape(N, nb, 3)
@@ -1124,6 +1231,36 @@ class OperaSpinorFenwickTree(nn.Module):
             parent = r * parent + (1.0 - r) * 0.5 * (h_left + h_right)
         return parent, lock_scalar, energy_scalar
 
+    def _homeo_relax(self, parent, layer_idx, level):
+        """homeo_mode='on': rotate each parent block a gated fraction of
+        the way toward the level's anchor spinor along the quaternion
+        geodesic (slerp), preserving block magnitude. parent: [N, d].
+        level: tree level of these parents (1 = span-2 nodes); clamped
+        to the anchor table (eval-time extrapolation reuses the deepest
+        anchor)."""
+        nb = self.nb
+        level = min(level, HOMEO_MAX_LEVELS - 1)
+        g = torch.sigmoid(self.homeo_gate[layer_idx, level])   # [nb]
+        a = self.homeo_anchor[layer_idx, level]                # [nb, 4]
+        pb = parent.reshape(-1, nb, 4)
+        pn = pb.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        qn = pb / pn                                           # unit dir
+        an = a / a.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        dot = (qn * an).sum(dim=-1, keepdim=True)
+        an = torch.where(dot < 0, -an, an)                     # shortest arc
+        dot = dot.abs().clamp(max=1.0 - 1e-6)
+        theta = torch.acos(dot)
+        sin_th = torch.sin(theta)
+        g4 = g.unsqueeze(-1)                                   # [nb, 1]
+        # slerp weights; near-parallel anchors fall back to lerp
+        w_q = torch.where(sin_th > 1e-4, torch.sin((1 - g4) * theta)
+                          / sin_th.clamp(min=1e-8), 1 - g4)
+        w_a = torch.where(sin_th > 1e-4, torch.sin(g4 * theta)
+                          / sin_th.clamp(min=1e-8), g4)
+        out = w_q * qn + w_a * an
+        out = out / out.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        return (out * pn).reshape(-1, 4 * nb)
+
     def build_tree(self, states, layer_idx, R_L, R_R, R_O):
         """ON-FLY INDEXING: no padding anywhere. A Fenwick block (k, j)
         is referenced only when (j+1)*2^k <= T, so 'partial' parents that
@@ -1145,6 +1282,10 @@ class OperaSpinorFenwickTree(nn.Module):
             N = B * m
             parent, lock, energy = self._compose(
                 left.reshape(N, d), right.reshape(N, d), layer_idx, R_L, R_R, R_O)
+            if self.homeo_mode == 'on':
+                # spinor homeostasis: relax the new parents toward the
+                # level's anchor (level 1 = span-2 nodes; leaves untouched)
+                parent = self._homeo_relax(parent, layer_idx, len(levels))
             current = parent.reshape(B, m, d)
             levels.append(current)
             locks.append(lock.reshape(B, m))
@@ -1206,6 +1347,19 @@ class OperaSpinorFenwickTree(nn.Module):
             c = torch.cos(ang)[None]                              # [1,T,S,nb]
             s = torch.sin(ang)[None]
             h = gathered.reshape(B, T, max_blocks, nb, 4)
+            sc, vx, vy, vz = h[..., 0], h[..., 1], h[..., 2], h[..., 3]
+            vx2 = vx * c - vy * s
+            vy2 = vx * s + vy * c
+            gathered = torch.stack([sc, vx2, vy2, vz], dim=-1).reshape(
+                B, T, max_blocks, d)
+
+        # --fold-adapt: content-adaptive transport twist, read from the
+        # block's own state (zero-init w -> ang 0 -> bitwise incumbent).
+        if self.fold_adapt_w is not None:
+            w = self.fold_adapt_w[layer_idx]                  # [nb, 4]
+            h = gathered.reshape(B, T, max_blocks, nb, 4)
+            ang = (h * w[None, None, None]).sum(-1)           # [B,T,S,nb]
+            c, s = torch.cos(ang), torch.sin(ang)
             sc, vx, vy, vz = h[..., 0], h[..., 1], h[..., 2], h[..., 3]
             vx2 = vx * c - vy * s
             vy2 = vx * s + vy * c

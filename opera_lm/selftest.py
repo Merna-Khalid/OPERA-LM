@@ -2055,6 +2055,212 @@ def test_nan_guard():
           "(collective by construction)")
 
 
+def test_homeo_anchor():
+    # SPINOR HOMEOSTASIS arm (trajectory-dynamics program, 2026-09):
+    # per-(layer, level) anchor spinor; composed parents relax a gated
+    # fraction toward it along the quaternion geodesic.
+    torch.manual_seed(0)
+    # (a) RNG-stream rule + near-incumbent at init: same-seed 'on' vs
+    #     'off' models share every incumbent parameter bitwise (anchors
+    #     are created LAST), and the gate init (-6 -> sigmoid ~0.0025)
+    #     keeps the flags-on forward within a small tolerance of the
+    #     incumbent (it is NOT bitwise -- the gate is not exactly zero;
+    #     that is the res_logit-style informative-init pattern).
+    torch.manual_seed(41)
+    m_off = OperaSpinorFenwickTree(vocab_size=101, d=64, nb=16,
+                                   num_layers=2, pe_mode='none',
+                                   fold_mode='left')
+    torch.manual_seed(41)
+    m_on = OperaSpinorFenwickTree(vocab_size=101, d=64, nb=16,
+                                  num_layers=2, pe_mode='none',
+                                  fold_mode='left', homeo_mode='on')
+    ps_off = dict(m_off.named_parameters())
+    ps_on = dict(m_on.named_parameters())
+    for n, p in ps_off.items():
+        assert n in ps_on, f"incumbent param missing with homeo on: {n}"
+        assert torch.equal(p, ps_on[n]), f"RNG-stream rule broken: {n}"
+    new_params = sorted(set(ps_on) - set(ps_off))
+    assert new_params == ['homeo_anchor', 'homeo_gate'], new_params
+    exp_new = 2 * (16 * 16 * 4 + 16 * 16)     # L * HOMEO_MAX_LEVELS * nb * 5
+    got_new = count_params(m_on) - count_params(m_off)
+    print(f"  homeo param delta: {got_new:+,} (expected {exp_new:+,})")
+    assert got_new == exp_new
+    tok = torch.randint(1, 101, (4, 21))
+    lens = torch.full((4,), 21)
+    m_off.eval(); m_on.eval()
+    with torch.no_grad():
+        lo = m_off(tok, lens).logits[-1]
+        ln = m_on(tok, lens).logits[-1]
+    rel = ((ln - lo).norm() / lo.norm()).item()
+    print(f"  homeo init deviation vs incumbent: {rel:.2e} (relative "
+          f"logit change, gate~0.0025)")
+    assert rel < 0.02
+    # (b) gradient flow to anchors AND gates
+    m_on.train()
+    loss, _, _ = lm_loss(m_on(tok, lens).logits, tok, lens)
+    loss.backward()
+    ga = m_on.homeo_anchor.grad.abs().sum().item()
+    gg = m_on.homeo_gate.grad.abs().sum().item()
+    print(f"  homeo: loss {loss.item():.3f}, anchor grad {ga:.3f}, "
+          f"gate grad {gg:.3f} (both >0)")
+    assert ga > 0 and gg > 0
+    # (c) causality: a future token must not move earlier logits
+    m_on.eval()
+    with torch.no_grad():
+        a1 = m_on(tok, lens).logits[-1][0, :8].clone()
+        tok2 = tok.clone(); tok2[0, 10] = (tok2[0, 10] + 5) % 100 + 1
+        b1 = m_on(tok2, lens).logits[-1][0, :8]
+    cerr = (a1 - b1).abs().max().item()
+    print(f"  homeo causality err: {cerr:.2e}")
+    assert cerr < 1e-5
+    # (d) slerp endpoints: gate -> 1 lands ON the anchor direction with
+    #     magnitude preserved; gate ~0 is identity.
+    q = torch.randn(7, 16, 4)
+    with torch.no_grad():
+        m_on.homeo_gate.fill_(20.0)          # sigmoid ~ 1
+        pulled = m_on._homeo_relax(q.reshape(7, -1), 0, 1)
+        m_on.homeo_gate.fill_(-20.0)         # sigmoid ~ 0
+        stayed = m_on._homeo_relax(q.reshape(7, -1), 0, 1)
+    an = m_on.homeo_anchor[0, 1].detach()
+    an = an / an.norm(dim=-1, keepdim=True)
+    pd = pulled.reshape(7, 16, 4)
+    pd = pd / pd.norm(dim=-1, keepdim=True)
+    cos_anchor = (pd * an).sum(-1).abs().min().item()
+    mag_err = (pulled.reshape(7, 16, 4).norm(dim=-1)
+               - q.norm(dim=-1)).abs().max().item()
+    id_err = (stayed - q.reshape(7, -1)).abs().max().item()
+    print(f"  homeo slerp: min|cos(pulled, anchor)| {cos_anchor:.6f}, "
+          f"magnitude err {mag_err:.2e}, gate~0 identity err {id_err:.2e}")
+    assert cos_anchor > 0.999 and mag_err < 1e-4 and id_err < 1e-4
+
+
+def test_quotient_path():
+    # QUOTIENT PATH arm (trajectory-dynamics program, 2026-09): fourth
+    # gated node path h_L (x) h_R^{-1} via a separate gate module
+    # created LAST in __init__ (RNG-stream rule).
+    torch.manual_seed(0)
+    # (a) RNG-stream rule + param accounting
+    torch.manual_seed(42)
+    m_off = OperaSpinorFenwickTree(vocab_size=101, d=64, nb=16,
+                                   num_layers=2, pe_mode='none',
+                                   fold_mode='left')
+    torch.manual_seed(42)
+    m_on = OperaSpinorFenwickTree(vocab_size=101, d=64, nb=16,
+                                  num_layers=2, pe_mode='none',
+                                  fold_mode='left', node_paths=4)
+    ps_off = dict(m_off.named_parameters())
+    ps_on = dict(m_on.named_parameters())
+    for n, p in ps_off.items():
+        assert n in ps_on and torch.equal(p, ps_on[n]), \
+            f"RNG-stream rule broken: {n}"
+    d64, nb64, L = 64, 16, 2
+    exp_new = L * (2 * d64 * nb64 + nb64)
+    got_new = count_params(m_on) - count_params(m_off)
+    print(f"  quotient param delta: {got_new:+,} (expected {exp_new:+,})")
+    assert got_new == exp_new
+    assert all((qg.bias + 6.0).abs().max() < 1e-9
+               for qg in m_on.quotient_gate), "g3 bias init != -6"
+    # (b) near-incumbent at init (gate ~0.0025)
+    tok = torch.randint(1, 101, (4, 21))
+    lens = torch.full((4,), 21)
+    m_off.eval(); m_on.eval()
+    with torch.no_grad():
+        lo = m_off(tok, lens).logits[-1]
+        ln = m_on(tok, lens).logits[-1]
+    rel = ((ln - lo).norm() / lo.norm()).item()
+    print(f"  quotient init deviation vs incumbent: {rel:.2e}")
+    assert rel < 0.02
+    # (c) gradient flow to the quotient gate
+    m_on.train()
+    loss, _, _ = lm_loss(m_on(tok, lens).logits, tok, lens)
+    loss.backward()
+    gw = sum(q.weight.grad.abs().sum().item()
+             for q in m_on.quotient_gate)
+    gb = sum(q.bias.grad.abs().sum().item() for q in m_on.quotient_gate)
+    print(f"  quotient: loss {loss.item():.3f}, gate W grad {gw:.3f}, "
+          f"bias grad {gb:.3f} (both >0)")
+    assert gw > 0 and gb > 0
+    # (d) causality
+    m_on.eval()
+    with torch.no_grad():
+        a1 = m_on(tok, lens).logits[-1][0, :8].clone()
+        tok2 = tok.clone(); tok2[0, 10] = (tok2[0, 10] + 5) % 100 + 1
+        b1 = m_on(tok2, lens).logits[-1][0, :8]
+    cerr = (a1 - b1).abs().max().item()
+    print(f"  quotient causality err: {cerr:.2e}")
+    assert cerr < 1e-5
+    # (e) algebra: q (x) q^{-1} is the identity quaternion, any norm
+    from .model import quat_quotient
+    gq = torch.Generator().manual_seed(7)
+    q = torch.randn(64, 16, 4, generator=gq) * 3.0
+    si, vi = quat_quotient(q[..., 0], q[..., 1:], q[..., 0], q[..., 1:])
+    serr = (si - 1.0).abs().max().item()
+    verr = vi.abs().max().item()
+    print(f"  quotient identity: scalar err {serr:.2e}, vector err "
+          f"{verr:.2e}")
+    assert serr < 1e-4 and verr < 1e-4
+
+
+def test_fold_adapt():
+    # CONTENT-ADAPTIVE FOLD TRANSPORT arm (trajectory-dynamics program,
+    # 2026-09): per-block fold twist angle read from the block's own
+    # state; w zero-init -> bitwise incumbent at init.
+    torch.manual_seed(0)
+    # (a) bitwise incumbent at init + param accounting (w is zeros:
+    #     ang 0 -> cos 1 sin 0 exactly, and zeros consume no RNG)
+    torch.manual_seed(43)
+    m_off = OperaSpinorFenwickTree(vocab_size=101, d=64, nb=16,
+                                   num_layers=2, pe_mode='none',
+                                   fold_mode='left')
+    torch.manual_seed(43)
+    m_on = OperaSpinorFenwickTree(vocab_size=101, d=64, nb=16,
+                                  num_layers=2, pe_mode='none',
+                                  fold_mode='left', fold_adapt='on')
+    ps_off = dict(m_off.named_parameters())
+    ps_on = dict(m_on.named_parameters())
+    for n, p in ps_off.items():
+        assert n in ps_on and torch.equal(p, ps_on[n]), \
+            f"RNG-stream rule broken: {n}"
+    exp_new = 2 * 16 * 4                      # L * nb * 4
+    got_new = count_params(m_on) - count_params(m_off)
+    print(f"  fold-adapt param delta: {got_new:+,} (expected "
+          f"{exp_new:+,})")
+    assert got_new == exp_new
+    tok = torch.randint(1, 101, (4, 21))
+    lens = torch.full((4,), 21)
+    m_off.eval(); m_on.eval()
+    with torch.no_grad():
+        lo = m_off(tok, lens).logits[-1]
+        ln = m_on(tok, lens).logits[-1]
+    bit = torch.equal(lo, ln)
+    print(f"  fold-adapt init is bitwise incumbent: {bit}")
+    assert bit
+    # (b) gradient flows to w even from the zero init (d/d ang at 0 is
+    #     the vector part, generally nonzero)
+    m_on.train()
+    loss, _, _ = lm_loss(m_on(tok, lens).logits, tok, lens)
+    loss.backward()
+    gw = m_on.fold_adapt_w.grad.abs().sum().item()
+    print(f"  fold-adapt: loss {loss.item():.3f}, w grad {gw:.3f} (>0)")
+    assert gw > 0
+    # (c) causality
+    m_on.eval()
+    with torch.no_grad():
+        a1 = m_on(tok, lens).logits[-1][0, :8].clone()
+        tok2 = tok.clone(); tok2[0, 10] = (tok2[0, 10] + 5) % 100 + 1
+        b1 = m_on(tok2, lens).logits[-1][0, :8]
+    cerr = (a1 - b1).abs().max().item()
+    print(f"  fold-adapt causality err: {cerr:.2e}")
+    assert cerr < 1e-5
+    # (d) nonzero w actually changes the forward (the twist is live)
+    with torch.no_grad():
+        m_on.fold_adapt_w.fill_(0.05)
+        ln2 = m_on(tok, lens).logits[-1]
+    delta = (ln2 - lo).abs().max().item()
+    print(f"  fold-adapt live-twist logit delta: {delta:.2e}")
+    assert delta > 1e-4
+
+
 _ARMS = [
     test_scan_fold,
     test_spine_readout,
@@ -2090,6 +2296,9 @@ _ARMS = [
     test_wsd_schedule,
     test_grad_accum,
     test_nan_guard,
+    test_homeo_anchor,
+    test_quotient_path,
+    test_fold_adapt,
 ]
 
 

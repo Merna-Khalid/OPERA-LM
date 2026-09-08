@@ -387,6 +387,7 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
           data=None, idx2word=None, optimizer='adamw', muon_lr=0.02,
           readout_mode='none', readout_max_slots=16,
           mem_mode='none', mem_dim=128, init_weights_from=None,
+          homeo_mode='off', node_paths=3, fold_adapt='off',
           packed_data=None, ddp=False):
     # DDP (multi-GPU data parallelism, added for the Kaggle 2xT4 tier --
     # a single T4 measured ~8.5x slower than the project's A100, so real
@@ -493,6 +494,9 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
     if msup: tag.append('msup')
     if readout_mode != 'none': tag.append(f'ro-{readout_mode}')
     if mem_mode != 'none': tag.append(f'mem-{mem_mode}{mem_dim}')
+    if homeo_mode != 'off': tag.append('homeo')
+    if node_paths != 3: tag.append(f'np{node_paths}')
+    if fold_adapt != 'off': tag.append('fadpt')
     if lock_mode != 'none': tag.append(lock_mode)
     tag = '+'.join(tag)
 
@@ -569,7 +573,10 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
                                    readout_mode=readout_mode,
                                    readout_max_slots=readout_max_slots,
                                    mem_mode=mem_mode,
-                                   mem_dim=mem_dim).to(torch_device)
+                                   mem_dim=mem_dim,
+                                   homeo_mode=homeo_mode,
+                                   node_paths=node_paths,
+                                   fold_adapt=fold_adapt).to(torch_device)
     npar = count_params(model)
     if is_main:
         print(f"  Model params: {npar:,}", flush=True)
@@ -1028,6 +1035,8 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
         'params': npar, 'd': d, 'nb': nb, 'num_layers': num_layers,
         'readout_mode': readout_mode, 'mem_mode': mem_mode,
         'mem_dim': (mem_dim if mem_mode != 'none' else None),
+        'homeo_mode': homeo_mode, 'node_paths': node_paths,
+        'fold_adapt': fold_adapt,
         'vocab_size': actual_vocab_size, 'max_len': max_len,
         'eval_max_len': eval_max_len, 'steps': steps,
         'final_loss': loss.item(),
