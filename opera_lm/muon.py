@@ -64,10 +64,11 @@ class Muon(torch.optim.Optimizer):
     """
 
     def __init__(self, param_groups, lr=1e-3, momentum=0.95, nesterov=True,
-                 ns_steps=5, betas=(0.9, 0.999), eps=1e-8):
+                 ns_steps=5, betas=(0.9, 0.999), eps=1e-8,
+                 weight_decay=0.0):
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov,
                         ns_steps=ns_steps, betas=betas, eps=eps,
-                        use_muon=False)
+                        use_muon=False, weight_decay=weight_decay)
         super().__init__(param_groups, defaults)
 
     @torch.no_grad()
@@ -86,21 +87,30 @@ class Muon(torch.optim.Optimizer):
     def _muon_step(self, group):
         lr = group['lr']
         momentum = group['momentum']
-        for p in group['params']:
+        names = group.get('names') or [''] * len(group['params'])
+        for name, p in zip(names, group['params']):
             g = p.grad
             if g is None:
                 continue
-            state = self.state[p]
-            if 'momentum_buffer' not in state:
-                state['momentum_buffer'] = torch.zeros_like(g)
-            buf = state['momentum_buffer']
-            buf.mul_(momentum).add_(g)
-            d = g.add(buf, alpha=momentum) if group['nesterov'] else buf
-            o = zeropower_via_newtonschulz5(d, steps=group['ns_steps'])
-            # shape adjustment (modded-nanogpt): a [m, n] update's RMS
-            # matches Adam-scale when scaled by max(1, m/n)**0.5.
-            scale = max(1.0, p.size(-2) / p.size(-1)) ** 0.5
-            p.add_(o, alpha=-lr * scale)
+            self._muon_update_one(group, name, p, g, lr, momentum)
+
+    def _muon_update_one(self, group, name, p, g, lr, momentum):
+        state = self.state[p]
+        if 'momentum_buffer' not in state:
+            state['momentum_buffer'] = torch.zeros_like(g)
+        buf = state['momentum_buffer']
+        buf.mul_(momentum).add_(g)
+        d = g.add(buf, alpha=momentum) if group['nesterov'] else buf
+        o = zeropower_via_newtonschulz5(d, steps=group['ns_steps'])
+        # shape adjustment (modded-nanogpt): a [m, n] update's RMS
+        # matches Adam-scale when scaled by max(1, m/n)**0.5.
+        scale = max(1.0, p.size(-2) / p.size(-1)) ** 0.5
+        p.add_(o, alpha=-lr * scale)
+        # decoupled weight decay (stage 0b: Moonshot's scaling recipe;
+        # default 0.0 keeps the update byte-identical to the incumbent).
+        wd = group.get('weight_decay', 0.0)
+        if wd:
+            p.mul_(1 - lr * wd)
 
     def _adamw_step(self, group):
         lr = group['lr']
@@ -130,17 +140,114 @@ class Muon(torch.optim.Optimizer):
 EXCLUDE_SUBSTR = ('emb', 'gate', 'quat', 'theta', 'beta')
 
 
-def split_muon_params(model):
-    """Partition model.parameters() into (muon_params, adamw_params).
+def split_muon_params(model, include=()):
+    """Partition model.named_parameters() into (muon, adamw) lists of
+    (name, param) pairs.
 
-    Muon: named parameters with ndim >= 2 whose names contain none of
+    Muon: matrix-shaped (ndim >= 2) parameters that either match the
+    INCLUDE list (checked first -- the stage-0a fix routes the compose
+    node's fusion matrices in by explicit name, single-variable, with
+    every other name's routing unchanged) or contain none of
     EXCLUDE_SUBSTR (rot_free's per-block 3x3 maps, cross_mlp weights,
     the untied head). AdamW: embeddings, gates, quaternions, gains,
     biases, and every 1-dim parameter."""
     muon, adamw = [], []
     for name, p in model.named_parameters():
-        if p.ndim >= 2 and not any(s in name for s in EXCLUDE_SUBSTR):
-            muon.append(p)
+        if p.ndim >= 2 and (any(s in name for s in include)
+                            or not any(s in name for s in EXCLUDE_SUBSTR)):
+            muon.append((name, p))
         else:
-            adamw.append(p)
+            adamw.append((name, p))
     return muon, adamw
+
+
+class LOMuon(Muon):
+    """Level-orthogonalized Muon for SCALE-TIED parameters
+    (docs/OPERA_Optimizer_prereg.md stage 1).
+
+    Muon orthogonalizes the SUMMED gradient of the compose node's fusion
+    matrix -- a sum over log2(T) tree levels whose applications differ
+    in count and input distribution. Newton-Schulz is approximately
+    scale-invariant, so it already discards the 15:1 magnitude
+    imbalance; what it cannot discard is which level's geometry
+    dominates the sum's directions. LOMuon changes one thing:
+
+        NS( sum_l G_l )   ->   NS( sum_l  w_l * NS(m_l) )
+
+    -- the sum happens in WHITENED space, so every level contributes a
+    direction vote rather than a magnitude vote, and one final NS
+    restores Muon's unit-RMS update discipline.
+
+    Per-level gradients arrive through the model's level-capture
+    registry (opera_lm.model._LevelCapture router); this optimizer
+    reads them instead of the summed .grad for the parameters named in
+    lo_names. Uniform w_l = 1 (theory-free ablation) or derived
+    w_l ~ 1/x_l (per-application-context steepest descent: Bernstein's
+    RMS-operator-norm bound says a level consuming larger inputs should
+    get a smaller dW budget; x_l is the registry's per-level input-RMS
+    EMA).
+
+    Zero new parameters; forward untouched; params not in lo_names get
+    exactly Muon's update.
+    """
+
+    def __init__(self, param_groups, lo_names=(), lo_mode='uniform', **kw):
+        super().__init__(param_groups, **kw)
+        assert lo_mode in ('uniform', 'derived')
+        self.lo_names = set(lo_names)
+        self.lo_mode = lo_mode
+
+    def _muon_update_one(self, group, name, p, g, lr, momentum):
+        if name not in self.lo_names:
+            super()._muon_update_one(group, name, p, g, lr, momentum)
+            return
+        from .model import level_capture_dict
+        cap = level_capture_dict()
+        if cap is None:
+            super()._muon_update_one(group, name, p, g, lr, momentum)
+            return
+        grads, rms = cap['grads'], cap['rms']
+        state = self.state[p]
+        moms = state.setdefault('lo_mom', {})
+        # uniform cadence: EVERY level's momentum decays each step;
+        # levels present this step (curriculum / short sequences) get
+        # the new gradient added on top.
+        for m in moms.values():
+            m.mul_(momentum)
+        for (n, l), gl in grads.items():
+            if n != name:
+                continue
+            if l in moms:
+                moms[l].add_(gl)
+            else:
+                moms[l] = gl.detach().clone()
+        if not moms:
+            return
+        if self.lo_mode == 'derived':
+            base = max([r for r in rms.values() if r] or [1.0])
+            w = {l: (base / rms[l]) if rms.get(l) else 1.0
+                 for l in moms}
+        else:
+            w = {l: 1.0 for l in moms}
+        u = None
+        for l, m in moms.items():
+            ul = zeropower_via_newtonschulz5(m, steps=group['ns_steps'])
+            ul = ul * w[l]
+            u = ul if u is None else u + ul
+        u = zeropower_via_newtonschulz5(u, steps=group['ns_steps'])
+        scale = max(1.0, p.size(-2) / p.size(-1)) ** 0.5
+        p.add_(u, alpha=-lr * scale)
+        wd = group.get('weight_decay', 0.0)
+        if wd:
+            p.mul_(1 - lr * wd)
+
+    def zero_grad(self, set_to_none=True):
+        """Standard zero_grad, plus: the level-capture registry's
+        gradient buffers are per-BACKWARD (they must not accumulate
+        across steps). The per-level input-RMS EMA PERSISTS -- it is a
+        running statistic, not a gradient."""
+        super().zero_grad(set_to_none=set_to_none)
+        from .model import level_capture_dict
+        cap = level_capture_dict()
+        if cap is not None:
+            cap['grads'] = {}

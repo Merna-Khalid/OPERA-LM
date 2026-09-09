@@ -106,6 +106,27 @@ RECIPE = {
     'rx_full':   dict(optimizer='muon', muon_lr=0.02, msup=True,
                       msup_weight=0.1, curriculum=(128, 250),
                       lr_schedule='wsd'),
+    # Stage 0 (docs/OPERA_Optimizer_prereg.md): pin the honest incumbent
+    # before the LO-Muon comparison. 0a = fusion_gate into the Muon
+    # partition (include-list, single variable, nothing else moves);
+    # 0b = Muon-side decoupled weight decay (Moonshot recipe); then both.
+    'rx_fgate':    dict(optimizer='muon', muon_lr=0.02,
+                        muon_include='fusion_gate'),
+    'rx_wd':       dict(optimizer='muon', muon_lr=0.02, muon_wd=0.01),
+    'rx_fgate_wd': dict(optimizer='muon', muon_lr=0.02,
+                        muon_include='fusion_gate', muon_wd=0.01),
+    # Stage 1: LO-Muon (level-orthogonalized updates for the scale-tied
+    # fusion weights; uniform = theory-free ablation, derived = the
+    # Bernstein/Gluon-motivated w_l ~ 1/x_l weighting). Recipe = fgate+wd,
+    # the expected stage-0 incumbent; amended if stage 0 crowns another.
+    # Run ONLY after experiments/level_cosine.py (the kill-switch) says
+    # the levels disagree.
+    'lo_uniform': dict(optimizer='muon', muon_lr=0.02,
+                       muon_include='fusion_gate', muon_wd=0.01,
+                       lo_muon='uniform'),
+    'lo_derived': dict(optimizer='muon', muon_lr=0.02,
+                       muon_include='fusion_gate', muon_wd=0.01,
+                       lo_muon='derived'),
 }
 for _n in RECIPE:
     ARMS[_n] = ('bytes', 1024, 512, 128)

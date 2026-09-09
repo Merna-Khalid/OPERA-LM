@@ -304,6 +304,69 @@ def grad_scale(x, s):
     return x if s == 1.0 else _GradScale.apply(x, s)
 
 
+# ---------------------------------------------------------------------------
+# LEVEL CAPTURE (docs/OPERA_Optimizer_prereg.md). Pass-through autograd
+# wrapper that decomposes the gradient of a SCALE-TIED parameter (one
+# weight set consumed at every tree level) into its per-level
+# contributions. Off by default and completely inert: the wrapper is
+# only applied when a capture registry is active, so training without
+# it is byte-identical. Two consumers:
+#   1. the kill-switch instrument (experiments/level_cosine.py) -- if
+#      the levels' whitened gradients already agree, LO-Muon is a no-op
+#      by construction and is not built;
+#   2. the LO-Muon router -- the optimizer reads per-level gradients
+#      from the registry instead of the summed .grad.
+# The registry also carries a per-level input-RMS EMA ('rms'), the
+# statistic the DERIVED weighting (w_l ~ 1/x_l) normalizes by.
+_LEVEL_CAPTURE = None
+
+
+class _LevelCapture(torch.autograd.Function):
+    """Identity forward; backward ACCUMULATES a copy of this call's
+    gradient into the registry and passes it through unchanged (the
+    parameter's total .grad is therefore untouched)."""
+
+    @staticmethod
+    def forward(ctx, x, key):
+        ctx.key = key
+        return x
+
+    @staticmethod
+    def backward(ctx, g):
+        if _LEVEL_CAPTURE is not None:
+            grads = _LEVEL_CAPTURE['grads']
+            buf = grads.get(ctx.key)
+            if buf is None:
+                grads[ctx.key] = g.detach().clone()
+            else:
+                buf.add_(g.detach())
+        return g, None
+
+
+def enable_level_capture():
+    """Turn per-level gradient capture ON (registry returned for tests)."""
+    global _LEVEL_CAPTURE
+    _LEVEL_CAPTURE = {'grads': {}, 'rms': {}}
+    return _LEVEL_CAPTURE
+
+
+def disable_level_capture():
+    global _LEVEL_CAPTURE
+    _LEVEL_CAPTURE = None
+
+
+def level_capture_dict():
+    return _LEVEL_CAPTURE
+
+
+def _maybe_capture_w(W, layer_idx, level_idx):
+    """Wrap the compose node's fusion weight for the current level."""
+    if level_idx is not None and _LEVEL_CAPTURE is not None:
+        return _LevelCapture.apply(
+            W, (f'fusion_gate.{layer_idx}.weight', level_idx))
+    return W
+
+
 class OperaOutput(NamedTuple):
     """forward()'s return value: fields absent from a given call (the
     corresponding return_* flag was False) are None rather than the field
@@ -1229,24 +1292,28 @@ class OperaSpinorFenwickTree(nn.Module):
 
     def _compose(self, h_left, h_right, layer_idx, R_L, R_R, R_O,
                  gate_scale=1.0,
-                 gate_bias=None):
+                 gate_bias=None,
+                 level_idx=None):
         """compose_pair_batch, optionally under activation checkpointing:
         backward recomputes the node's ~18 intermediates from its two
         inputs instead of storing them (~25-35% slower steps for a
         several-fold activation-memory reduction). gate_bias (v9 arm A):
         optional [3, nb] replacement for the fusion-gate bias -- the
-        fold's chrono init; None reproduces the incumbent node exactly."""
+        fold's chrono init; None reproduces the incumbent node exactly.
+        level_idx: the tree level this call composes (1 = span-2 nodes);
+        consumed only by the level-capture registry (LO-Muon router /
+        kill-switch instrument), never by the math."""
         if self.grad_checkpoint == 'level' and self.training:
             from torch.utils.checkpoint import checkpoint
             return checkpoint(self.compose_pair_batch, h_left, h_right,
                               layer_idx, R_L, R_R, R_O, gate_bias,
-                              gate_scale, use_reentrant=False)
+                              gate_scale, level_idx, use_reentrant=False)
         return self.compose_pair_batch(h_left, h_right, layer_idx,
                                        R_L, R_R, R_O, gate_bias,
-                                       gate_scale)
+                                       gate_scale, level_idx)
 
     def compose_pair_batch(self, h_left, h_right, layer_idx, R_L, R_R, R_O,
-                           gate_bias=None, gate_scale=1.0):
+                           gate_bias=None, gate_scale=1.0, level_idx=None):
         N = h_left.shape[0]
         nb = self.nb
         gb = (self.fusion_gate[layer_idx].bias if gate_bias is None
@@ -1267,7 +1334,8 @@ class OperaSpinorFenwickTree(nn.Module):
                 from .triton_kernel import fused_node_triton as fused_node
             else:
                 from .metal_kernel import fused_node
-            W = self.fusion_gate[layer_idx].weight
+            W = _maybe_capture_w(self.fusion_gate[layer_idx].weight,
+                                 layer_idx, level_idx)
             b = gb
             g = (F.linear(h_left, W[:, :self.d]) +
                  F.linear(h_right, W[:, self.d:]) + b)
@@ -1336,7 +1404,9 @@ class OperaSpinorFenwickTree(nn.Module):
         # tensor written and saved for backward at EVERY node. Chained
         # addmm: (b + h_left@W1^T) + h_right@W2^T in 2 kernel launches
         # (float-op reordering only).
-        W = grad_scale(self.fusion_gate[layer_idx].weight, gate_scale)
+        W = grad_scale(_maybe_capture_w(
+            self.fusion_gate[layer_idx].weight, layer_idx, level_idx),
+            gate_scale)
         b = grad_scale(gb, gate_scale) if gate_scale != 1.0 else gb
         g = torch.addmm(torch.addmm(b, h_left, W[:, :self.d].t()),
                         h_right, W[:, self.d:].t())
@@ -1475,11 +1545,20 @@ class OperaSpinorFenwickTree(nn.Module):
             lvl_i += 1
             # Level lvl_i's share of dL/dW is scaled by beta**lvl_i.
             gs = (beta ** lvl_i) / _z
+            if _LEVEL_CAPTURE is not None:
+                # input-RMS EMA per level: the statistic the DERIVED
+                # LO-Muon weighting (w_l ~ 1/x_l) normalizes by. The
+                # compose inputs are the (left, right) halves.
+                r = (left.detach().square().mean().sqrt()
+                     + right.detach().square().mean().sqrt()).item() / 2
+                prev = _LEVEL_CAPTURE['rms'].get(lvl_i)
+                _LEVEL_CAPTURE['rms'][lvl_i] = (
+                    r if prev is None else 0.9 * prev + 0.1 * r)
             rl, rr, ro = (grad_scale(R_L, gs), grad_scale(R_R, gs),
                           grad_scale(R_O, gs))
             parent, lock, energy = self._compose(
                 left.reshape(N, d), right.reshape(N, d), layer_idx,
-                rl, rr, ro, gate_scale=gs)
+                rl, rr, ro, gate_scale=gs, level_idx=lvl_i)
             if self.homeo_mode == 'on':
                 # spinor homeostasis: relax the new parents toward the
                 # level's anchor (level 1 = span-2 nodes; leaves untouched)
@@ -1924,11 +2003,26 @@ class OperaSpinorFenwickTree(nn.Module):
                     break
                 a = acc.index_select(1, act)              # [B, m, d]
                 nxt = gathered[:, act, s_idx, :]          # [B, m, d]
+                if _LEVEL_CAPTURE is not None:
+                    # fold bucket: slot s_idx's block level varies PER
+                    # POSITION (each prefix's Fenwick decomposition),
+                    # so the fold's applications of the shared weight
+                    # are scale-MIXED within one call. They get their
+                    # own capture bucket rather than a fake level; the
+                    # kill-switch reports it separately and LO-Muon
+                    # gives it its own momentum/whitening.
+                    r = (a.detach().square().mean().sqrt()
+                         + nxt.detach().square().mean().sqrt()).item() / 2
+                    prev = _LEVEL_CAPTURE['rms'].get('fold')
+                    _LEVEL_CAPTURE['rms']['fold'] = (
+                        r if prev is None else 0.9 * prev + 0.1 * r)
                 # v9 arm A: chrono-biased gate on the fold transport
                 # (shared weights; only the bias differs from the tree).
                 composed, _, _ = self._compose(
                     a.reshape(B * m, d), nxt.reshape(B * m, d),
-                    layer_idx, R_L, R_R, R_O, gate_bias=fgb)
+                    layer_idx, R_L, R_R, R_O, gate_bias=fgb,
+                    level_idx=('fold' if _LEVEL_CAPTURE is not None
+                               else None))
                 if self.bist_a is not None:
                     composed = self._bistable_update(
                         a.reshape(B * m, d), nxt.reshape(B * m, d),

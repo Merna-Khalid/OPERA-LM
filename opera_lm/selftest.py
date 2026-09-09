@@ -1647,10 +1647,13 @@ def test_muon_optimizer():
                                  pe_mode='none', fold_mode='left',
                                  rot_mode='free')
     muon12, adam12 = split_muon_params(m12)
-    ids12 = {id(p) for p in muon12} | {id(p) for p in adam12}
+    muon_names12 = {n for n, _ in muon12}
+    adam_names12 = {n for n, _ in adam12}
+    ids12 = ({id(p) for _, p in muon12} | {id(p) for _, p in adam12})
     assert len(ids12) == len(list(m12.parameters()))
+    assert not (muon_names12 & adam_names12)
     names12 = dict(m12.named_parameters())
-    muon_names12 = {n for n, p in names12.items() if any(p is q for q in muon12)}
+    assert muon_names12 | adam_names12 == set(names12)
     assert 'rot_free' in muon_names12
     assert any(n.startswith('cross_mlp') and n.endswith('weight')
                for n in muon_names12)
@@ -1658,9 +1661,16 @@ def test_muon_optimizer():
     for n in names12:
         if 'emb' in n or 'gate' in n:
             assert n not in muon_names12, n
+    # include-list routing (stage 0a): fusion_gate joins the Muon side
+    # when named explicitly; every OTHER name's routing is unchanged.
+    muon12b, adam12b = split_muon_params(m12, include=('fusion_gate',))
+    muon_names12b = {n for n, _ in muon12b}
+    assert muon_names12b == muon_names12 | \
+        {n for n in names12 if n.startswith('fusion_gate')
+         and n.endswith('.weight')}
     print(f"  muon b: partition total/disjoint; rot_free+cross_mlp+head "
-          f"muon-side ({sum(p.numel() for p in muon12):,} params), "
-          f"emb/gates adam-side")
+          f"muon-side ({sum(p.numel() for _, p in muon12):,} params), "
+          f"emb/gates adam-side; include-list routes fusion_gate only")
     # (c) learning dynamics: a few Muon steps reduce a quadratic loss.
     torch.manual_seed(12)
     p12 = torch.nn.Parameter(torch.randn(10, 5))
@@ -2268,6 +2278,112 @@ def test_level_grad_balance():
           f"grad unchanged")
 
 
+def test_lomuon():
+    # LEVEL CAPTURE + LO-MUON (docs/OPERA_Optimizer_prereg.md). The
+    # router decomposes the scale-tied fusion weight's gradient per tree
+    # level (fold applications get their own scale-mixed bucket);
+    # LOMuon orthogonalizes per level and sums in whitened space.
+    import torch.nn.functional as _F2
+    from .model import (enable_level_capture, disable_level_capture,
+                        level_capture_dict)
+    from .muon import Muon, LOMuon
+    torch.manual_seed(13)
+    kw = dict(vocab_size=101, d=64, nb=16, num_layers=2, pe_mode='none',
+              fold_mode='left', rot_mode='free')
+    ids = torch.randint(1, 101, (2, 33))
+    ln = torch.tensor([33, 33])
+
+    # (a) capture on/off are bitwise-identical in the FORWARD (the
+    #     wrapper is pass-through) and .grad is untouched by routing.
+    torch.manual_seed(13); m = OperaSpinorFenwickTree(**kw)
+    lo_off = m(ids, ln).logits[-1]
+    cap = enable_level_capture()
+    m.zero_grad(set_to_none=True)
+    out = m(ids, ln).logits[-1]
+    assert torch.equal(lo_off, out), "capture changed the forward"
+    _F2.cross_entropy(out[:, :-1].reshape(-1, 101),
+                      ids[:, 1:].reshape(-1)).backward()
+    # (b) ROUTER CORRECTNESS: per-level + fold buffers sum to the
+    #     parameter's total .grad (the wrapper passes gradient through).
+    np_ = dict(m.named_parameters())
+    for l in range(2):
+        name = f'fusion_gate.{l}.weight'
+        tot = sum(v for (n, _), v in cap['grads'].items() if n == name)
+        assert tot is not None, f"no capture buckets for {name}"
+        rel = ((tot - np_[name].grad).norm()
+               / np_[name].grad.norm()).item()
+        assert rel < 1e-4, f"router sum != .grad for {name}: {rel}"
+    # rms statistics populated (levels + fold)
+    assert any(isinstance(k, int) for k in cap['rms']) and \
+        'fold' in cap['rms'], cap['rms'].keys()
+    print(f"  lomuon a: forward bitwise under capture; router buckets "
+          f"sum to .grad ({len(cap['grads'])} buckets, rel<1e-4)")
+    disable_level_capture()
+
+    # (c) SINGLE-LEVEL EQUIVALENCE: at T=2 the tree has exactly one
+    #     compose level (no fold), so LOMuon's per-level pipeline must
+    #     reproduce Muon's update up to NS idempotence (NS5 of an
+    #     already-orthogonalized matrix).
+    torch.manual_seed(7); m1 = OperaSpinorFenwickTree(**kw)
+    torch.manual_seed(7); m2 = OperaSpinorFenwickTree(**kw)
+    ids2 = torch.randint(1, 101, (2, 2))
+    ln2 = torch.tensor([2, 2])
+    fg = [n for n, _ in m1.named_parameters()
+          if n.startswith('fusion_gate') and n.endswith('weight')]
+    opt1 = Muon([{'params': [dict(m1.named_parameters())[n] for n in fg],
+                  'names': fg, 'use_muon': True, 'lr': 0.02}], lr=0.02)
+    opt2 = LOMuon([{'params': [dict(m2.named_parameters())[n] for n in fg],
+                    'names': fg, 'use_muon': True, 'lr': 0.02}],
+                  lo_names=set(fg), lr=0.02)
+    m1.zero_grad(set_to_none=True); m2.zero_grad(set_to_none=True)
+    _F2.cross_entropy(m1(ids2, ln2).logits[-1].reshape(-1, 101),
+                      ids2.reshape(-1)).backward()
+    enable_level_capture()
+    _F2.cross_entropy(m2(ids2, ln2).logits[-1].reshape(-1, 101),
+                      ids2.reshape(-1)).backward()
+    opt1.step(); opt2.step()
+    # zero_grad clears gradient buckets but PRESERVES the rms EMA
+    # (checked while capture is still enabled)
+    cap2 = level_capture_dict()
+    r_before = dict(cap2['rms'])
+    opt2.zero_grad()
+    cap2 = level_capture_dict()
+    assert not cap2['grads'] and cap2['rms'] == r_before
+    disable_level_capture()
+    d1 = dict(m1.named_parameters()); d2 = dict(m2.named_parameters())
+    dmax = max((d1[n] - d2[n]).norm().item() / d1[n].norm().item()
+               for n in fg)
+    assert dmax < 0.05, f"single-level LOMuon != Muon: {dmax}"
+    print(f"  lomuon b: single-level equivalence rel {dmax:.4f} "
+          f"(NS idempotence bound); zero_grad clears grads, keeps rms")
+
+    # (d) MODES DIFFER: uniform vs derived weighting produce different
+    #     updates when the per-level input RMS differs (it does here --
+    #     embeddings vs composed states), given identical gradients.
+    torch.manual_seed(11); ma = OperaSpinorFenwickTree(**kw)
+    torch.manual_seed(11); mb = OperaSpinorFenwickTree(**kw)
+    ga = LOMuon([{'params': [dict(ma.named_parameters())[n] for n in fg],
+                  'names': fg, 'use_muon': True, 'lr': 0.02}],
+                lo_names=set(fg), lo_mode='uniform', lr=0.02)
+    gb = LOMuon([{'params': [dict(mb.named_parameters())[n] for n in fg],
+                  'names': fg, 'use_muon': True, 'lr': 0.02}],
+                lo_names=set(fg), lo_mode='derived', lr=0.02)
+    enable_level_capture()
+    _F2.cross_entropy(ma(ids, ln).logits[-1].reshape(-1, 101),
+                      ids.reshape(-1)).backward()
+    ga.step(); ga.zero_grad()
+    _F2.cross_entropy(mb(ids, ln).logits[-1].reshape(-1, 101),
+                      ids.reshape(-1)).backward()
+    gb.step()
+    disable_level_capture()
+    da = dict(ma.named_parameters()); db = dict(mb.named_parameters())
+    dd = max((da[n] - db[n]).norm().item() / da[n].norm().item()
+             for n in fg)
+    assert dd > 1e-6, "uniform and derived produced identical updates"
+    print(f"  lomuon c: uniform vs derived updates differ (rel {dd:.4f}) "
+          f"on identical gradients")
+
+
 def test_fold_relax():
     # OVER-RELAXATION arm (docs/OPERA_Relax_prereg.md):
     #     acc <- (1-g)*acc + g*composed,   g = 1 + tanh(z)
@@ -2515,6 +2631,7 @@ _ARMS = [
     test_fold_bistable,
     test_fold_relax,
     test_level_grad_balance,
+    test_lomuon,
 ]
 
 

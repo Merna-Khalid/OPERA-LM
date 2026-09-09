@@ -126,7 +126,13 @@ def main():
     else:
         source = GpuBatchSource(train_data, a.max_len, a.device, a.seed)
     if a.optimizer == "muon":
-        muon_p, adam_p = split_muon_params(model)
+        # split_muon_params returns (name, param) pairs; the include
+        # list stays EMPTY here -- Path A's TF arms keep the 4.8-pinned
+        # partition (fusion-style gates excluded), unlike the byte
+        # program's stage-0a arm.
+        muon_np, adam_np = split_muon_params(model)
+        muon_p = [p for _, p in muon_np]
+        adam_p = [p for _, p in adam_np]
         opt = Muon([
             {"params": muon_p, "use_muon": True, "lr": a.muon_lr},
             {"params": adam_p, "use_muon": False, "lr": a.max_lr},

@@ -390,6 +390,7 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
           homeo_mode='off', node_paths=3, fold_adapt='off',
           fold_bistable='off', bist_rank=0, fold_relax='off',
           level_grad_balance=1.0,
+          muon_include='', muon_wd=0.0, lo_muon=None,
           packed_data=None, ddp=False):
     # DDP (multi-GPU data parallelism, added for the Kaggle 2xT4 tier --
     # a single T4 measured ~8.5x slower than the project's A100, so real
@@ -504,6 +505,12 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
     if fold_bistable != 'off':
         tag.append(f'bist-{fold_bistable}'
                    + (f'-r{bist_rank}' if bist_rank else ''))
+    if muon_include:
+        tag.append('mfg' if muon_include == 'fusion_gate' else 'minc')
+    if muon_wd:
+        tag.append(f'mwd{muon_wd:g}')
+    if lo_muon:
+        tag.append('lo' if lo_muon == 'uniform' else 'loder')
     if lock_mode != 'none': tag.append(lock_mode)
     tag = '+'.join(tag)
 
@@ -687,15 +694,41 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
         # per-block 3x3 maps, cross_mlp, untied head), AdamW on embeddings/
         # gates/gains/scalars. ONE optimizer object -> resume machinery
         # untouched. Per-group lr is re-set every step from the schedule.
-        from .muon import Muon, split_muon_params
-        muon_p, adam_p = split_muon_params(model)
-        opt = Muon([
-            {'params': muon_p, 'use_muon': True, 'lr': muon_lr},
-            {'params': adam_p, 'use_muon': False, 'lr': max_lr},
-        ], lr=max_lr)
+        # muon_include (stage 0a, single-variable): explicit include-list
+        # evaluated BEFORE the exclusion substrings -- routes the compose
+        # node's fusion matrices into Muon without touching any other
+        # name's routing. Default '' preserves the incumbent partition
+        # byte-for-byte (Path A stays pinned to the 4.8 recipe).
+        # muon_wd (stage 0b): decoupled weight decay on the Muon side.
+        # lo_muon (stage 1): level-orthogonalized updates for the
+        # scale-tied fusion weights via the model's level-capture router.
+        from .muon import Muon, LOMuon, split_muon_params
+        include = tuple(s for s in muon_include.split(',') if s)
+        muon_np, adam_np = split_muon_params(model, include)
+        groups = [
+            {'params': [p for _, p in muon_np],
+             'names': [n for n, _ in muon_np],
+             'use_muon': True, 'lr': muon_lr, 'weight_decay': muon_wd},
+            {'params': [p for _, p in adam_np], 'use_muon': False,
+             'lr': max_lr},
+        ]
+        if lo_muon:
+            lo_names = [n for n, _ in muon_np if n.startswith('fusion_gate')]
+            opt = LOMuon(groups, lo_names=lo_names, lo_mode=lo_muon,
+                         lr=max_lr)
+            from .model import enable_level_capture
+            enable_level_capture()
+            if is_main:
+                print(f"  LOMuon: {len(lo_names)} scale-tied fusion "
+                      f"tensors, mode={lo_muon}", flush=True)
+        else:
+            opt = Muon(groups, lr=max_lr)
         if is_main:
-            print(f"  Muon: {sum(p.numel() for p in muon_p):,} matrix params "
-                  f"(lr {muon_lr}) + AdamW: {sum(p.numel() for p in adam_p):,} "
+            print(f"  Muon: {sum(p.numel() for _, p in muon_np):,} matrix "
+                  f"params (lr {muon_lr}"
+                  + (f", include {list(include)}" if include else "")
+                  + (f", wd {muon_wd}" if muon_wd else "")
+                  + f") + AdamW: {sum(p.numel() for _, p in adam_np):,} "
                   f"(lr {max_lr})", flush=True)
     elif use_foreach:
         # AdamW(foreach=True): fused multi-tensor step. weight_decay=0.0
@@ -1053,6 +1086,8 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
         'bist_rank': bist_rank,
         'fold_relax': fold_relax,
         'level_grad_balance': level_grad_balance,
+        'muon_include': muon_include, 'muon_wd': muon_wd,
+        'lo_muon': lo_muon,
         'vocab_size': actual_vocab_size, 'max_len': max_len,
         'eval_max_len': eval_max_len, 'steps': steps,
         'final_loss': loss.item(),
