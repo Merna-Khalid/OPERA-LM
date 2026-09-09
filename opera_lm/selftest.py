@@ -2384,6 +2384,49 @@ def test_lomuon():
           f"on identical gradients")
 
 
+def test_level_cond():
+    # LEVEL-CONDITIONED COMPOSE WEIGHTS (docs/OPERA_LevelCond_prereg.md,
+    # OPEN 5b): W_l = W + U diag(f(l)) V, f = fixed sinusoidal level
+    # basis (extrapolation-safe by construction). Zero-init U -> bitwise
+    # the incumbent at init while dL/dU != 0.
+    import torch.nn.functional as _F3
+    kw = dict(vocab_size=101, d=64, nb=16, num_layers=2, pe_mode='none',
+              fold_mode='left', rot_mode='free')
+    ids = torch.randint(1, 101, (2, 65))
+    ln = torch.tensor([65, 65])
+    torch.manual_seed(13); m0 = OperaSpinorFenwickTree(**kw)
+    torch.manual_seed(13)
+    m1 = OperaSpinorFenwickTree(**kw, level_cond_rank=8)
+
+    # (a) bitwise incumbent at init (U = 0)
+    assert torch.equal(m0(ids, ln).logits[-1],
+                       m1(ids, ln).logits[-1]), "lc not bitwise at init"
+    # (b) shared params bitwise; exactly 2 new tensors per layer
+    pa = dict(m0.named_parameters())
+    new = [n for n, p in m1.named_parameters()
+           if n not in pa or not torch.equal(p, pa[n])]
+    assert sorted(new) == ['lc_U.0', 'lc_U.1', 'lc_V.0', 'lc_V.1'], new
+    # (c) gradient flows to U at init (no cold gate)
+    _F3.cross_entropy(m1(ids, ln).logits[-1][:, :-1].reshape(-1, 101),
+                      ids[:, 1:].reshape(-1)).backward()
+    g = m1.lc_U[0].grad.norm().item()
+    assert g > 0, g
+    # (d) causality with U perturbed (mechanism actually changes forward)
+    with torch.no_grad():
+        m1.lc_U[0].normal_(0, 0.05)
+    b = ids.clone(); b[:, 30:] = torch.randint(1, 101, (2, 35))
+    sa = m1(ids, ln, return_states=True).states[-1]
+    sb = m1(b, ln, return_states=True).states[-1]
+    err = (sa[:, :30] - sb[:, :30]).abs().max().item()
+    assert err < 1e-5, f"lc causality {err}"
+    # (e) forward at 4x training length (unseen levels 7-8) stays finite
+    big = torch.randint(1, 101, (1, 257))
+    bln = torch.tensor([257])
+    assert torch.isfinite(m1(big, bln).logits[-1]).all().item()
+    print(f"  level-cond: bitwise at init; 2 tensors/layer; dL/dU {g:.2e}; "
+          f"causality {err:.0e}; 4x-length forward finite (unseen levels)")
+
+
 def test_fold_relax():
     # OVER-RELAXATION arm (docs/OPERA_Relax_prereg.md):
     #     acc <- (1-g)*acc + g*composed,   g = 1 + tanh(z)
@@ -2632,6 +2675,7 @@ _ARMS = [
     test_fold_relax,
     test_level_grad_balance,
     test_lomuon,
+    test_level_cond,
 ]
 
 

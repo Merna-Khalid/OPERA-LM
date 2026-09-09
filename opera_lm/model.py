@@ -367,6 +367,13 @@ def _maybe_capture_w(W, layer_idx, level_idx):
     return W
 
 
+def level_sin_features(level, r, device, dtype):
+    """f(l) for the level-conditioned weights: the fixed sinusoidal
+    basis, evaluated at one integer level (levels are small ints; the
+    basis is defined at EVERY depth, seen or not)."""
+    return level_sin_enc(torch.tensor([level], device=device), r)[0].to(dtype)
+
+
 class OperaOutput(NamedTuple):
     """forward()'s return value: fields absent from a given call (the
     corresponding return_* flag was False) are None rather than the field
@@ -405,7 +412,7 @@ class OperaSpinorFenwickTree(nn.Module):
                  mem_mode='none', mem_dim=128, homeo_mode='off',
                  node_paths=3, fold_adapt='off', fold_bistable='off',
                  bist_rank=0, fold_relax='off',
-                 level_grad_balance=1.0):
+                 level_grad_balance=1.0, level_cond_rank=0):
         super().__init__()
         assert d == 4 * nb, f"d must equal 4*nb (got d={d}, nb={nb})"
         assert lock_mode in ('none', 'interference')
@@ -1217,6 +1224,27 @@ class OperaSpinorFenwickTree(nn.Module):
         else:
             self.relax_g = None
 
+        # LEVEL-CONDITIONED COMPOSE WEIGHTS (docs/OPERA_LevelCond_prereg.md,
+        # OPEN 5b): W_l = W + U diag(f(l)) V per tree level, with f the
+        # FIXED sinusoidal level basis (level_sin_enc) -- smooth in l and
+        # defined at every depth, so levels beyond training get a smooth
+        # continuation of the operator, never never-trained rows. Zero-init
+        # U: bitwise the incumbent at init while dL/dU != 0 (the delta is
+        # linear in U) -- no cold gate, no warm-gate compromise. The fold's
+        # applications are scale-mixed per call and use the base W
+        # (pre-stated in the prereg).
+        self.level_cond_rank = int(level_cond_rank)
+        if self.level_cond_rank > 0:
+            r = self.level_cond_rank
+            self.lc_U = nn.ParameterList(
+                [nn.Parameter(torch.zeros(3 * nb, r)) for _ in range(num_layers)])
+            self.lc_V = nn.ParameterList(
+                [nn.Parameter(torch.randn(r, 2 * d) * (2 * d) ** -0.5)
+                 for _ in range(num_layers)])
+        else:
+            self.lc_U = None
+            self.lc_V = None
+
         # QUOTIENT PATH gate (node_paths=4): separate module created
         # LAST so the incumbent fusion_gate and RNG stream are exactly
         # the incumbent's. Bias -6 -> sigmoid ~= 0.0025: flags-on is
@@ -1290,6 +1318,14 @@ class OperaSpinorFenwickTree(nn.Module):
             return M
         return ent[1]
 
+    def _level_delta(self, layer_idx, level, W):
+        """U diag(f(l)) V for this level's effective compose weights
+        (level-conditioned arm). Cached per (layer, level, step) is
+        unnecessary: the matmul is ~3M flops at the d512 rung."""
+        f = level_sin_features(level, self.level_cond_rank,
+                               W.device, W.dtype)
+        return (self.lc_U[layer_idx] * f[None, :]) @ self.lc_V[layer_idx]
+
     def _compose(self, h_left, h_right, layer_idx, R_L, R_R, R_O,
                  gate_scale=1.0,
                  gate_bias=None,
@@ -1334,8 +1370,10 @@ class OperaSpinorFenwickTree(nn.Module):
                 from .triton_kernel import fused_node_triton as fused_node
             else:
                 from .metal_kernel import fused_node
-            W = _maybe_capture_w(self.fusion_gate[layer_idx].weight,
-                                 layer_idx, level_idx)
+            W = self.fusion_gate[layer_idx].weight
+            if self.lc_U is not None and isinstance(level_idx, int):
+                W = W + self._level_delta(layer_idx, level_idx, W)
+            W = _maybe_capture_w(W, layer_idx, level_idx)
             b = gb
             g = (F.linear(h_left, W[:, :self.d]) +
                  F.linear(h_right, W[:, self.d:]) + b)
@@ -1404,9 +1442,11 @@ class OperaSpinorFenwickTree(nn.Module):
         # tensor written and saved for backward at EVERY node. Chained
         # addmm: (b + h_left@W1^T) + h_right@W2^T in 2 kernel launches
         # (float-op reordering only).
-        W = grad_scale(_maybe_capture_w(
-            self.fusion_gate[layer_idx].weight, layer_idx, level_idx),
-            gate_scale)
+        W = self.fusion_gate[layer_idx].weight
+        if self.lc_U is not None and isinstance(level_idx, int):
+            W = W + self._level_delta(layer_idx, level_idx, W)
+        W = grad_scale(_maybe_capture_w(W, layer_idx, level_idx),
+                       gate_scale)
         b = grad_scale(gb, gate_scale) if gate_scale != 1.0 else gb
         g = torch.addmm(torch.addmm(b, h_left, W[:, :self.d].t()),
                         h_right, W[:, self.d:].t())

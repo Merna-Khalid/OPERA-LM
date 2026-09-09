@@ -194,3 +194,49 @@ Not "can the state move" — it can. **"Can the movement be aimed?"**
 R-H3 is the gate that failed, and it is the one that matters for the
 garden-path claim: excursions must land on the reinterpretation points,
 not merely exist. That needs its own registration.
+
+---
+
+# ADDENDUM 2 — pre-registered re-validation under Muon (2026-09-09)
+
+**Registered BEFORE any run.** The 2026-09-08 outcomes above were
+measured on the AdamW baseline that `OPERA_Recipe_results.md` later
+showed was 3.75% off its achievable quality. The recipe axis has since
+moved twice (Muon; then fusion_gate routing + wd 0.01 → BPB 2.0371).
+Before over-relaxation can be considered for Path A it must be
+re-validated under the current incumbent recipe — both because a
+positive measured on a mis-trained baseline is unproven, and because
+optimizer–mechanism interactions are real (LO-Muon's falsification
+showed the update rule changes what the fold mechanisms do).
+
+**Arms:** `relaxM_off` / `relaxM_under` / `relaxM_over` — identical to
+the 2026-09-08 arms except the recipe is `rx_fgate_wd` (Muon lr 0.02,
+include fusion_gate, wd 0.01). Same rung, seed, steps, data.
+
+**Gates:**
+
+- **RM-H1 (the original falsifier, unchanged):** `over` p99.9/median
+  ≥ 1.60 and ≥ `under` + 0.10. If the tail effect was an AdamW
+  artifact, it dies here and the mechanism line closes for good.
+- **RM-H2 (Path-A relevance — new, decision-bearing):** the quantity
+  Path A actually gates on is length extrapolation. *PASS* if `over`
+  improves the 1025–2048 bucket ≥ 1.5% vs `relaxM_off` with BPB
+  regression ≤ 1.0%. **This is the adopt-into-Path-A gate**: PASS →
+  over-relaxation is proposed as the OPERA arm's fold (amendment to
+  the Path A prereg, before training); FAIL → it stays a trajectory
+  result, interesting and closed.
+- **RM-H3 (guard):** BPB within 1.5% of `relaxM_off` (the 2026-09-08
+  cost was −0.76%; more than ~1.5% under the better optimizer means
+  the trade is no longer worth it at this rung).
+
+**Pre-stated interpretation.** RM-H1 pass + RM-H2 pass → the one
+positive mechanism of the series survives its re-validation AND
+targets the study's extrapolation axis; strongest architecture
+candidate for Path A. RM-H1 pass + RM-H2 fail → displacement is real
+but does not buy extrapolation; recorded, not adopted. RM-H1 fail →
+the 2026-09-08 positive was baseline-dependent; line closes.
+
+**Limitations:** single seed; one rung; the 1025–2048 bucket is 2×
+training length, not 16× — adoption for Path A is a transfer bet
+stated openly, and the Path A position-curve instrument itself is the
+final arbiter of H1 there.

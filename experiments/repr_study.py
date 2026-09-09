@@ -130,6 +130,27 @@ RECIPE = {
 }
 for _n in RECIPE:
     ARMS[_n] = ('bytes', 1024, 512, 128)
+# Over-relaxation RE-VALIDATION under the incumbent Muon recipe
+# (OPERA_Relax_prereg.md ADDENDUM 2, 2026-09-09): the 2026-09-08 arms
+# ran on the AdamW baseline; RM-H2 is the adopt-into-Path-A gate.
+RELAX_M = {'relaxM_off': 'off', 'relaxM_under': 'under',
+           'relaxM_over': 'over'}
+RECIPE['relaxM_off'] = dict(optimizer='muon', muon_lr=0.02,
+                            muon_include='fusion_gate', muon_wd=0.01)
+RECIPE['relaxM_under'] = dict(optimizer='muon', muon_lr=0.02,
+                              muon_include='fusion_gate', muon_wd=0.01)
+RECIPE['relaxM_over'] = dict(optimizer='muon', muon_lr=0.02,
+                             muon_include='fusion_gate', muon_wd=0.01)
+# LEVEL-CONDITIONED compose weights (OPERA_LevelCond_prereg.md):
+# lc_off re-runs the incumbent recipe in-family; lc_r8 is the arm.
+RECIPE['lc_off'] = dict(optimizer='muon', muon_lr=0.02,
+                        muon_include='fusion_gate', muon_wd=0.01,
+                        level_cond_rank=0)
+RECIPE['lc_r8'] = dict(optimizer='muon', muon_lr=0.02,
+                       muon_include='fusion_gate', muon_wd=0.01,
+                       level_cond_rank=8)
+for _n in list(RELAX_M) + ['lc_off', 'lc_r8']:
+    ARMS[_n] = ('bytes', 1024, 512, 128)
 for _n in RELAX:
     ARMS[_n] = ('bytes', 1024, 512, 128)
 for _n, _m in BIST.items():
@@ -210,7 +231,7 @@ def main():
             out_dir=arm_dir, tie=False,
             fold_bistable=BIST.get(name, 'off'),
             bist_rank=BIST_RANK.get(name, 0),
-            fold_relax=RELAX.get(name, 'off'),
+            fold_relax={**RELAX, **RELAX_M}.get(name, 'off'),
             level_grad_balance=LGB.get(name, 1.0),
             **RECIPE.get(name, {}))
         mins = (time.time() - t0) / 60

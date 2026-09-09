@@ -391,6 +391,7 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
           fold_bistable='off', bist_rank=0, fold_relax='off',
           level_grad_balance=1.0,
           muon_include='', muon_wd=0.0, lo_muon=None,
+          level_cond_rank=0,
           packed_data=None, ddp=False):
     # DDP (multi-GPU data parallelism, added for the Kaggle 2xT4 tier --
     # a single T4 measured ~8.5x slower than the project's A100, so real
@@ -511,6 +512,8 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
         tag.append(f'mwd{muon_wd:g}')
     if lo_muon:
         tag.append('lo' if lo_muon == 'uniform' else 'loder')
+    if level_cond_rank:
+        tag.append(f'lc{level_cond_rank}')
     if lock_mode != 'none': tag.append(lock_mode)
     tag = '+'.join(tag)
 
@@ -594,7 +597,8 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
                                    fold_bistable=fold_bistable,
                                    bist_rank=bist_rank,
                                    fold_relax=fold_relax,
-                                   level_grad_balance=level_grad_balance
+                                   level_grad_balance=level_grad_balance,
+                                   level_cond_rank=level_cond_rank
                                    ).to(torch_device)
     npar = count_params(model)
     if is_main:
@@ -1087,7 +1091,7 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
         'fold_relax': fold_relax,
         'level_grad_balance': level_grad_balance,
         'muon_include': muon_include, 'muon_wd': muon_wd,
-        'lo_muon': lo_muon,
+        'lo_muon': lo_muon, 'level_cond_rank': level_cond_rank,
         'vocab_size': actual_vocab_size, 'max_len': max_len,
         'eval_max_len': eval_max_len, 'steps': steps,
         'final_loss': loss.item(),
