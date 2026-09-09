@@ -223,6 +223,28 @@ recipe on purpose (it is the control leg, not a proposal).
 
 ## Amendments log (append-only)
 
+**2026-09-09 — implementation scope: LO v1 covers `fusion_gate` only;
+`rot_free` deferred.** Building the router revealed that `rot_free`'s
+only per-level decomposition point is the R_L/R_R/R_O rotation tensors
+(assembled once per layer, before the level loop) — whitening would
+happen in R-space, not in the parameter space where NS5 operates, and
+the two are not interchangeable. `fusion_gate.{l}.weight` decomposes
+natively (captured at the point of consumption, per level). rot_free
+is 0.3% of the partition; its per-level treatment is deferred to a v2
+if LO passes. Relatedly: the router captures the FOLD's applications of
+the shared weight (36–38% of dL/dW at T=1024, measured by the
+kill-switch) as a dedicated scale-mixed bucket with its own momentum —
+dropping it would have silently discarded a third of the signal.
+
+**2026-09-09 — KILL-SWITCH RESULT: PROCEED (runs_reprs/level_cosine.json).
+Median inter-level whitened cosine 0.012 against the 0.95 threshold
+(n=360 pairs, 4×4 batches at T=1024 on the rx_muon checkpoint); the
+levels are near-orthogonal, so NS(Σ G_ℓ) and NS(Σ NS(G_ℓ)) are
+maximally different operators. Measured alongside: level-1 input RMS
+1.020 vs 0.63–0.70 deeper levels (the 1.5× gap the derived weighting
+corrects), and gradient shares L1 30–33% decaying monotonically to ~0
+at the root — consistent with the 2026-09-07 audit at T=256.**
+
 **2026-09-09 — literature survey (docs/OPERA_Optimizer_survey.md)
 landed before any stage ran; three protocol updates.** (1) Stage 1 now
 has TWO treatment arms, one mechanism: `lo_uniform` (w_ℓ = 1, the
