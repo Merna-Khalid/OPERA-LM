@@ -59,14 +59,14 @@ Recommended session order (the engine does this automatically with
 | # | accelerator | what happens | ~time |
 |---|---|---|---|
 | 1 | **none (CPU)** | env selftests; tokenizer 2M lines (RAM fix, peak RSS logged); saturation check; smoltalk + FineWeb prep at 512/8192; pack to mmap pools; bucket report; data-dataset push | 3–5 h (free, no GPU quota) |
-| 2 | T4 x2, `--stages smoke` ONLY | 20M/500-step end-to-end smoke (packed source, 8k eval, position curve) + 155M throughput measurements → s/step recorded. NOT `auto`: don't start pretraining on a small FineWeb pool | ~1 h |
-| 3 | **none (CPU)**, `--stages data` | FineWeb re-stream at the 1B cap (the 250M stream lands only ~22M unique ≤512 tokens — see the prereg's 2026-09-06 amendment); repack + push | ~4–7 h (free) |
-| 4+ | T4 x2, `--stages auto` | OPERA pretrain 15,000 steps (DDP), governor-limited resumes | ~3 weekly quotas |
+| 2 | **none (CPU)**, `--stages data` | FineWeb re-stream at the 1B cap (the 250M stream lands only ~22M unique ≤512 tokens — see the prereg's 2026-09-06 amendment); repack + push. **Run this BEFORE the GPU smoke** so the recipe sweep (session 3) measures on the final pool | ~4–7 h (free) |
+| 3 | T4 x2, `--stages smoke` ONLY | 20M/500-step end-to-end smoke (packed source, 8k eval, position curve) + 155M throughput measurements → s/step recorded + **recipe sweep + 155M confirm** (prereg amendment 2026-09-09: 5 OPERA + 3 TF 20M probes on the FineWeb pool; the adopted lr/wd/fusion_gate-routing is written into state.json and used by every later stage). NOT `auto`: don't start pretraining on an untuned recipe | ~3.5–4.5 h |
+| 4+ | T4 x2, `--stages auto` | OPERA pretrain 15,000 steps (DDP) with the **adopted recipe**, governor-limited resumes | ~3 weekly quotas |
 | — | T4 x2 | TF RoPE + TF NoPE pretrains concurrently (one per GPU) | ~1–2 sessions |
 | — | T4 x2 | SFT ×3 (opera 2,500 steps; then the TF pair) | ~1 session |
 | — | T4 x2 | position curves ×3 to 8192, gates H1–H4, long-context samples | <1 h |
 
-After session 3's push: re-attach the updated `opera-lm-patha-data`
+After session 2's push: re-attach the updated `opera-lm-patha-data`
 dataset (the mount is a snapshot; re-adding picks up the bigger pool).
 
 ## What to watch between sessions

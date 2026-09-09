@@ -60,6 +60,9 @@ def main():
     p.add_argument("--optimizer", default="muon",
                    choices=["adamw", "muon"])
     p.add_argument("--muon-lr", type=float, default=0.02)
+    p.add_argument("--muon-wd", type=float, default=0.0,
+                   help="decoupled weight decay on the Muon side "
+                        "(Path A amendment 2026-09-09: 0.01, Moonshot)")
     p.add_argument("--d", type=int, default=512)
     p.add_argument("--num-layers", type=int, default=4)
     p.add_argument("--curriculum-t0", type=int, default=64)
@@ -134,7 +137,8 @@ def main():
         muon_p = [p for _, p in muon_np]
         adam_p = [p for _, p in adam_np]
         opt = Muon([
-            {"params": muon_p, "use_muon": True, "lr": a.muon_lr},
+            {"params": muon_p, "use_muon": True, "lr": a.muon_lr,
+             "weight_decay": a.muon_wd},
             {"params": adam_p, "use_muon": False, "lr": a.max_lr},
         ], lr=a.max_lr)
         print(f"  Muon: {sum(p.numel() for p in muon_p):,} matrix params "

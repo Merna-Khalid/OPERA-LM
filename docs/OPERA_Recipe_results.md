@@ -119,3 +119,24 @@ so the ceiling on this fix is low regardless.
 3. Re-run BPE under Muon before quoting the representation margin.
 4. Optionally isolate which of curriculum / WSD costs `rx_full` its
    0.83%.
+
+## Addendum 2026-09-09 — items 1+2 executed; new incumbent 2.0371
+
+Both fixes ran (single-variable each, then combined; full record in
+`docs/OPERA_Optimizer_prereg.md` Outcomes):
+
+| arm | BPB | vs `rx_muon` | extrapolation |
+|---|---|---|---|
+| `rx_muon` | 2.0508 | — | 4.0711 |
+| `rx_fgate` (include-list, not the `'blend_gate'` narrowing — moves
+  ONLY fusion_gate) | 2.0496 | −0.06% | 4.0679 |
+| `rx_wd` (Muon-side wd 0.01) | 2.0460 | −0.23% | 4.0718 |
+| **`rx_fgate_wd`** | **2.0371** | **−0.67%** | **4.0560** |
+
+**The new byte incumbent is `rx_fgate_wd`, BPB 2.0371** — cumulative
+−4.39% from the AdamW baseline. Item 3 (BPE under Muon) is still open
+and now matters more: the byte-vs-BPE margin should be quoted as
+2.0371 against BPE-under-Muon when that run happens. A same-day LO-Muon
+study on this incumbent falsified per-level orthogonalization
+(+3.6% BPB) and closed the optimizer side of the scale-tied problem —
+see the Optimizer prereg.

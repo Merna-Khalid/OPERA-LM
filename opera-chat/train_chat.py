@@ -52,6 +52,16 @@ def main():
                         "(rot_free 3x3 maps, cross_mlp, head), AdamW on "
                         "embeddings/gates/gains")
     p.add_argument("--muon-lr", type=float, default=0.02)
+    p.add_argument("--muon-include", default="",
+                   help="comma-separated names routed into the Muon "
+                        "partition by explicit include-list BEFORE the "
+                        "exclusion substrings (Path A amendment "
+                        "2026-09-09: 'fusion_gate' -- the compose node's "
+                        "fusion matrices, misrouted to AdamW by the "
+                        "'gate' substring in the original partition)")
+    p.add_argument("--muon-wd", type=float, default=0.0,
+                   help="decoupled weight decay on the Muon side "
+                        "(Path A amendment 2026-09-09: 0.01, Moonshot)")
     p.add_argument("--accum", type=int, default=1,
                    help="gradient accumulation micro-batches per update; "
                         "effective batch = batch x world_size x accum. "
@@ -157,6 +167,7 @@ def main():
         curriculum=None if a.no_curriculum else (a.curriculum_t0, a.curriculum_every),
         data=(train_data, test_short, test_long, vocab_size),
         idx2word=None, optimizer=a.optimizer, muon_lr=a.muon_lr,
+        muon_include=a.muon_include, muon_wd=a.muon_wd,
         readout_mode=a.readout, mem_mode=a.mem, mem_dim=a.mem_dim,
         use_metal=a.metal, use_triton=a.triton, init_weights_from=a.init_weights_from,
         ddp=a.ddp, grad_checkpoint=a.grad_checkpoint,

@@ -221,6 +221,74 @@ all-reduce; not needed on this rung, flagged for whoever ports it.
 Stage 0c's AdamW-everywhere arm re-uses the falsified incumbent
 recipe on purpose (it is the control leg, not a proposal).
 
+## Outcomes — 2026-09-09
+
+### Stage 0 (ungated recipe record) — new incumbent: `rx_fgate_wd`
+
+| arm | BPB | vs `rx_muon` | extrapolation (1025–2048) |
+|---|---|---|---|
+| rx_muon | 2.0508 | — | 4.0711 |
+| rx_fgate (0a) | 2.0496 | −0.06% | 4.0679 |
+| rx_wd (0b) | 2.0460 | −0.23% | 4.0718 |
+| **rx_fgate_wd** | **2.0371** | **−0.67%** | **4.0560** |
+
+Additive on both metrics. Individually each sits near the 0.04% repro
+floor; together they take the byte rung to **2.0371** — a cumulative
+**−4.39%** from the AdamW baseline `bist_off` (2.1308). The winner is
+exactly the registered LO recipe; no amendment needed. The fusion_gate
+fix alone was correctness, not immediate BPB.
+
+### Stage 1 (LO-Muon) — **O-H1 FAIL, O-H2 FAIL, decisively.**
+
+| arm | BPB | vs incumbent | extrapolation | nan_skips |
+|---|---|---|---|---|
+| rx_fgate_wd (incumbent) | 2.0371 | — | 4.0560 | 0 |
+| lo_uniform | 2.1096 | **+3.56%** | 4.2556 (**+4.92%**) | 0 |
+| lo_derived | 2.1121 | **+3.68%** | 4.2800 (**+5.52%**) | 0 |
+
+- **O-H1**: required BPB ≤ 2.0167 (−1.0%); measured +3.56%/+3.68%.
+  FAIL by a wide margin in the wrong direction.
+- **O-H2**: required extrapolation ≤ 3.975 with BPB regression ≤ 1%.
+  Extrapolation is *worse* (+4.9%/+5.5%) — no trade-off, harm on both
+  metrics. FAIL.
+- **O-H3 (usage)**: routing confirmed — the LOMuon header fired on
+  both arms ("2 scale-tied fusion tensors"), per-level capture summed
+  to `.grad` (selftest + kill-switch router check), training was
+  stable end-to-end (0 skips, healthy loss curve). This is a
+  mechanism-active failure, not a cold-parameter null.
+- **O-H4**: zero new parameters (3,293,447 on all three arms);
+  forward untouched.
+
+**Verdict (pre-stated in §6, applied): O-H1 fail with routing
+confirmed ⇒ magnitude rebalancing (β^ℓ, under AdamW) AND direction
+rebalancing (LO, under Muon) are both dead. The optimizer side of the
+scale-tied problem is CLOSED.** OPEN 5b (level-conditioned weights) is
+the only remaining attack on `OPEN_scale_tied_operator.md`.
+
+**The registered retry is NOT exercised.** §6 allows one momentum-
+placement retry "only if null-with-routing-confirmed." This is not a
+null: it is a decisive active harm (+3.6% BPB, +4.9% extrapolation)
+with a mechanistic account. Retrying under a different momentum
+placement cannot plausibly flip +3.6% into −1.0%, and doing so would
+be the fishing the single-dose rule exists to prevent. Line closed.
+
+**Post-hoc reading (not registered, recorded because it explains both
+this null and the level-balance one).** NS on the *summed* gradient
+preserves relative magnitudes — and a level's gradient magnitude
+encodes its node count, i.e. its information content (level 1 + the
+fold carry ~70% of dL/dW because they perform ~70% of the
+compositions). NS5 is scale-invariant, so per-level whitening hands a
+0.7%-share level the same full-magnitude direction vote as a 30%-share
+level: equal votes for rarer, noisier scales. LO-Muon is direction-
+equalization exactly as β^ℓ was magnitude-equalization — and both are
+now measured as actively harmful in their own currency. The tied
+operator does not merely tolerate the shallow+fold-dominated update;
+it *wants* it. "Measurable imbalance" was not "harmful" (LGB's
+lesson); "maximal room to matter" (kill-switch 0.012) was not "should
+be used." The OPEN problem's remaining question is whether the
+*forward* should give deep levels their own operator (5b), not whether
+the optimizer should equalize them.
+
 ## Amendments log (append-only)
 
 **2026-09-09 — implementation scope: LO v1 covers `fusion_gate` only;

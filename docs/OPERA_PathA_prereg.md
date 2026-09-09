@@ -265,3 +265,53 @@ exact regime and is **not** part of this protocol. It belongs to a
 separate, separately pre-registered study, and is named here only so
 that the record shows it was identified before the outcomes, not after
 them.
+
+**2026-09-09 — Recipe adoption + Session-2 recipe sweep (logged
+BEFORE any GPU training; only CPU data sessions have run).** The
+byte-rung program of 2026-09-08/09 changed what is known about the
+optimizer recipe this protocol froze on 2026-09-06:
+
+1. **`fusion_gate` was misrouted to AdamW by the `'gate'` substring**
+   in `muon.py`'s exclusion list — 28% of 2-D parameters at d512, and
+   ~21% of ALL parameters (33.2M/154.8M) at this study's OPERA config.
+   This was an accident, not a design choice; §4.8's OPERA arm carried
+   the same misrouting (its TF arm was unaffected — its matrices were
+   always in Muon). OPERA adopts the include-list routing
+   (`--muon-include fusion_gate`).
+2. **Muon-side weight decay 0.01** (Moonshot's scaling recipe; byte
+   rung: −0.23% alone, additive with the routing fix). Both arms adopt.
+3. **`muon_lr=0.02` was gated at the word-level toy rung (T0.1) and
+   carried unmodified into §4.8 and this protocol.** It has never been
+   measured on BPE chat/FineWeb data, at 155M, or on T4s.
+
+Amendment: the recipe is **measured on this study's own data,
+tokenization, and hardware** inside Session 2, before any long run:
+a 20M sweep (5 OPERA probes — lr {0.01, 0.02, 0.04} at wd 0.01 with
+the routing fix, a wd-0 control, a routing-off control; 3 TF probes —
+lr {0.01, 0.02, 0.04} at wd 0.01; 2,000 steps each on the FineWeb
+pool, one probe per GPU) followed by a 155M × 250-step confirmation
+of the top-2 lr. **Adoption rules, pre-stated:** keep lr 0.02 unless
+another value wins by >1%; keep wd 0.01 unless 0 wins by >1%; keep
+the fusion_gate routing (it is a correctness fix) unless off wins by
+>1.5%; an at-scale (155M) ranking flip overrides the 20M lr ranking.
+The adopted recipe is written to state.json and used by every later
+stage. Session order changes accordingly: the free CPU FineWeb
+extension (old session 3) runs BEFORE the GPU smoke so the sweep
+measures on the final 80M+ pool.
+
+*Fairness principle, stated:* matched means matched protocol — same
+schedule, data, steps, seeds, and measurement. Each arm additionally
+runs its best-known recipe; a known misrouting is not part of either
+architecture. The TF arms have no fusion_gate analogue, so the
+include is OPERA-only by construction, not an asymmetry. H1–H4 and
+all other protocol elements are unchanged; H3's two-stage reading
+compares THIS study's arms (§4.8 remains context, not a control).
+
+*Not adopted, on the record:* LO-Muon (falsified 2026-09-09: +3.6%
+BPB, +4.9% extrapolation at the byte rung with routing confirmed);
+over-relaxation (BPB-negative at the byte rung, unvalidated under
+Muon, and its benefit is a trajectory metric this study does not
+gate on); the bistable arms (falsified); byte-level representation
+(§5.1's adoption rule settled it; token-matched §4.8 comparability);
+`mem_mode='delta'` (implemented and selftested but never validated —
+a post-study arm, not something to smuggle into a 3-week commit).

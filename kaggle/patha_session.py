@@ -66,6 +66,44 @@ SAVE_EVERY = 1000
 OPERA_ARGS = ["--d", "1664", "--nb", "416", "--num-layers", "8"]
 SMOKE_OPERA_ARGS = ["--d", "640", "--nb", "160", "--num-layers", "4"]
 TF_ARGS = ["--d", "1264", "--num-layers", "7"]
+SMOKE_TF_ARGS = ["--d", "512", "--num-layers", "4"]      # ~21M (4.7 pilot scale)
+SWEEP_STEPS = 2000      # 20M recipe-sweep length (curriculum every 50)
+PROBE_STEPS = 250       # 155M confirmation probe length
+# Recipe defaults (prereg amendment 2026-09-09): fusion_gate routing is a
+# correctness fix (measured misallocation), wd 0.01 follows Moonshot +
+# the byte rung; both + the lr are RE-MEASURED by the Session-2 sweep on
+# this study's own data/hardware, with pre-stated adoption rules.
+RECIPE_DEFAULT = {"opera": {"lr": "0.02", "wd": "0.01",
+                            "include": "fusion_gate"},
+                  "tf": {"lr": "0.02", "wd": "0.01"}}
+
+
+def get_recipe(st):
+    return st.get("recipe") or RECIPE_DEFAULT
+
+
+def _final_loss(out_dir, log_name=None):
+    """Final training loss of a probe run: last results row that has one,
+    else the last 'loss <x>' step print in the run's log."""
+    import glob as _glob
+    import json as _json
+    for rj in sorted(_glob.glob(os.path.join(out_dir, "*results.jsonl"))):
+        rows = [_json.loads(x) for x in open(rj) if x.strip()]
+        for r in reversed(rows):
+            v = r.get("final_loss", r.get("loss"))
+            if v is not None:
+                return float(v)
+    if log_name:
+        lp = os.path.join(WORK, "logs", log_name)
+        if os.path.exists(lp):
+            last = None
+            for line in open(lp):
+                m = re.search(r"loss\s+([\d.]+)", line)
+                if m:
+                    last = float(m.group(1))
+            if last is not None:
+                return last
+    return None
 
 T0 = time.time()
 SOFT_DEADLINE = T0 + GOVERNOR_HOURS * 3600
@@ -497,9 +535,121 @@ def stage_smoke(st):
         assert s, "could not parse TF s/step from throughput smoke"
         st["measured"]["s_per_step_tf"] = s
         log(f"MEASURED: TF 155M 1xT4 batch 32 = {s:.2f} s/step")
+    # (d) RECIPE SWEEP (prereg amendment 2026-09-09) + 155M confirm:
+    # the recipe is measured on this study's own data and hardware
+    # before any long training runs; adoption rules are pre-stated in
+    # _recipe_sweep's docstring and the prereg amendment.
+    if "recipe" not in st:
+        _recipe_sweep(st, fw_pkl, fw_prefix)
+    st["stages"]["recipe"] = "done"
+    save_state(st)
     st["stages"]["smoke"] = "done"
     save_state(st)
-    push_all(st, "smoke stage complete")
+    push_all(st, "smoke stage complete (recipe measured + adopted)")
+
+
+
+def _recipe_probe_cmd(kind, name, lr, wd, include, pkl, prefix, out_dir,
+                      tf=False):
+    if tf:
+        return [PY, "opera-chat/train_tf_chat.py", "--pe", "rope",
+                "--data", pkl, "--packed-data", prefix,
+                "--steps", str(SWEEP_STEPS), "--batch", "32",
+                *SMOKE_TF_ARGS, "--device", "cuda", "--optimizer", "muon",
+                "--muon-lr", str(lr), "--muon-wd", str(wd),
+                "--lr-schedule", "wsd", "--curriculum-every", "50",
+                "--save-every", "0", "--out-dir", out_dir]
+    cmd = [PY, "opera-chat/train_chat.py", "--data", pkl,
+           "--packed-data", prefix, "--steps", str(SWEEP_STEPS),
+           "--batch", "16", "--curriculum-every", "50",
+           *SMOKE_OPERA_ARGS, "--max-len", str(MAX_LEN),
+           "--eval-max-len", str(EVAL_MAX), "--device", "cuda",
+           "--optimizer", "muon", "--muon-lr", str(lr),
+           "--muon-wd", str(wd), "--compile", "off",
+           "--save-every", "0", "--out-dir", out_dir]
+    if include:
+        cmd += ["--muon-include", include]
+    return cmd
+
+
+def _recipe_sweep(st, pkl, prefix):
+    """Session-2 recipe sweep (prereg amendment 2026-09-09): measure the
+    optimizer recipe ON THIS STUDY'S data/tokenization/hardware at the
+    20M rung before the 3-week commitment, symmetric for both arms.
+    Pre-stated adoption rules:
+      lr   argmin over {0.01, 0.02, 0.04} (wd 0.01, fgate on); keep 0.02
+           unless the winner beats it by > 1%.
+      wd   0 vs 0.01 at the winning lr; keep 0.01 unless 0 wins by > 1%.
+      fg   fusion_gate stays (correctness fix) unless off wins by > 1.5%.
+      tf   same lr rule at wd 0.01 (TF has no fusion analogue).
+      155M top-2 confirmation: an at-scale ranking flip OVERRIDES the
+      20M lr ranking (pre-stated).
+    """
+    root = os.path.join(WORK, "runs", "recipe")
+    def _k(pref, lr):
+        return f"{pref}_lr{int(lr * 1000):03d}"
+    opera_cfgs = [(_k("op", 0.01), 0.01, 0.01, True),
+                  (_k("op", 0.02), 0.02, 0.01, True),
+                  (_k("op", 0.04), 0.04, 0.01, True),
+                  ("op_wd0", 0.02, 0.0, True),
+                  ("op_nofg", 0.02, 0.01, False)]
+    tf_cfgs = [(_k("tf", 0.01), 0.01), (_k("tf", 0.02), 0.02),
+               (_k("tf", 0.04), 0.04)]
+    todo = [(n, _recipe_probe_cmd("opera", n, lr, wd, "fusion_gate" if fg else "",
+                                  pkl, prefix, os.path.join(root, n)),
+             "0" if i % 2 == 0 else "1")
+            for i, (n, lr, wd, fg) in enumerate(opera_cfgs)]
+    todo += [(n, _recipe_probe_cmd("tf", n, lr, 0.01, "",
+                                   pkl, prefix, os.path.join(root, n)),
+              "0" if i % 2 == 0 else "1")
+             for i, (n, lr) in enumerate(tf_cfgs)]
+    losses = {}
+    for k in range(0, len(todo), 2):
+        batch = todo[k:k + 2]
+        run_jobs([(cmd, f"recipe_{n}.log", {"CUDA_VISIBLE_DEVICES": dev})
+                  for n, cmd, dev in batch])
+    for n, cmd, dev in todo:
+        v = _final_loss(os.path.join(root, n), f"recipe_{n}.log")
+        assert v is not None, f"probe {n} produced no final loss"
+        losses[n] = v
+        log(f"SWEEP {n}: final loss {v:.4f}")
+    # adoption (rules above, arithmetic not judgement)
+    lr_best = min(("0.01", "0.02", "0.04"), key=lambda l: losses[_k("op", l)])
+    keep = ("0.02" if losses[_k("op", "0.02")] <= losses[_k("op", lr_best)] * 1.01
+            else lr_best)
+    wd = "0.01" if losses["op_wd0"] > losses[_k("op", "0.02")] * 0.99 else "0.0"
+    inc = ("fusion_gate"
+           if losses["op_nofg"] > losses[_k("op", "0.02")] * 0.985 else "")
+    tf_best = min(("0.01", "0.02", "0.04"), key=lambda l: losses[_k("tf", l)])
+    tf_keep = ("0.02" if losses[_k("tf", "0.02")] <= losses[_k("tf", tf_best)] * 1.01
+               else tf_best)
+    # 155M confirmation of the lr decision (at-scale overrides 20M)
+    c_a, c_b = keep, "0.02"
+    if c_a != c_b:
+        outs = {}
+        for tag, lr_v, dev in ((f"confirm_{c_a}", c_a, "0"), (f"confirm_{c_b}", c_b, "1")):
+            run(["torchrun", "--nproc_per_node=2", "opera-chat/train_chat.py",
+                 "--ddp", "--data", pkl, "--packed-data", prefix,
+                 "--steps", str(PROBE_STEPS), "--batch", "16", *OPERA_ARGS,
+                 "--max-len", str(MAX_LEN), "--eval-max-len", str(EVAL_MAX),
+                 "--device", "cuda", "--optimizer", "muon",
+                 "--muon-lr", lr_v, "--muon-include", "fusion_gate",
+                 "--muon-wd", "0.01", "--curriculum-every", "10",
+                 "--compile", "off", "--grad-checkpoint", "level",
+                 "--save-every", "0",
+                 "--out-dir", os.path.join(root, tag)],
+                f"recipe_{tag}.log")
+            outs[lr_v] = _final_loss(os.path.join(root, tag),
+                                     f"recipe_{tag}.log")
+        keep = min(outs, key=outs.get)
+        log(f"155M confirm: {outs} -> lr {keep} adopted")
+    st["recipe"] = {"opera": {"lr": keep, "wd": wd, "include": inc},
+                    "tf": {"lr": tf_keep, "wd": "0.01"},
+                    "evidence": losses}
+    log(f"RECIPE ADOPTED: opera lr={keep} wd={wd} include={inc or 'none'} | "
+        f"tf lr={tf_keep} wd=0.01")
+    save_state(st)
+    push_all(st, "recipe sweep complete")
 
 
 def stage_pretrain_opera(st):
@@ -514,7 +664,9 @@ def stage_pretrain_opera(st):
          "--ddp", "--data", fw_pkl, "--packed-data", fw_prefix,
          "--steps", str(PRETRAIN_STEPS), "--batch", "16", *OPERA_ARGS,
          "--max-len", str(MAX_LEN), "--eval-max-len", str(EVAL_MAX),
-         "--device", "cuda", "--optimizer", "muon", "--muon-lr", "0.02",
+         "--device", "cuda", "--optimizer", "muon",
+         "--muon-lr", rcp["opera"]["lr"], "--muon-include",
+         rcp["opera"]["include"], "--muon-wd", rcp["opera"]["wd"],
          "--lr-schedule", "wsd", "--save-every", str(SAVE_EVERY),
          "--resume", "--compile", "off", "--grad-checkpoint", "level",
          "--out-dir", os.path.join(WORK, "runs", "pretrain_opera")],
@@ -527,11 +679,13 @@ def stage_pretrain_opera(st):
     push_all(st, "pretrain opera progress")
 
 
-def _tf_train_cmd(pe, pkl, prefix, steps, out_dir, init=None):
+def _tf_train_cmd(pe, pkl, prefix, steps, out_dir, init=None, rcp=None):
+    rcp = rcp or RECIPE_DEFAULT
     cmd = [PY, "opera-chat/train_tf_chat.py", "--pe", pe, "--data", pkl,
            "--packed-data", prefix, "--steps", str(steps), "--batch", "32",
            *TF_ARGS, "--device", "cuda", "--optimizer", "muon",
-           "--muon-lr", "0.02", "--lr-schedule", "wsd",
+           "--muon-lr", rcp["tf"]["lr"], "--muon-wd", rcp["tf"]["wd"],
+           "--lr-schedule", "wsd",
            "--save-every", str(SAVE_EVERY), "--resume",
            "--out-dir", out_dir]
     if init:
@@ -567,11 +721,14 @@ def stage_sft_opera(st):
     smol_prefix = smol_pkl[:-len(".eval.pkl")]
     init = opera_final(os.path.join(WORK, "runs", "pretrain_opera"))
     assert init, "opera pretrain has no final checkpoint yet"
+    rcp = get_recipe(st)
     run(["torchrun", "--nproc_per_node=2", "opera-chat/train_chat.py",
          "--ddp", "--data", smol_pkl, "--packed-data", smol_prefix,
          "--steps", str(SFT_STEPS), "--batch", "16", *OPERA_ARGS,
          "--max-len", str(MAX_LEN), "--eval-max-len", str(EVAL_MAX),
-         "--device", "cuda", "--optimizer", "muon", "--muon-lr", "0.02",
+         "--device", "cuda", "--optimizer", "muon",
+         "--muon-lr", rcp["opera"]["lr"], "--muon-include",
+         rcp["opera"]["include"], "--muon-wd", rcp["opera"]["wd"],
          "--lr-schedule", "wsd", "--save-every", str(SAVE_EVERY),
          "--resume", "--compile", "off", "--grad-checkpoint", "level",
          "--init-weights-from", init,

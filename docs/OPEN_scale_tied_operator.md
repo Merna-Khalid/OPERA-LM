@@ -78,9 +78,28 @@ plausibly the *correct* allocation — level 0 performs 256× more distinct
 compositions and should receive more gradient. Forcing equality is
 over-correction.
 
+**Level-orthogonalized Muon (LO-Muon) — FALSIFIED 2026-09-09**
+(`docs/OPERA_Optimizer_prereg.md`). Orthogonalize each level's gradient
+separately (plus the fold bucket, 36–38% of dL/dW) and sum in whitened
+space: NS(Σ NS(G_ℓ)) instead of NS(Σ G_ℓ). The kill-switch measured
+maximal room first (median inter-level whitened cosine **0.012** vs a
+0.95 no-op bound — the levels are near-orthogonal). Result: **BPB
++3.56%/+3.68%, extrapolation +4.92%/+5.52%** vs the best recipe
+(rx_fgate_wd 2.0371), zero divergence skips, routing confirmed — a
+mechanism-active failure. Post-hoc: NS on the sum preserves magnitude
+≈ node count ≈ information content; per-level whitening equalizes
+rare/noisy scales with common/informative ones. Direction-equalization
+joins magnitude-equalization (β^ℓ) as falsified: **the tied operator
+wants the shallow+fold-dominated update.** The optimizer side of this
+problem is closed; §5b (level-conditioned *weights*) is the only
+remaining attack.
+
 **Methodological note worth keeping:** *measurable* + *unique to the
 architecture* ≠ *harmful*. Three separate claims; the first two were
-established and the third was assumed.
+established and the third was assumed. (LO-Muon adds a fourth lesson:
+*maximal statistical room* ≠ *should be used* — the 0.012 cosine said
+the operators differ; it said nothing about which one the objective
+prefers.)
 
 ## 4. Adjacent prior art, and why it does not cover this
 
