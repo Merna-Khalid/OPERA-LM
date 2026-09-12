@@ -188,3 +188,18 @@ Seven mechanism arms have been tested and one succeeded (over-relaxation,
 `docs/OPERA_Relax_prereg.md`). The recipe axis has produced a larger
 effect on the first attempt than the architecture axis produced in a
 day. Finish that axis before reopening this one.
+
+**Level-conditioned weights (5b) — TESTED AND FAILED 2026-09-12**
+(`docs/OPERA_LevelCond_prereg.md`). W_ℓ = W + U·diag(f(ℓ))·V, fixed
+sinusoidal f, r=8, zero-init U, under the current Muon recipe. The
+mechanism was heavily used (deltas 18–62% of ‖W‖, growing with
+depth, ~orthogonal to W) and direction-positive on both metrics —
+but the pre-registered extrapolation gate (≥2%) was missed at
+1.267%, with BPB *improving* 0.32%. Verdict per the registration:
+the shared operator is what the objective prefers, in both
+currencies now. **The OPEN problem closes: scale-tying has been
+attacked by magnitude equalization (β^ℓ), direction equalization
+(LO-Muon), and forward-side per-level operators, and defended itself
+every time.** What survives is the constructive observation — the
+trained deltas grow with depth, the first direct evidence the
+operator wants depth-dependent structure — recorded for the paper.

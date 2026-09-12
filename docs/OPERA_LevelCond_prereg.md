@@ -118,3 +118,65 @@ arbiter is Path A's own instrument. r=8 is a single dose; no ladder.
 The fold uses base W (§1).
 
 ## Amendments log (append-only)
+
+---
+
+## Outcomes — 2026-09-12
+
+| arm | BPB | extrapolation (1025–2048) | min |
+|---|---|---|---|
+| lc_off | 2.0406 | 4.0714 | 60 |
+| **lc_r8** | **2.0341** | **4.0198** | 63 |
+
+### LC-H1 — **FAIL.** Direction positive, bar not met.
+
+Extrapolation improves **1.267%** (4.0714 → 4.0198) against a
+pre-registered bar of ≥ 2.0%. Recorded as failed. The margin sits
+above the ~0.2% cross-session BPB noise but under the gate; the bar
+does not move.
+
+### LC-H2 — **PASS, and better than the guard allows.** BPB
+*improves* 0.32% (best in the family, ahead of `rx_fgate_wd`'s
+2.0371). The pre-stated trade-off (spend in-length for extrapolation)
+did not materialize — both metrics moved the right way, just not far
+enough on the primary.
+
+### LC-H3 — heavily used; not a cold null.
+
+Per-level delta magnitude ‖U·diag(f(ℓ))·V‖/‖W‖ at convergence:
+18% (level 1) rising to ~50–62% (levels 9–12), nearly orthogonal to
+W (cos ≈ +0.05) — the effective operator genuinely became
+level-dependent, in *new* directions, and diverges more the deeper
+the level. That is exactly the shape the input-distribution
+measurement (1.020 vs 0.63–0.70 RMS) predicted the levels wanted.
+
+### LC-H4 — PASS. Finite and well-behaved at unseen depths (asserted
+in the selftest at 4× length; the 1025–2048 eval exercises level 11
+on every step).
+
+### Verdict (§5, applied): **LC-H1 fail with LC-H3 showing real
+per-level deltas → the shared operator is what the objective prefers
+in BOTH currencies. The OPEN problem closes with a complete answer.**
+
+Scale-tying has now been attacked three ways — magnitude
+equalization (β^ℓ, AdamW), direction equalization (LO-Muon, Muon),
+and forward-side per-level operators (this study) — and defended
+itself every time, the last one against a mechanism the objective
+happily used at 20–60% magnitude. Scale-tying is not a pathology at
+this rung; it is a design the training objective ratifies. NOT
+adopted into Path A.
+
+**Post-hoc (not registered, recorded for honesty):** direction was
+positive on BOTH metrics, at +0.3% params, single seed, one dose
+(r=8), 0.56 epochs. A revival at a longer budget or higher rank is a
+*new registration* with its own gates — this one's verdict stands.
+The most likely reading of the miss: at 0.56 epochs the deltas are
+still growing (‖U‖ unconverged); the rung may simply be too short
+for the specialization to pay for its parameters.
+
+**Bonus measurement (the first of its kind here):** the level-
+conditioned deltas are ~orthogonal to W and grow with depth — the
+first direct evidence that OPERA's compose operator *wants* different
+deep-vs-shallow structure, even though providing it does not yet pay.
+This observation belongs in the paper's scale-tying section either
+way.

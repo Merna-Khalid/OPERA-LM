@@ -240,3 +240,35 @@ the 2026-09-08 positive was baseline-dependent; line closes.
 training length, not 16× — adoption for Path A is a transfer bet
 stated openly, and the Path A position-curve instrument itself is the
 final arbiter of H1 there.
+
+## Outcomes (Addendum 2) — 2026-09-12
+
+| arm | BPB | extrap | p99.9/med |
+|---|---|---|---|
+| relaxM_off | 2.0411 | 4.0562 | **1.859** |
+| relaxM_under | 2.0451 | 4.0517 | 1.833 |
+| relaxM_over | 2.0927 | 4.1763 | **1.958** |
+
+### RM-H1 — **PASS.** The tail effect survives the better optimizer:
+1.958 ≥ 1.60, and over − under = +0.125 ≥ 0.10.
+
+### RM-H2 — **FAIL, decisively.** Extrapolation is 2.96% *worse*
+(needed ≥ 1.5% better); the displacement does not buy extrapolation.
+
+### RM-H3 — **FAIL.** BPB cost 2.52% (guard 1.5%). The trade worsened
+under Muon (it was −0.76% under AdamW): the better the optimizer, the
+more over-relaxation costs.
+
+### Verdict (pre-stated): **RM-H1 pass + RM-H2 fail → displacement is
+real but does not buy extrapolation; recorded, not adopted.** The
+one positive mechanism of the series is now a trajectory-only result.
+
+### Unregistered observation, load-bearing for the trajectory
+program: **Muon itself fattened the tails.** The AdamW incumbent's
+tail was 1.200; the identical-architecture Muon incumbent measures
+**1.859** — the recipe change alone moved the trajectory statistic
+past the 1.60 bar the entire mechanism series was held to. Part of
+the "constant-speed deficiency" the program set out to fix was an
+optimizer artifact. Any future trajectory claim must state its
+recipe, and the phase-0/2 constant-speed measurements carry an
+AdamW caveat in the writeup.

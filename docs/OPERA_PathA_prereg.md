@@ -315,3 +315,26 @@ gate on); the bistable arms (falsified); byte-level representation
 (§5.1's adoption rule settled it; token-matched §4.8 comparability);
 `mem_mode='delta'` (implemented and selftested but never validated —
 a post-study arm, not something to smuggle into a 3-week commit).
+
+**2026-09-12 — architecture-gate outcomes: both candidates measured,
+neither adopted; the plain OPERA arm stands.** Two pre-registered
+validation studies ran on the byte rung under the incumbent recipe
+before any GPU training (amendments of 2026-09-09 named them as the
+only candidates considered):
+
+- **Level-conditioned compose weights (OPEN 5b, r=8):** LC-H1 FAIL —
+  extrapolation improved 1.267% against a ≥2% bar (BPB improved
+  0.32%; mechanism heavily used, deltas 18–62% of ‖W‖ growing with
+  depth). Not adopted. Full record: `OPERA_LevelCond_prereg.md`.
+- **Over-relaxation under Muon:** RM-H2 FAIL — extrapolation 2.96%
+  worse, BPB 2.52% worse (RM-H1's tail effect did survive: 1.958 vs
+  1.833 control). Not adopted. Full record:
+  `OPERA_Relax_prereg.md` Addendum 2.
+
+Protocol consequence: the OPERA arm is the plain architecture with
+the 2026-09-09 recipe amendments (fusion_gate routing + wd + the
+Session-2 sweep). The scale-tying question is closed at this rung
+with three falsifications (β^ℓ, LO-Muon, level-conditioning) and one
+constructive observation (the operator *wants* depth-dependent
+structure — deltas grow with level — even though providing it does
+not yet pay); both go to the paper, not to Path A's arms.
