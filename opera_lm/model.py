@@ -359,12 +359,56 @@ def level_capture_dict():
     return _LEVEL_CAPTURE
 
 
-def _maybe_capture_w(W, layer_idx, level_idx):
+def _maybe_capture_w(W, layer_idx, level_idx, name='fusion_gate'):
     """Wrap the compose node's fusion weight for the current level."""
     if level_idx is not None and _LEVEL_CAPTURE is not None:
         return _LevelCapture.apply(
-            W, (f'fusion_gate.{layer_idx}.weight', level_idx))
+            W, (f'{name}.{layer_idx}.weight', level_idx))
     return W
+
+
+def _decay_scan(a, b):
+    """Inclusive linear recurrence M_t = a_t * M_{t-1} + b_t over dim 1,
+    WORK-EFFICIENT (Blelloch-style up-sweep / down-sweep over a binary
+    tree -- the same pattern as the downsweep fold): ~2T elementwise work
+    instead of Hillis-Steele's T log T. Pairs combine as (A2 A1,
+    A2 B1 + B2) (earlier, later). a is kept narrow and broadcast against b
+    (e.g. a [B,T,n,1], b [B,T,n,4]). T is padded to a power of two with
+    identity elements (a=1, b=0). Exact up to float reassociation
+    (selftest: equals the naive recurrence)."""
+    T = b.shape[1]
+    P = 1 << max(T - 1, 1).bit_length()
+    if P != T:
+        a = torch.cat([a, a.new_ones(a.shape[0], P - T, *a.shape[2:])], 1)
+        b = torch.cat([b, b.new_zeros(b.shape[0], P - T, *b.shape[2:])], 1)
+    As, Bs = [a], [b]
+    while As[-1].shape[1] > 1:
+        A, Bv = As[-1], Bs[-1]
+        A1, A2, B1, B2 = A[:, 0::2], A[:, 1::2], Bv[:, 0::2], Bv[:, 1::2]
+        As.append(A2 * A1)
+        Bs.append(A2 * B1 + B2)
+    PA, PB = As[-1], Bs[-1]
+    for k in range(len(As) - 2, -1, -1):
+        A, Bv = As[k], Bs[k]
+        evB = torch.cat([Bv[:, :1], A[:, 2::2] * PB[:, :-1] + Bv[:, 2::2]], 1)
+        PB_new = torch.stack([evB, PB], 2).reshape(Bv.shape)
+        if k > 0:
+            evA = torch.cat([A[:, :1], A[:, 2::2] * PA[:, :-1]], 1)
+            PA = torch.stack([evA, PA], 2).reshape(A.shape)
+        PB = PB_new
+    return PB[:, :T]
+
+
+def quat_mul_conj_a(a, b):
+    """conj(a) (x) b per block without materializing conj(a) -- the
+    holographic unbinding (one fewer full-size copy than
+    quat_mul(quat_conj(a), b))."""
+    aw, ax, ay, az = a[..., 0], a[..., 1], a[..., 2], a[..., 3]
+    bw, bx, by, bz = b[..., 0], b[..., 1], b[..., 2], b[..., 3]
+    return torch.stack([aw * bw + ax * bx + ay * by + az * bz,
+                        aw * bx - ax * bw - ay * bz + az * by,
+                        aw * by + ax * bz - ay * bw - az * bx,
+                        aw * bz - ax * by + ay * bx - az * bw], dim=-1)
 
 
 def level_sin_features(level, r, device, dtype):
@@ -411,10 +455,182 @@ class OperaSpinorFenwickTree(nn.Module):
                  readout_mode='none', readout_max_slots=16,
                  mem_mode='none', mem_dim=128, homeo_mode='off',
                  node_paths=3, fold_adapt='off', fold_bistable='off',
-                 bist_rank=0, fold_relax='off',
-                 level_grad_balance=1.0, level_cond_rank=0):
+                 bist_rank=0, fold_relax='off', fold_grade=None,
+                 level_grad_balance=1.0, level_cond_rank=0,
+                 head_mode='fold', resid_mode='blend', fold_gate='shared',
+                 fold_h0=False, state_mult=1, state_tie=False,
+                 node_mix_rank=0, fold_innov_rank=0, tree_disent_rank=0,
+                 fold_impl='compact', lowrank_gain=False, fold_dir='left',
+                 future_bag=None, resid_init_scale=None, hmem_nb=0,
+                 hmem_decay='none', hmem_conv=0):
         super().__init__()
         assert d == 4 * nb, f"d must equal 4*nb (got d={d}, nb={nb})"
+        # STREAM / TREE-WIDTH ARMS (architecture review 2026-09-24; draft
+        # prereg docs/OPERA_Stream_prereg.md). All defaults reproduce the
+        # incumbent bitwise.
+        #   head_mode='stream': the LM head reads LN(current) -- the
+        #     residual stream AFTER each layer's blend -- instead of the
+        #     fold output. Flags-off, the last layer's cross_mlp and
+        #     blend_gate feed nothing (34% of the L=2 incumbent's params
+        #     receive no gradient); 'stream' makes them live.
+        #   resid_mode='add': current <- current + cross_mlp(prefix), with
+        #     a pre-norm on each layer's tree input, instead of the convex
+        #     scalar blend (G1: prod(1-g) = 0.02 at L=8). Requires 'stream'
+        #     (otherwise the last layer's MLP is dead again).
+        #   fold_gate='separate': the left fold gets its own fusion gate,
+        #     INITIALIZED AS A COPY of the tree gate (bitwise incumbent at
+        #     init, no RNG consumed). The tree composes equal-span siblings
+        #     at one level; the fold composes a large accumulator with a
+        #     small block, scales mixed within a call.
+        #   fold_h0=True: every position's left fold starts from a learned
+        #     per-layer accumulator h0 (zero-init), so no readout is a raw
+        #     tree node (F6's zero-fold positions) and graded groups get a
+        #     trained neutral start instead of zeros. +T compositions/layer.
+        #   state_mult=k>1: the tree/fold run at width k*d (k*nb quaternion
+        #     slots) behind per-layer in/out projections; embedding, head,
+        #     cross_mlp and the stream stay at d. The per-prefix state is
+        #     k*d numbers (review item 4: the value path never moves content
+        #     between slots, so state width is the capacity knob).
+        assert head_mode in ('fold', 'stream')
+        assert resid_mode in ('blend', 'add')
+        assert resid_mode == 'blend' or head_mode == 'stream', \
+            "resid_mode='add' needs head_mode='stream' (else the last " \
+            "layer's cross_mlp feeds nothing)"
+        assert fold_gate in ('shared', 'separate')
+        assert int(state_mult) == state_mult and state_mult >= 1
+        state_mult = int(state_mult)
+        for _flag, _on in (('fold_gate', fold_gate != 'shared'),
+                           ('fold_h0', bool(fold_h0)),
+                           ('state_mult', state_mult > 1)):
+            if _on:
+                assert fold_mode == 'left', \
+                    f"{_flag} is implemented for the left fold"
+        if state_mult > 1:
+            assert (readout_mode == 'none' and mem_mode == 'none'
+                    and homeo_mode == 'off' and node_paths == 3
+                    and fold_adapt == 'off' and fold_bistable == 'off'
+                    and fold_relax == 'off' and level_cond_rank == 0
+                    and not fold_scale and fold_rotors == 'shared'), \
+                "state_mult > 1 supports the plain left fold (+ fold_grade, " \
+                "fold_gate_bias, fold_gate, fold_h0) only"
+        # state_tie=True (needs state_mult=k>1): the k copies of each
+        #   quaternion slot SHARE the slot's gates and rotations -- the
+        #   fusion gate emits 3*nb (not 3*k*nb) channels, tiled k times,
+        #   and the rotors are tiled likewise. State grows k-fold while
+        #   the gate's output width stays the incumbent's (its input is
+        #   the k*d tree state, so its cost grows k-fold, not k^2).
+        #   Motivation: M2RNN (arXiv 2603.14360) -- state size, not
+        #   non-linearity, is the capacity knob.
+        # node_mix_rank=r>0: identity-initialized low-rank cross-slot
+        #   value mixing inside the compose node, parent <- parent +
+        #   (parent @ V) @ U^T before the node norm, U zero-init. The
+        #   incumbent node never moves values between slots (Jacobian:
+        #   54-77% block-diagonal energy); MLP-LDRU (arXiv 2605.26035)
+        #   shows gated-sum operators at 67.1% vs 100% with full
+        #   identity-init value projections. U = 0 -> bitwise incumbent
+        #   at init, dL/dU != 0 (interior, no cold gate).
+        assert not state_tie or state_mult > 1, \
+            "state_tie shares gates across state_mult copies; needs " \
+            "state_mult > 1"
+        # fold_innov_rank=r>0 (INNOVATION FOLD, predictive coding at the
+        #   fold; docs/OPERA_Redundancy_Research_2026-09-24.md §4 2a):
+        #   before each left-fold compose, acc <- acc - (nxt @ V) @ U^T --
+        #   remove from the old-content accumulator the part the newer
+        #   block already predicts, so the parent does not store it twice
+        #   and single-copy old content (measured: 4.6 bits in its block,
+        #   0 after the fold) has room. U zero-init: bitwise incumbent at
+        #   init, interior (dL/dU != 0).
+        # tree_disent_rank=r>0 (CAUSAL DISENTANGLER, MERA; §4 2b): at every
+        #   tree level, node_j <- node_j + (node_{j-1} @ V) @ U^T using the
+        #   RAW left neighbour (no chain). Causal: every prefix that reads
+        #   node j already covers node j-1's span; append-only: node j-1
+        #   exists when node j completes. U zero-init: bitwise at init.
+        # fold_impl='downsweep': the SAME left fold for every prefix,
+        #   computed top-down over the tree (Blelloch-style downsweep, cf.
+        #   Prefix-Scannable Models, arXiv 2506.10918): E_k[2j] = E_{k+1}[j],
+        #   E_k[2j+1] = compose(E_{k+1}[j], node_k[2j]). Every prefix's chain
+        #   of composes is identical to the compacted fold's, but shared
+        #   across prefixes: ~T composes per layer instead of
+        #   sum(popcount-1) (~(T/2) log T; 4097 -> ~1013 at T=1024).
+        #   Equal to 'compact' up to float reassociation in batched GEMMs.
+        assert fold_impl in ('compact', 'downsweep')
+        if fold_impl == 'downsweep':
+            assert fold_mode == 'left', "downsweep computes the left fold"
+            assert (fold_grade in (None, 'off', '') and not fold_h0
+                    and fold_bistable == 'off' and fold_relax == 'off'
+                    and readout_mode == 'none' and not fold_scale
+                    and fold_adapt == 'off' and fold_rotors == 'shared'), \
+                "fold_impl='downsweep' supports the plain left fold " \
+                "(+ fold_gate_bias, fold_gate, fold_innov_rank) for now"
+        self.fold_impl = fold_impl
+        assert fold_innov_rank >= 0 and tree_disent_rank >= 0
+        if fold_innov_rank:
+            assert fold_mode == 'left', \
+                "fold_innov_rank is implemented for the left fold"
+        if tree_disent_rank:
+            assert fold_mode != 'scan', \
+                "tree_disent_rank acts on tree levels; scan builds none"
+        # lowrank_gain=True: the three low-rank corrections (node_mix,
+        #   fold_innov, tree_disent) become gain * (x V) U^T / (|U| |V|):
+        #   U, V random (their DIRECTION is learned, Muon-friendly), a
+        #   per-layer scalar gain starts at 0 (AdamW) -> bitwise incumbent
+        #   at init; the map is normalized so that `gain` is the typical
+        #   relative size of the correction (see _lowrank_corr).
+        #   Motivation (measured 2026-09-24): with U zero-init routed to
+        #   Muon (fixed-size orthogonalized steps, x2.8 tall-matrix scale),
+        #   the corrections grew to 1.3x (innov), 6.6x (disent) and 30x
+        #   (node_mix) the size of their inputs and all three arms lost
+        #   1.3-7.7% BPB -- a learning-rate artifact, not a mechanism test.
+        self.lowrank_gain = bool(lowrank_gain)
+        # fold_dir='both' (COUNTERCLOCKWISE FOLD; path splitting after
+        #   Chakaravarthy et al., arXiv 1602.04478: traverse the path both
+        #   ways and join at the boundary). The left fold
+        #   ((B1 o B2) o B3) o B4 composes the oldest block first and
+        #   squashes it through every later compose (measured: its
+        #   single-copy content 4.6 bits in-block -> 0 after the fold). The
+        #   right fold B1 o (B2 o (B3 o B4)) composes the newest blocks
+        #   first and joins the oldest LAST. Readout: P = P_left + gain (.)
+        #   P_right, gain a per-slot vector, zero-init, AdamW (1-D) ->
+        #   bitwise incumbent at init; every block gets a short path to
+        #   the readout from one side. Cost: the right fold has no shared
+        #   structure across prefixes (sum(popcount-1) composes, like the
+        #   compacted left fold).
+        assert fold_dir in ('left', 'both')
+        if fold_dir == 'both':
+            assert fold_mode == 'left' and fold_grade in (None, 'off', '') \
+                and not fold_h0 and readout_mode == 'none', \
+                "fold_dir='both' is implemented for the plain left fold"
+        self.fold_dir = fold_dir
+        # future_bag=(W, K): TRAINING-ONLY auxiliary head (never used by
+        #   forward(); inference and the decoder are unchanged). From each
+        #   position's final head input it predicts the distribution of
+        #   hashed byte-trigrams (K buckets) in the next W bytes
+        #   (opera_lm.losses.future_bag_loss). Motivation: next-byte loss
+        #   barely rewards far context (MI curve flat beyond ~100 bytes),
+        #   while 11% of 8-byte continuations recur only >100 bytes back;
+        #   the past-future MI grows with the future window (L2M), so a
+        #   window-level target pays the state to keep content that will
+        #   recur.
+        self.future_bag = tuple(future_bag) if future_bag else None
+        assert node_mix_rank >= 0
+        if node_mix_rank:
+            assert fold_mode != 'scan', \
+                "node_mix_rank mixes the compose node; scan builds none"
+        self.head_mode = head_mode
+        self.resid_mode = resid_mode
+        self.state_mult = state_mult
+        self.state_tie = bool(state_tie)
+        self.node_mix_rank = int(node_mix_rank)
+        # d_model/nb_model: the stream width (embedding, head, cross_mlp).
+        # d/nb from here on: the TREE width, which is what every compose /
+        # fold / rotation code path reads as self.d / self.nb.
+        d_model, nb_model = d, nb
+        d, nb = d * state_mult, nb * state_mult
+        self.d_model, self.nb_model = d_model, nb_model
+        # nb_gate: slots with their OWN gates/rotors (== nb unless
+        # state_tie, where the state_mult copies of a slot share them).
+        nb_gate = nb_model if state_tie else nb
+        self.nb_gate = nb_gate
         assert lock_mode in ('none', 'interference')
         assert pe_mode in ('sin', 'none', 'rotor')
         assert rot_mode in ('so3', 'free')
@@ -492,6 +708,31 @@ class OperaSpinorFenwickTree(nn.Module):
             assert fold_bistable == 'off', \
                 "fold_relax and fold_bistable both rewrite the fold " \
                 "accumulator; enabling both makes attribution impossible"
+        # SCALE-GRADED READOUT (docs/OPERA_ScaleGraded_prereg.md, REGISTERED
+        # 2026-09-13): slot-partitioned fold accumulator. Slots [0,R) keep
+        # the classical fold over ALL path blocks; slots [R,nb) are divided
+        # into G equal groups and a level-l block composes only into
+        # group min(l, G-1). Routing only -- zero new parameters, compose
+        # node untouched (the fusion gate still conditions on the full 2d
+        # input; only the accumulator WRITE is masked per slot). NOT
+        # bitwise-incumbent at init: the information topology differs from
+        # step 0 by design; the control is the incumbent architecture.
+        if fold_grade not in (None, 'off', ''):
+            if isinstance(fold_grade, str):
+                parts = fold_grade.split(',')
+                assert len(parts) == 2, \
+                    "--fold-grade expects 'R,G' (e.g. '24,8')"
+                R_g, G_g = int(parts[0]), int(parts[1])
+            else:
+                R_g, G_g = fold_grade
+            assert fold_mode == 'left', \
+                "fold_grade is implemented for the left fold"
+            assert 0 <= R_g < nb and G_g >= 1 and (nb - R_g) % G_g == 0, \
+                f"fold_grade needs 0 <= R < nb and (nb-R) % G == 0 " \
+                f"(got R={R_g}, G={G_g}, nb={nb})"
+            self.fold_grade = (R_g, G_g)
+        else:
+            self.fold_grade = None
         assert fold_bistable in ('off', 'mono', 'bi')
         if fold_bistable != 'off':
             assert fold_mode == 'left', \
@@ -552,18 +793,18 @@ class OperaSpinorFenwickTree(nn.Module):
         self.tie = tie
         self.dropout = dropout
 
-        self.word_emb = nn.Embedding(vocab_size, d, padding_idx=0)
+        self.word_emb = nn.Embedding(vocab_size, d_model, padding_idx=0)
 
         if tie:
             # Tied head + THE INIT FIX. Tying a N(0,1) embedding straight
             # into the head gives initial logits of magnitude ~sqrt(d)
             # (v6.7 confound; v7.2 init PPL 3.9e42). A learned scalar
             # logit_scale init 1/sqrt(d) restores initial loss ~ ln(V).
-            self.head = nn.Linear(d, vocab_size, bias=False)
+            self.head = nn.Linear(d_model, vocab_size, bias=False)
             self.head.weight = self.word_emb.weight
-            self.logit_scale = nn.Parameter(torch.tensor(d ** -0.5))
+            self.logit_scale = nn.Parameter(torch.tensor(d_model ** -0.5))
         else:
-            self.head = nn.Linear(d, vocab_size)
+            self.head = nn.Linear(d_model, vocab_size)
             self.logit_scale = None
 
         if fold_mode == 'scan':
@@ -572,7 +813,7 @@ class OperaSpinorFenwickTree(nn.Module):
             self.quat = None
             self.rot_free = None
         elif rot_mode == 'so3':
-            q_init = torch.zeros(num_layers, 3, nb, 4)
+            q_init = torch.zeros(num_layers, 3, nb_gate, 4)
             q_init[..., 0] = 1.0
             q_init += torch.randn_like(q_init) * 0.1
             self.quat = nn.Parameter(q_init)
@@ -581,7 +822,7 @@ class OperaSpinorFenwickTree(nn.Module):
             # --rot free (r15): unconstrained 3x3 per block per role per
             # layer. Init identity + 0.1 noise -- near-identity like the
             # so3 init, so the two arms start in comparable regimes.
-            m_init = torch.eye(3).expand(num_layers, 3, nb, 3, 3).clone()
+            m_init = torch.eye(3).expand(num_layers, 3, nb_gate, 3, 3).clone()
             m_init += torch.randn_like(m_init) * 0.1
             self.rot_free = nn.Parameter(m_init)
             self.quat = None
@@ -638,7 +879,7 @@ class OperaSpinorFenwickTree(nn.Module):
             self.block_gain = None
         else:
             self.fusion_gate = nn.ModuleList(
-                [nn.Linear(2 * d, 3 * nb)
+                [nn.Linear(2 * d, 3 * nb_gate)
                  for _ in range(num_layers)])
             if norm_mode == 'layer':
                 self.comp_norm = nn.ModuleList([nn.LayerNorm(d) for _ in range(num_layers)])
@@ -733,16 +974,82 @@ class OperaSpinorFenwickTree(nn.Module):
             self.scan_norm = None
 
         self.cross_mlp = nn.ModuleList([
-            nn.Sequential(nn.Linear(d, d * 2), nn.GELU(), nn.Linear(d * 2, d))
+            nn.Sequential(nn.Linear(d_model, d_model * 2), nn.GELU(),
+                          nn.Linear(d_model * 2, d_model))
             for _ in range(num_layers)
         ])
-        self.blend_gate = nn.ModuleList([
-            nn.Sequential(nn.Linear(d, d // 4), nn.GELU(), nn.Linear(d // 4, 1), nn.Sigmoid())
-            for _ in range(num_layers)
-        ])
+        # resid_init_scale: multiply each cross_mlp output projection by
+        #   this factor at init ('auto' = 1/sqrt(2L), GPT-2's residual
+        #   scaling) and zero its bias. Measured at L=8 (float64 perturbation
+        #   growth per layer): blend/default 4.84x, add/default 1.38x,
+        #   add + 1/sqrt(2L) 1.05x -- the deep stack is expansive without
+        #   it (d8 runs: loss spike at peak LR, +38..49% BPB). In-place
+        #   multiply: no RNG consumed; None = incumbent bitwise.
+        if resid_init_scale is not None:
+            sc = ((2.0 * num_layers) ** -0.5 if resid_init_scale == 'auto'
+                  else float(resid_init_scale))
+            with torch.no_grad():
+                for mlp in self.cross_mlp:
+                    mlp[-1].weight.mul_(sc)
+                    mlp[-1].bias.zero_()
+        self.resid_init_scale = resid_init_scale
+        # hmem_nb=n>0: QUATERNION HOLOGRAPHIC MEMORY (in-context recall;
+        #   docs/OPERA_Recall_Research_2026-09-24.md §4/§4a/§5a). Per layer,
+        #   n quaternion slots. Write at every position i: bind the unit
+        #   key of the PREVIOUS token with the value of the current token,
+        #   key_{i-1} (x) value_i (Hamilton product -- non-commutative, so
+        #   "B followed A" != "A followed B"), scaled by a learned write
+        #   gate, and superpose by a running sum (exact, O(T); a sum needs
+        #   no tree). Read at position t: unbind with the conjugate of the
+        #   current token's unit key, conj(key_t) (x) M_t -- a value bound
+        #   to a matching key returns exactly, others as rotated noise
+        #   (geometric analogue of holographic reduced representations,
+        #   Aerts/Czachor/De Moor 2009; redundancy across slots as in
+        #   Associative LSTM, Danihelka et al. 2016). No scores, no softmax.
+        #   Output: LayerNorm -> projection -> scalar gain (zero-init,
+        #   AdamW) added to the fold readout: bitwise incumbent at init.
+        #   Motivation: MQAR at chance (1/512) for the fold, pipeline
+        #   control 100%.
+        assert hmem_nb >= 0
+        self.hmem_nb = int(hmem_nb)
+        # hmem_decay (docs/OPERA_Recall_Research_2026-09-24.md §5d): the
+        #   plain running sum accumulates interference (measured ~670
+        #   effective writes per 1024 bytes; SNR ~ sqrt(slots/items)).
+        #   'fixed': M_t = lambda_s M_{t-1} + update, lambda_s learnable per
+        #     slot (1-D -> AdamW), half-lives spread geometrically 8..4096
+        #     bytes (RetNet multi-scale decay; TODAM forgetting coefficient).
+        #   'gated': lambda_{t,s} = sigmoid(W_f x_t + b_s) with W_f zero-init
+        #     and b_s = the same spread -> identical to 'fixed' at init;
+        #     forgetting can then depend on content (Associative LSTM's
+        #     forget gate on the holographic memory; GLA/Mamba).
+        assert hmem_decay in ('none', 'fixed', 'gated')
+        assert hmem_decay == 'none' or hmem_nb > 0
+        self.hmem_decay = hmem_decay
+        # hmem_conv=K>0 (docs/OPERA_Recall_Research_2026-09-24.md §7): a
+        #   causal depthwise convolution of width K with residual over the
+        #   memory's raw projection (keys, values, write/forget logits):
+        #   y_t <- y_t + sum_j c_j * y_{t-j}, j = 0..K-1 (Canon layer,
+        #   Allen-Zhu 2025, position B; the short conv of H3 / Mamba /
+        #   Based). Keys then describe the last K positions instead of one:
+        #   at layer 0 a single byte has only 256 possible keys. Zero-init
+        #   taps (AdamW) -> identical to the memory without it at init.
+        assert hmem_conv >= 0 and (hmem_conv == 0 or hmem_nb > 0)
+        self.hmem_conv = int(hmem_conv)
+        if resid_mode == 'blend':
+            self.blend_gate = nn.ModuleList([
+                nn.Sequential(nn.Linear(d_model, d_model // 4), nn.GELU(),
+                              nn.Linear(d_model // 4, 1), nn.Sigmoid())
+                for _ in range(num_layers)
+            ])
+        else:
+            # resid_mode='add': no blend gate (it would be a dead module).
+            # Not RNG-identical to the incumbent from here on -- 'add' is
+            # a different arm, never claimed bitwise.
+            self.blend_gate = None
 
         self._fenwick_cache = {}
         self._rot_dense_cache = {}
+        self._grade_mask_cache = {}
 
         # --fold attend (v8.0): q/k projections for the block-attention
         # readout. Created LAST so every shared module above consumes the
@@ -999,7 +1306,7 @@ class OperaSpinorFenwickTree(nn.Module):
             assert len(fold_gate_bias) == 3, \
                 "--gate-bias takes 3 values: b0,b1,b2"
             b0, b1, b2 = (float(x) for x in fold_gate_bias)
-            gb_init = torch.empty(num_layers, 3, nb)
+            gb_init = torch.empty(num_layers, 3, nb_gate)
             gb_init[:, 0, :] = b0
             gb_init[:, 1, :] = b1
             gb_init[:, 2, :] = b2
@@ -1258,11 +1565,161 @@ class OperaSpinorFenwickTree(nn.Module):
         else:
             self.quotient_gate = None
 
+        # STREAM / TREE-WIDTH ARMS (see the constructor head). Created
+        # LAST (RNG-stream rule); the deterministic ones first so that
+        # combining them never shifts the random draws of state_mult's
+        # projections.
+        # head_mode='stream': one LayerNorm per layer on the post-blend
+        # stream (per-layer so aux heads read their own layer's stream).
+        self.stream_norm = (nn.ModuleList(
+            [nn.LayerNorm(d_model) for _ in range(num_layers)])
+            if head_mode == 'stream' else None)
+        # resid_mode='add': pre-norm on each layer's tree input (the
+        # additive stream's norm grows with depth; the tree's leaves
+        # should not).
+        self.tree_in_norm = (nn.ModuleList(
+            [nn.LayerNorm(d_model) for _ in range(num_layers)])
+            if resid_mode == 'add' else None)
+        # fold_gate='separate': a copy of the tree gate (no RNG consumed;
+        # bitwise incumbent at init, then free to specialize).
+        if fold_gate == 'separate':
+            self.fusion_gate_fold = nn.ModuleList()
+            for fg in self.fusion_gate:
+                g = nn.Linear(2 * d, 3 * nb_gate)
+                with torch.no_grad():
+                    g.weight.copy_(fg.weight)
+                    g.bias.copy_(fg.bias)
+                self.fusion_gate_fold.append(g)
+        else:
+            self.fusion_gate_fold = None
+        # fold_h0: per-layer learned initial fold accumulator, zero-init.
+        # A ParameterList of 1-D tensors on purpose: split_muon_params
+        # routes by ndim, and a [L, d] matrix would be orthogonalized.
+        self.fold_h0 = (nn.ParameterList(
+            [nn.Parameter(torch.zeros(d)) for _ in range(num_layers)])
+            if fold_h0 else None)
+        # state_mult: leaves = tree_in(x) [d_model -> d], readout =
+        # tree_out(prefix) [d -> d_model]. Variance-preserving init
+        # (std fan_in^-1/2): leaves start at the incumbent's unit scale.
+        if state_mult > 1:
+            self.tree_in = nn.ModuleList(
+                [nn.Linear(d_model, d, bias=False) for _ in range(num_layers)])
+            self.tree_out = nn.ModuleList(
+                [nn.Linear(d, d_model, bias=False) for _ in range(num_layers)])
+            with torch.no_grad():
+                for ti, to in zip(self.tree_in, self.tree_out):
+                    ti.weight.normal_(0.0, d_model ** -0.5)
+                    to.weight.normal_(0.0, d ** -0.5)
+        else:
+            self.tree_in = None
+            self.tree_out = None
+        # node_mix_rank: parent += (parent @ V) @ U^T, U zero-init (bitwise
+        # incumbent at init), V variance-preserving. Created after every
+        # other parameter (RNG-stream rule).
+        def _lowrank(r):
+            down = nn.ParameterList(
+                [nn.Parameter(torch.randn(d, r) * d ** -0.5)
+                 for _ in range(num_layers)])
+            if lowrank_gain:
+                up = nn.ParameterList(
+                    [nn.Parameter(torch.randn(d, r) * d ** -0.5)
+                     for _ in range(num_layers)])
+                gain = nn.ParameterList(
+                    [nn.Parameter(torch.zeros(())) for _ in range(num_layers)])
+            else:
+                up = nn.ParameterList(
+                    [nn.Parameter(torch.zeros(d, r))
+                     for _ in range(num_layers)])
+                gain = None
+            return down, up, gain
+        # fold_dir='both': per-slot join gain for the right fold (zeros ->
+        # bitwise incumbent; deterministic, no RNG consumed).
+        self.fold_join_gain = (nn.ParameterList(
+            [nn.Parameter(torch.zeros(nb)) for _ in range(num_layers)])
+            if fold_dir == 'both' else None)
+        # future_bag head (training-only); after the RNG-consuming modules
+        # above so every forward-path parameter is the incumbent's.
+        self.future_head = None
+        if node_mix_rank:
+            self.node_mix_down, self.node_mix_up, self.node_mix_gain = \
+                _lowrank(node_mix_rank)
+        else:
+            self.node_mix_down = self.node_mix_up = self.node_mix_gain = None
+
+        # INNOVATION FOLD / CAUSAL DISENTANGLER low-rank maps (U zero-init
+        # -> bitwise incumbent; V variance-preserving; or the lowrank_gain
+        # form). Created LAST.
+        self.fold_innov_down, self.fold_innov_up, self.fold_innov_gain = (
+            _lowrank(fold_innov_rank) if fold_innov_rank else (None,) * 3)
+        self.tree_disent_down, self.tree_disent_up, self.tree_disent_gain = (
+            _lowrank(tree_disent_rank) if tree_disent_rank else (None,) * 3)
+        if self.future_bag is not None:
+            self.future_head = nn.Linear(d_model, self.future_bag[1])
+        # hmem: created LAST (RNG-stream rule) -- every other parameter is
+        # the incumbent's at the same seed. Names: '*_gate' and '*_gain'
+        # route to AdamW; the three projections are ordinary matrices.
+        if self.hmem_nb:
+            D = 4 * self.hmem_nb
+            self.hmem_k = nn.ModuleList(
+                [nn.Linear(d_model, D, bias=False) for _ in range(num_layers)])
+            self.hmem_v = nn.ModuleList(
+                [nn.Linear(d_model, D, bias=False) for _ in range(num_layers)])
+            self.hmem_o = nn.ModuleList(
+                [nn.Linear(D, d_model, bias=False) for _ in range(num_layers)])
+            self.hmem_write_gate = nn.ModuleList(
+                [nn.Linear(d_model, 1) for _ in range(num_layers)])
+            with torch.no_grad():
+                for wg in self.hmem_write_gate:
+                    wg.bias.fill_(2.0)            # write ~0.88 at init
+            self.hmem_norm = nn.ModuleList(
+                [nn.LayerNorm(D) for _ in range(num_layers)])
+            self.hmem_gain = nn.ParameterList(
+                [nn.Parameter(torch.zeros(())) for _ in range(num_layers)])
+            # decay: deterministic init (no RNG): half-lives 8..4096 bytes
+            n = self.hmem_nb
+            hl = 8.0 * (512.0 ** (torch.arange(n, dtype=torch.float32)
+                                   / max(n - 1, 1)))
+            lam = 0.5 ** (1.0 / hl)
+            logit = torch.log(lam) - torch.log1p(-lam)
+            self.hmem_decay_logit = (nn.ParameterList(
+                [nn.Parameter(logit.clone()) for _ in range(num_layers)])
+                if self.hmem_decay != 'none' else None)
+            if self.hmem_decay == 'gated':
+                self.hmem_forget_gate = nn.ModuleList(
+                    [nn.Linear(d_model, n, bias=False)
+                     for _ in range(num_layers)])
+                with torch.no_grad():
+                    for fg in self.hmem_forget_gate:
+                        fg.weight.zero_()
+            else:
+                self.hmem_forget_gate = None
+        else:
+            self.hmem_decay_logit = self.hmem_forget_gate = None
+            self.hmem_k = self.hmem_v = self.hmem_o = None
+            self.hmem_write_gate = self.hmem_norm = self.hmem_gain = None
+        # hmem_conv taps [C, K] per layer, zero-init (deterministic, no RNG),
+        # created after everything else; C = the raw projection's channels.
+        if self.hmem_conv:
+            C = 8 * self.hmem_nb + 1 + (self.hmem_nb if self.hmem_decay == 'gated' else 0)
+            self.hmem_conv_w = nn.ParameterList(
+                [nn.Parameter(torch.zeros(C, self.hmem_conv))
+                 for _ in range(num_layers)])
+        else:
+            self.hmem_conv_w = None
+
     def apply_head(self, h):
         logits = self.head(h)
         if self.logit_scale is not None:
             logits = logits * self.logit_scale
         return logits
+
+    def node_readout(self, h, layer_idx):
+        """Map tree-width node states [..., d] to the head's input width
+        (msup reads tree nodes through the head). Identity unless
+        state_mult > 1, where it applies the layer's out-projection."""
+        if self.tree_out is None:
+            return h
+        return self.tree_out[layer_idx](h)
 
     def get_rotations(self, layer_idx, fold=False):
         if self.rot_mode == 'free':
@@ -1270,12 +1727,17 @@ class OperaSpinorFenwickTree(nn.Module):
                    if (fold and self.rot_free_fold is not None)
                    else self.rot_free)
             M = src[layer_idx]
-            return M[0], M[1], M[2]
-        src = self.quat_fold if (fold and self.quat_fold is not None) else self.quat
-        q = src[layer_idx]
-        q = q / (q.norm(dim=-1, keepdim=True) + 1e-8)
-        R = quat_to_rotmat(q)
-        return R[0], R[1], R[2]
+        else:
+            src = (self.quat_fold if (fold and self.quat_fold is not None)
+                   else self.quat)
+            q = src[layer_idx]
+            q = q / (q.norm(dim=-1, keepdim=True) + 1e-8)
+            M = quat_to_rotmat(q)
+        if self.state_tie:
+            # state_tie: the state_mult copies of each slot share its
+            # rotor (copy-major slot layout: tree slot c*nb_gate + j).
+            M = M.repeat(1, self.state_mult, 1, 1)
+        return M[0], M[1], M[2]
 
     def _dense_rot(self, R):
         """Block-diagonal dense form M of the per-block 3x3 rotation R
@@ -1329,7 +1791,8 @@ class OperaSpinorFenwickTree(nn.Module):
     def _compose(self, h_left, h_right, layer_idx, R_L, R_R, R_O,
                  gate_scale=1.0,
                  gate_bias=None,
-                 level_idx=None):
+                 level_idx=None,
+                 fold=False):
         """compose_pair_batch, optionally under activation checkpointing:
         backward recomputes the node's ~18 intermediates from its two
         inputs instead of storing them (~25-35% slower steps for a
@@ -1338,22 +1801,29 @@ class OperaSpinorFenwickTree(nn.Module):
         fold's chrono init; None reproduces the incumbent node exactly.
         level_idx: the tree level this call composes (1 = span-2 nodes);
         consumed only by the level-capture registry (LO-Muon router /
-        kill-switch instrument), never by the math."""
+        kill-switch instrument), never by the math.
+        fold: this call is a fold transport compose -- selects the fold's
+        own fusion gate when fold_gate='separate' (else identical)."""
         if self.grad_checkpoint == 'level' and self.training:
             from torch.utils.checkpoint import checkpoint
             return checkpoint(self.compose_pair_batch, h_left, h_right,
                               layer_idx, R_L, R_R, R_O, gate_bias,
-                              gate_scale, level_idx, use_reentrant=False)
+                              gate_scale, level_idx, fold,
+                              use_reentrant=False)
         return self.compose_pair_batch(h_left, h_right, layer_idx,
                                        R_L, R_R, R_O, gate_bias,
-                                       gate_scale, level_idx)
+                                       gate_scale, level_idx, fold)
 
     def compose_pair_batch(self, h_left, h_right, layer_idx, R_L, R_R, R_O,
-                           gate_bias=None, gate_scale=1.0, level_idx=None):
+                           gate_bias=None, gate_scale=1.0, level_idx=None,
+                           fold=False):
         N = h_left.shape[0]
         nb = self.nb
-        gb = (self.fusion_gate[layer_idx].bias if gate_bias is None
-              else gate_bias.reshape(-1))
+        if fold and self.fusion_gate_fold is not None:
+            gmod, gname = self.fusion_gate_fold[layer_idx], 'fusion_gate_fold'
+        else:
+            gmod, gname = self.fusion_gate[layer_idx], 'fusion_gate'
+        gb = gmod.bias if gate_bias is None else gate_bias.reshape(-1)
 
         hl = h_left.reshape(N, nb, 4)
         hr = h_right.reshape(N, nb, 4)
@@ -1370,15 +1840,18 @@ class OperaSpinorFenwickTree(nn.Module):
                 from .triton_kernel import fused_node_triton as fused_node
             else:
                 from .metal_kernel import fused_node
-            W = self.fusion_gate[layer_idx].weight
+            W = gmod.weight
             if self.lc_U is not None and isinstance(level_idx, int):
                 W = W + self._level_delta(layer_idx, level_idx, W)
-            W = _maybe_capture_w(W, layer_idx, level_idx)
+            W = _maybe_capture_w(W, layer_idx, level_idx, gname)
             b = gb
             g = (F.linear(h_left, W[:, :self.d]) +
                  F.linear(h_right, W[:, self.d:]) + b)
-            g = torch.sigmoid(g.reshape(N, 3, nb))
+            g = torch.sigmoid(g.reshape(N, 3, self.nb_gate))
+            if self.state_tie:
+                g = g.repeat(1, 1, self.state_mult)
             parent = fused_node(hl, hr, R_L, R_R, R_O, g).reshape(N, -1)
+            parent = self._node_mix(parent, layer_idx)
             if getattr(self, '_need_locks', False):
                 with torch.no_grad():
                     v_l = hl[..., 1:]; v_r = hr[..., 1:]
@@ -1442,15 +1915,17 @@ class OperaSpinorFenwickTree(nn.Module):
         # tensor written and saved for backward at EVERY node. Chained
         # addmm: (b + h_left@W1^T) + h_right@W2^T in 2 kernel launches
         # (float-op reordering only).
-        W = self.fusion_gate[layer_idx].weight
+        W = gmod.weight
         if self.lc_U is not None and isinstance(level_idx, int):
             W = W + self._level_delta(layer_idx, level_idx, W)
-        W = grad_scale(_maybe_capture_w(W, layer_idx, level_idx),
+        W = grad_scale(_maybe_capture_w(W, layer_idx, level_idx, gname),
                        gate_scale)
         b = grad_scale(gb, gate_scale) if gate_scale != 1.0 else gb
         g = torch.addmm(torch.addmm(b, h_left, W[:, :self.d].t()),
                         h_right, W[:, self.d:].t())
-        g = torch.sigmoid(g.reshape(N, 3, nb))
+        g = torch.sigmoid(g.reshape(N, 3, self.nb_gate))
+        if self.state_tie:
+            g = g.repeat(1, 1, self.state_mult)
         g0, g1, g2 = g[:, 0, :], g[:, 1, :], g[:, 2, :]
 
         if self.lock_mode == 'interference':
@@ -1494,6 +1969,7 @@ class OperaSpinorFenwickTree(nn.Module):
             fv = torch.einsum('kij,nkj->nki', R_O, fv)
 
         parent = torch.cat([fs.unsqueeze(-1), fv], dim=-1).reshape(N, -1)
+        parent = self._node_mix(parent, layer_idx)
         if getattr(self, '_need_energy', False):
             with torch.no_grad():
                 energy_scalar = parent.reshape(N, nb, 4).norm(
@@ -1521,6 +1997,133 @@ class OperaSpinorFenwickTree(nn.Module):
             r = torch.sigmoid(self.res_logit[layer_idx])
             parent = r * parent + (1.0 - r) * 0.5 * (h_left + h_right)
         return parent, lock_scalar, energy_scalar
+
+    def _hmem_parts(self, x, layer_idx):
+        """Unit keys [.., n, 4], values [.., n, 4] and write gate [.., 1]
+        for the holographic memory, from the layer's input stream x."""
+        n = self.hmem_nb
+        # one runtime-concatenated GEMM for k, v and the write gate (the
+        # three modules and the state_dict are unchanged)
+        W = torch.cat([self.hmem_k[layer_idx].weight,
+                       self.hmem_v[layer_idx].weight,
+                       self.hmem_write_gate[layer_idx].weight], 0)
+        bias = torch.cat([W.new_zeros(8 * n),
+                          self.hmem_write_gate[layer_idx].bias], 0)
+        y = F.linear(x, W, bias).float()
+        k = F.normalize(y[..., :4 * n].reshape(*x.shape[:-1], n, 4), dim=-1)
+        v = y[..., 4 * n:8 * n].reshape(*x.shape[:-1], n, 4)
+        w = torch.sigmoid(y[..., 8 * n:])
+        return k, v, w
+
+    def _hmem_proj(self, x, layer_idx, conv=True):
+        """Raw memory projection y [.., C]: keys | values | write logit |
+        forget logits ('gated'), one GEMM; plus the hmem_conv short
+        convolution over the sequence (x: [B, T, d])."""
+        n = self.hmem_nb
+        Ws = [self.hmem_k[layer_idx].weight, self.hmem_v[layer_idx].weight,
+              self.hmem_write_gate[layer_idx].weight]
+        bs = [Ws[0].new_zeros(8 * n), self.hmem_write_gate[layer_idx].bias]
+        if self.hmem_forget_gate is not None:
+            Ws.append(self.hmem_forget_gate[layer_idx].weight)
+            bs.append(Ws[0].new_zeros(n))
+        y = F.linear(x, torch.cat(Ws, 0), torch.cat(bs, 0))
+        if self.hmem_conv and conv:
+            # Metal kernel on MPS, the same op in PyTorch elsewhere
+            from .hmem_kernel import causal_dwconv
+            y = causal_dwconv(y, self.hmem_conv_w[layer_idx])      # taps [C, K]
+        return y
+
+    def _hmem_conv_row(self, y_hist, layer_idx):
+        """Decoder: the convolved projection of the newest position from
+        y_hist [K, C] (row 0 = newest raw projection, zeros before t=0)."""
+        c = self.hmem_conv_w[layer_idx]
+        yf = y_hist.float()
+        return (yf[0] + (c.t() * yf).sum(0)).to(y_hist.dtype)
+
+    def _hmem_out(self, r, layer_idx, dtype):
+        """Retrieved quaternions r [.., n, 4] -> readout contribution."""
+        r = self.hmem_norm[layer_idx](r.reshape(*r.shape[:-2], -1))
+        return (self.hmem_gain[layer_idx]
+                * self.hmem_o[layer_idx](r.to(dtype))).to(dtype)
+
+    def _hmem_read(self, x, layer_idx):
+        """Quaternion holographic memory over the whole sequence, causal.
+        x: [B, T, d_model]. M_t = sum_{i<=t} w_i key_{i-1} (x) value_i;
+        read r_t = conj(key_t) (x) M_t. fp32 inside (running sums)."""
+        if (self.use_metal and x.device.type == 'mps') or self.hmem_conv:
+            # fused Metal kernel (opera_lm/hmem_kernel.py, hmem_fused): one
+            # GEMM for keys / values / write gate / forget gate, then the
+            # kernel reads the raw (bf16) projection and does key
+            # normalization, the sigmoids, bind + decayed superposition +
+            # unbind in one pass, analytic backward -- identical math
+            # (selftest test_hmem_kernel). Off MPS, the same op in PyTorch.
+            from .hmem_kernel import hmem_fused
+            y = self._hmem_proj(x, layer_idx)
+            L = (self.hmem_decay_logit[layer_idx]
+                 if self.hmem_decay_logit is not None else None)
+            r = hmem_fused(y, L, self.hmem_nb, self.hmem_decay)
+            return self._hmem_out(r, layer_idx, x.dtype)
+        k, v, w = self._hmem_parts(x, layer_idx)                 # [B,T,n,4]
+        kprev = torch.cat([torch.zeros_like(k[:, :1]), k[:, :-1]], 1)
+        bind = quat_mul(kprev, v) * w.unsqueeze(-1)
+        if self.hmem_decay == 'none':
+            M = bind.cumsum(1)
+        else:
+            a = self._hmem_lambda(x, layer_idx)                   # [B,T,n] or [n]
+            if a.dim() == 1:
+                a = a.expand(bind.shape[:3])
+            M = _decay_scan(a.unsqueeze(-1), bind)
+        r = quat_mul_conj_a(k, M)
+        return self._hmem_out(r, layer_idx, x.dtype)
+
+    def _hmem_lambda(self, x, layer_idx):
+        """Per-slot decay lambda in (0,1): [n] ('fixed') or [.., n]
+        ('gated', from the layer's input stream x)."""
+        z = self.hmem_decay_logit[layer_idx].float()
+        if self.hmem_forget_gate is not None:
+            z = z + self.hmem_forget_gate[layer_idx](x).float()
+        return torch.sigmoid(z)
+
+    def _lowrank_corr(self, x, name, layer_idx):
+        """(x V) U^T for the low-rank correction `name` ('node_mix',
+        'fold_innov', 'tree_disent'). With lowrank_gain the map M = V U^T
+        is rescaled by gain * sqrt(d) / |M|_F: for isotropic x,
+        E|x M|^2 = |x|^2 |M|_F^2 / d, so `gain` is the TYPICAL relative
+        size of the correction -- its direction is learned (Muon on U, V;
+        their norms cancel), its magnitude only through the AdamW scalar.
+        |M|_F^2 = sum((U^T U) * (V^T V)) (r x r, cheap)."""
+        V = getattr(self, name + '_down')[layer_idx].to(x.dtype)
+        U = getattr(self, name + '_up')[layer_idx].to(x.dtype)
+        c = (x @ V) @ U.t()
+        g = getattr(self, name + '_gain')
+        if g is not None:
+            fro = ((U.t() @ U) * (V.t() @ V)).sum().clamp_min(1e-12).sqrt()
+            c = c * (g[layer_idx].to(x.dtype) * (U.shape[0] ** 0.5) / fro)
+        return c
+
+    def _node_mix(self, parent, layer_idx):
+        """node_mix_rank: identity + low-rank cross-slot value mixing on
+        the pre-norm node output. Identity (returns `parent` itself) when
+        off; exactly `parent` at init when on (U = 0, or gain = 0)."""
+        if self.node_mix_up is None:
+            return parent
+        return parent + self._lowrank_corr(parent, 'node_mix', layer_idx)
+
+    def _fold_innov(self, acc, nxt, layer_idx):
+        """Innovation fold: acc - (nxt V) U^T (identity when off; exact
+        `acc` at init since U = 0)."""
+        if self.fold_innov_up is None:
+            return acc
+        return acc - self._lowrank_corr(nxt, 'fold_innov', layer_idx)
+
+    def _disentangle(self, nodes, layer_idx):
+        """Causal disentangler on one tree level, nodes [B, n, d]: node j
+        += (raw node j-1) V U^T; node 0 has no left neighbour (+0).
+        Identity when off; exact at init (U = 0)."""
+        if self.tree_disent_up is None:
+            return nodes
+        left = torch.cat([torch.zeros_like(nodes[:, :1]), nodes[:, :-1]], 1)
+        return nodes + self._lowrank_corr(left, 'tree_disent', layer_idx)
 
     def _homeo_relax(self, parent, layer_idx, level):
         """homeo_mode='on': rotate each parent block a gated fraction of
@@ -1561,6 +2164,7 @@ class OperaSpinorFenwickTree(nn.Module):
         floor(prev/2) nodes; the referenced set (and therefore every
         output) is IDENTICAL to the padded version."""
         B, n0, d = states.shape
+        states = self._disentangle(states, layer_idx)   # level 0 (identity if off)
         levels = [states]
         locks = []
         energies = []
@@ -1603,7 +2207,7 @@ class OperaSpinorFenwickTree(nn.Module):
                 # spinor homeostasis: relax the new parents toward the
                 # level's anchor (level 1 = span-2 nodes; leaves untouched)
                 parent = self._homeo_relax(parent, layer_idx, len(levels))
-            current = parent.reshape(B, m, d)
+            current = self._disentangle(parent.reshape(B, m, d), layer_idx)
             levels.append(current)
             locks.append(lock.reshape(B, m))
             energies.append(energy.reshape(B, m))
@@ -1632,6 +2236,48 @@ class OperaSpinorFenwickTree(nn.Module):
         out = (idx.to(device), count.to(device), max_blocks, lvl.to(device),
                active)
         self._fenwick_cache[key] = out
+        return out
+
+    def _grade_fold_masks(self, T, num_levels, level_offsets, device):
+        """Per-fold-step accumulator write masks for the scale-graded
+        readout (docs/OPERA_ScaleGraded_prereg.md §1). masks[s-1] is
+        [m_s, nb] bool over the ACTIVE rows of fold step s: True where a
+        slot takes the composed value (global slots [0,R) always; graded
+        slot j only when the step's block level routes to j's group,
+        group(l) = min(l, G-1)). seed_mask is [T, nb] for the
+        initialization: the path's slot-0 block (the oldest, level
+        lvl[t, 0]) seeds only global slots + its own group; every other
+        group starts at ZERO -- a group's fold sees only ITS blocks
+        (compose has no neutral element, so the content-free empty-fold
+        value is zero). Static per (T, R, G, nb) -- computed once from
+        the cached Fenwick decomposition, never from data."""
+        R, G = self.fold_grade
+        nb = self.nb
+        key = (T, num_levels, R, G, nb, str(device))
+        if key in self._grade_mask_cache:
+            return self._grade_mask_cache[key]
+        _, count, max_blocks, lvl, active = self._fenwick_indices(
+            T, num_levels, level_offsets, device)
+        w = (nb - R) // G
+        slot_group = torch.full((nb,), -1, dtype=torch.long,
+                                device=lvl.device)
+        slot_group[R:] = torch.arange(nb - R, dtype=torch.long,
+                                      device=lvl.device) // w
+        g_seed = lvl[:, 0].clamp(max=G - 1)                       # [T]
+        seed_mask = ((slot_group[None, :] < 0) |
+                     (slot_group[None, :] == g_seed[:, None]))     # [T, nb]
+        masks = []
+        for s in range(1, max_blocks):
+            act = active[s]
+            if act.numel() == 0:
+                masks.append(None)
+                continue
+            g_pos = lvl[act, s].clamp(max=G - 1)                # [m]
+            keep = ((slot_group[None, :] < 0) |
+                    (slot_group[None, :] == g_pos[:, None]))    # [m, nb]
+            masks.append(keep)
+        out = (seed_mask, masks)
+        self._grade_mask_cache[key] = out
         return out
 
     def prefix_states(self, levels, T, layer_idx, R_L, R_R, R_O):
@@ -2022,6 +2668,12 @@ class OperaSpinorFenwickTree(nn.Module):
                 layer_idx, R_L, R_R, R_O)
             return base.index_copy(1, act, composed.reshape(B, m, d))
 
+        if (self.fold_mode == 'left' and self.fold_impl == 'downsweep'
+                and _LEVEL_CAPTURE is None):
+            return self._join_right(
+                self._downsweep_fold(levels, T, layer_idx, R_L, R_R, R_O),
+                gathered, count, max_blocks, layer_idx, R_L, R_R, R_O)
+
         if self.fold_mode == 'left':
             # FOLD COMPACTION (v7.9): compose ONLY the active rows per
             # step. Position j participates in step s iff count[j] > s;
@@ -2033,10 +2685,42 @@ class OperaSpinorFenwickTree(nn.Module):
             # Work drops from (max_blocks-1)*T row-compositions to
             # sum_L (popcount(L)-1) -- ~2.3-2.7x less fold work, all of
             # it bandwidth (the measured MPS bottleneck).
-            acc = gathered[:, :, 0, :]
+            # SCALE-GRADED READOUT: per-step write masks (global slots
+            # always update; graded slots only on their group's steps).
+            # The compose call itself is unchanged -- the node still sees
+            # the full (acc, block) pair; only the accumulator write is
+            # masked per quaternion slot (values never mix across slots;
+            # the fusion gate may keep conditioning on the full 2d input).
+            # The seed (slot-0 block) likewise writes only global + its
+            # own group; unrouted groups start at zero -- a group's fold
+            # sees only ITS blocks.
+            # FOLD_H0: the fold starts from the learned accumulator h0 and
+            # composes EVERY path block (step 0 included: active[0] is all
+            # positions), so the readout is never a raw tree node. With
+            # grading, step 0's write uses the seed mask -- unrouted
+            # groups keep h0 (a trained neutral start) instead of zero.
+            h0 = (self.fold_h0[layer_idx] if self.fold_h0 is not None
+                  else None)
+            if self.fold_grade is not None:
+                seed_mask, grade_masks = self._grade_fold_masks(
+                    T, len(levels), level_offsets, device)
+                step_masks = [seed_mask] + grade_masks    # index = s_idx
+            else:
+                step_masks = None
+            if h0 is not None:
+                acc = h0.to(gathered.dtype).expand(B, T, d)
+                first_step = 0
+            elif step_masks is not None:
+                seed0 = gathered[:, :, 0, :].reshape(B, T, nb, 4)
+                acc = torch.where(seed_mask[None, :, :, None], seed0,
+                                  torch.zeros_like(seed0)).reshape(B, T, d)
+                first_step = 1
+            else:
+                acc = gathered[:, :, 0, :]
+                first_step = 1
             fgb = (self.fold_gate_bias[layer_idx]
                    if self.fold_gate_bias is not None else None)
-            for s_idx in range(1, max_blocks):
+            for s_idx in range(first_step, max_blocks):
                 act = active[s_idx]                       # [m] static per (T,s)
                 m = act.numel()                           # python int at trace
                 if m == 0:
@@ -2059,10 +2743,11 @@ class OperaSpinorFenwickTree(nn.Module):
                 # v9 arm A: chrono-biased gate on the fold transport
                 # (shared weights; only the bias differs from the tree).
                 composed, _, _ = self._compose(
-                    a.reshape(B * m, d), nxt.reshape(B * m, d),
+                    self._fold_innov(a, nxt, layer_idx).reshape(B * m, d),
+                    nxt.reshape(B * m, d),
                     layer_idx, R_L, R_R, R_O, gate_bias=fgb,
                     level_idx=('fold' if _LEVEL_CAPTURE is not None
-                               else None))
+                               else None), fold=True)
                 if self.bist_a is not None:
                     composed = self._bistable_update(
                         a.reshape(B * m, d), nxt.reshape(B * m, d),
@@ -2071,11 +2756,20 @@ class OperaSpinorFenwickTree(nn.Module):
                     composed = self._relax_update(
                         a.reshape(B * m, d), nxt.reshape(B * m, d),
                         composed, layer_idx)
+                if step_masks is not None:
+                    # masked write: non-routed graded slots keep their
+                    # pre-step accumulator values verbatim.
+                    keep = step_masks[s_idx]                     # [m, nb]
+                    newv = composed.reshape(B, m, nb, 4)
+                    oldv = a.reshape(B, m, nb, 4)
+                    composed = torch.where(keep[None, :, :, None], newv,
+                                           oldv).reshape(B, m, d)
                 acc = acc.index_copy(1, act, composed.reshape(B, m, d))
             if self.readout_mode == 'multistate':
                 acc = acc + self._multistate_readout(gathered, lvl, count,
                                                      layer_idx)
-            return acc
+            return self._join_right(acc, gathered, count, max_blocks,
+                                    layer_idx, R_L, R_R, R_O)
 
         if self.fold_mode == 'left-masked':
             # v7.7 reference implementation, kept verbatim for the
@@ -2127,6 +2821,87 @@ class OperaSpinorFenwickTree(nn.Module):
             slots, valid = merged, new_valid
             S = slots.shape[2]
         return slots[:, :, 0, :]
+
+    def _join_right(self, acc, gathered, count, max_blocks, layer_idx,
+                    R_L, R_R, R_O):
+        """fold_dir='both': acc + gain (.) right_fold. Identity when off."""
+        if self.fold_join_gain is None:
+            return acc
+        right = self._right_fold(gathered, count, max_blocks, layer_idx,
+                                 R_L, R_R, R_O)
+        B, T, d = acc.shape
+        g = self.fold_join_gain[layer_idx].to(acc.dtype)
+        return (acc.reshape(B, T, self.nb, 4)
+                + g[None, None, :, None]
+                * right.reshape(B, T, self.nb, 4)).reshape(B, T, d)
+
+    def _right_fold(self, gathered, count, max_blocks, layer_idx,
+                    R_L, R_R, R_O):
+        """Counterclockwise (right-nested) fold of each prefix's Fenwick
+        blocks: B1 o (B2 o (... o B_S)). Start from the newest block
+        (slot count-1); then for s = S-2 .. 0, acc <- compose(block_s, acc)
+        -- the older block is the LEFT child (time order preserved).
+        Compacted: only positions whose slot s exists and is not their
+        last take part in step s."""
+        B, T, S, d = gathered.shape
+        dev = gathered.device
+        tpos = torch.arange(T, device=dev)
+        acc = gathered[:, tpos, count - 1, :]                     # newest block
+        for s_idx in range(max_blocks - 2, -1, -1):
+            act = torch.nonzero(count > s_idx + 1, as_tuple=False).squeeze(-1)
+            m = act.numel()
+            if m == 0:
+                continue
+            blk = gathered[:, act, s_idx, :]
+            a = acc.index_select(1, act)
+            c, _, _ = self._compose(blk.reshape(B * m, d), a.reshape(B * m, d),
+                                    layer_idx, R_L, R_R, R_O, fold=True)
+            acc = acc.index_copy(1, act, c.reshape(B, m, d))
+        return acc
+
+    def _downsweep_fold(self, levels, T, layer_idx, R_L, R_R, R_O):
+        """All-prefix left fold, top-down (fold_impl='downsweep').
+
+        E_k[j] = fold of the Fenwick blocks of prefix length j * 2^k
+        (largest block first, left-nested) -- stored for j = 1..(T >> k)
+        (j = 0 is the empty fold). Coarse to fine:
+            E_k[2j]   = E_{k+1}[j]                      (same prefix)
+            E_k[2j+1] = compose(E_{k+1}[j], node_k[2j]) (one more, smallest
+                                                        block), j >= 1
+            E_k[1]    = node_k[0]                       (empty acc: no compose)
+        Prefix state of position t = E_0[t + 1]. Same compose chain per
+        prefix as the compacted fold (same operands, same order, same
+        fold gate/bias/innovation), shared across prefixes."""
+        B, d = levels[0].shape[0], levels[0].shape[-1]
+        dev = levels[0].device
+        fgb = (self.fold_gate_bias[layer_idx]
+               if self.fold_gate_bias is not None else None)
+        K = len(levels) - 1
+        E = levels[K][:, :1]                       # E_K[1..1]
+        for k in range(K - 1, -1, -1):
+            n = T >> k
+            n_odd = (n - 1) // 2 + 1               # indices 2j+1 <= n, j = 0..
+            blocks = levels[k][:, 0:2 * n_odd:2]   # node_k[2j]
+            parts = [blocks[:, :1]]                # E_k[1] = node_k[0]
+            if n_odd > 1:
+                acc = E[:, :n_odd - 1]             # E_{k+1}[j], j = 1..n_odd-1
+                nxt = blocks[:, 1:]
+                c, _, _ = self._compose(
+                    self._fold_innov(acc, nxt, layer_idx).reshape(-1, d),
+                    nxt.reshape(-1, d), layer_idx, R_L, R_R, R_O,
+                    gate_bias=fgb, fold=True)
+                odd = torch.cat([parts[0], c.reshape(B, -1, d)], 1)
+            else:
+                odd = parts[0]
+            # interleave: slot 2i (index 2i+1) <- odd[i]; slot 2i+1 (index
+            # 2i+2) <- E_{k+1}[i+1]
+            n_even = n // 2
+            out = torch.empty(B, n, d, device=dev, dtype=odd.dtype)
+            out[:, 0::2] = odd[:, :(n + 1) // 2]
+            if n_even:
+                out[:, 1::2] = E[:, :n_even].to(odd.dtype)
+            E = out
+        return E
 
     def _bistable_update(self, acc, nxt, composed, layer_idx):
         """BRC recurrence on the fold accumulator (arXiv:2006.05252).
@@ -2467,7 +3242,7 @@ class OperaSpinorFenwickTree(nn.Module):
                 geom=None, geom_mask=None, geom_block=0):
         B, T = token_ids.shape
         device = token_ids.device
-        d = self.d
+        d = self.d_model             # stream width (== self.d unless state_mult)
 
         states = self.word_emb(token_ids)
         if self.pe_mode == 'sin':
@@ -2475,9 +3250,10 @@ class OperaSpinorFenwickTree(nn.Module):
         elif self.pe_mode == 'rotor':
             key = (T, str(device))
             if key not in self._rotor_cache:
-                self._rotor_cache[key] = rotor_pos_tables(T, self.nb, device)
+                self._rotor_cache[key] = rotor_pos_tables(T, self.nb_model,
+                                                          device)
             cos, sin = self._rotor_cache[key]
-            states = apply_rotor_pe(states, cos, sin, self.nb)
+            states = apply_rotor_pe(states, cos, sin, self.nb_model)
         # pe_mode == 'none': tree/Fenwick structure is the only position source
         if self.dropout > 0:
             states = F.dropout(states, p=self.dropout, training=self.training)
@@ -2487,7 +3263,7 @@ class OperaSpinorFenwickTree(nn.Module):
             # `geom_block` BEFORE the tree ever sees them, so the tree's
             # existing rotation/geometric-product composition operates on
             # real coordinates for those leaves, not learned embeddings.
-            states = inject_geometry(states, geom, geom_mask, self.nb,
+            states = inject_geometry(states, geom, geom_mask, self.nb_model,
                                      geom_block)
 
         pad = None  # on-fly indexing: tree built without padding
@@ -2506,19 +3282,29 @@ class OperaSpinorFenwickTree(nn.Module):
         per_layer_energies = []
 
         def _layer_body(current, layer_idx, T):
+            # Tree input: the stream itself (incumbent), pre-normed
+            # (resid_mode='add'), then lifted to tree width (state_mult).
+            x = current
+            if self.tree_in_norm is not None:
+                x = self.tree_in_norm[layer_idx](x)
+            if self.tree_in is not None:
+                x = self.tree_in[layer_idx](x)
             if self.fold_mode == 'scan':
                 # no tree: levels/locks/energies are empty (msup/tree-
                 # inspection/energy-diagnostic N/A)
-                return self.scan_prefix(current, layer_idx), [], [], []
+                return self.scan_prefix(x, layer_idx), [], [], []
             R_L, R_R, R_O = self.get_rotations(layer_idx)
             levels, locks, energies = self.build_tree(
-                current, layer_idx, R_L, R_R, R_O)
+                x, layer_idx, R_L, R_R, R_O)
             prefix = self.prefix_states(levels, T, layer_idx, R_L, R_R, R_O)
             if self.mem_mode == 'delta':
                 # T1.4: the memory reads the layer's token states, the
                 # fold's prefix state queries it by content.
-                prefix = prefix + self._delta_memory(current, prefix,
-                                                     layer_idx)
+                prefix = prefix + self._delta_memory(x, prefix, layer_idx)
+            if self.tree_out is not None:
+                prefix = self.tree_out[layer_idx](prefix)
+            if self.hmem_nb:
+                prefix = prefix + self._hmem_read(current, layer_idx)
             return prefix, levels, locks, energies
 
         current = states
@@ -2533,7 +3319,6 @@ class OperaSpinorFenwickTree(nn.Module):
                 levels = locks = energies = None
             else:
                 prefix, levels, locks, energies = _layer_body(current, layer_idx, T)
-            per_layer_prefix.append(prefix)
             if return_tree:
                 tree_info.append((levels, locks))
             if return_levels:
@@ -2541,11 +3326,30 @@ class OperaSpinorFenwickTree(nn.Module):
             if return_energy:
                 per_layer_energies.append(energies)
 
+            if (self.head_mode == 'fold'
+                    and layer_idx == self.num_layers - 1
+                    and not (self.dropout > 0 and self.training)):
+                # The head reads the fold output; the last layer's stream
+                # update would feed nothing (its cross_mlp/blend_gate get
+                # no gradient either way) -- skip computing it. Not under
+                # training dropout: its F.dropout draw advances the global
+                # RNG, and skipping it would shift the batch stream.
+                per_layer_prefix.append(prefix)
+                break
             mixed = self.cross_mlp[layer_idx](prefix)
             if self.dropout > 0:
                 mixed = F.dropout(mixed, p=self.dropout, training=self.training)
-            gate = self.blend_gate[layer_idx](prefix)
-            current = gate * mixed + (1 - gate) * current
+            if self.resid_mode == 'add':
+                current = current + mixed
+            else:
+                gate = self.blend_gate[layer_idx](prefix)
+                current = gate * mixed + (1 - gate) * current
+            # per_layer_prefix holds each layer's HEAD INPUT (what `states`
+            # returns and train_lm_loss applies the head to): the fold
+            # output (incumbent) or the normalized post-update stream.
+            per_layer_prefix.append(
+                self.stream_norm[layer_idx](current)
+                if self.head_mode == 'stream' else prefix)
 
         if head_last_only:
             # OPT: eval/probe only read [-1]; skip aux-layer head GEMMs.

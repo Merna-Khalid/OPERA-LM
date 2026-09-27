@@ -9,7 +9,8 @@ import torch
 import torch.nn as nn
 
 from .model import OperaSpinorFenwickTree, count_params, fold_work_counts
-from .losses import lm_loss, train_lm_loss, msup_loss
+from .losses import (lm_loss, train_lm_loss, msup_loss, future_bag_loss,
+                     far_repeat_mask)
 from .data import load_data
 from .packed import packed_stats
 
@@ -389,9 +390,19 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
           mem_mode='none', mem_dim=128, init_weights_from=None,
           homeo_mode='off', node_paths=3, fold_adapt='off',
           fold_bistable='off', bist_rank=0, fold_relax='off',
+          fold_grade=None,
           level_grad_balance=1.0,
           muon_include='', muon_wd=0.0, lo_muon=None,
           level_cond_rank=0,
+          head_mode='fold', resid_mode='blend', fold_gate='shared',
+          fold_h0=False, state_mult=1, aux_weight=0.5,
+          state_tie=False, node_mix_rank=0,
+          fold_innov_rank=0, tree_disent_rank=0, fold_impl='compact',
+          lowrank_gain=False, fold_dir='left',
+          future_bag=None, future_weight=0.1,
+          far_weight=0.0, far_n=8, far_d=100, byte_dropout=0.0,
+          mask_id=2, resid_init_scale=None, hmem_nb=0, hmem_decay='none', hmem_conv=0,
+          samuon_gamma=1.0, samuon_warmup_frac=0.3,
           packed_data=None, ddp=False):
     # DDP (multi-GPU data parallelism, added for the Kaggle 2xT4 tier --
     # a single T4 measured ~8.5x slower than the project's A100, so real
@@ -506,6 +517,8 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
     if fold_bistable != 'off':
         tag.append(f'bist-{fold_bistable}'
                    + (f'-r{bist_rank}' if bist_rank else ''))
+    if fold_grade is not None:
+        tag.append(f'grade-R{fold_grade[0]}G{fold_grade[1]}')
     if muon_include:
         tag.append('mfg' if muon_include == 'fusion_gate' else 'minc')
     if muon_wd:
@@ -514,6 +527,33 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
         tag.append('lo' if lo_muon == 'uniform' else 'loder')
     if level_cond_rank:
         tag.append(f'lc{level_cond_rank}')
+    if head_mode != 'fold': tag.append(f'head-{head_mode}')
+    if resid_mode != 'blend': tag.append(f'res-{resid_mode}')
+    if fold_gate != 'shared': tag.append('foldgate')
+    if fold_h0: tag.append('h0')
+    if state_mult != 1: tag.append(f'sx{state_mult}')
+    if aux_weight != 0.5: tag.append(f'auxw{aux_weight:g}')
+    if state_tie: tag.append('tie-state')
+    if node_mix_rank: tag.append(f'nmix{node_mix_rank}')
+    if fold_innov_rank: tag.append(f'innov{fold_innov_rank}')
+    if tree_disent_rank: tag.append(f'disent{tree_disent_rank}')
+    if fold_impl != 'compact': tag.append(f'fold-{fold_impl}')
+    if lowrank_gain: tag.append('lrgain')
+    if fold_dir != 'left': tag.append(f'fdir-{fold_dir}')
+    if future_bag:
+        tag.append(f'fbag{future_bag[0]}x{future_bag[1]}w{future_weight:g}')
+    if far_weight: tag.append(f'far{far_weight:g}n{far_n}d{far_d}')
+    if byte_dropout: tag.append(f'bdrop{byte_dropout:g}')
+    if resid_init_scale is not None: tag.append(f'rinit-{resid_init_scale}')
+    if hmem_nb: tag.append(f'hmem{hmem_nb}')
+    if hmem_decay != 'none': tag.append(f'hdecay-{hmem_decay}')
+    if hmem_conv: tag.append(f'hconv{hmem_conv}')
+    assert samuon_gamma == 1.0 or optimizer == 'muon', \
+        "samuon_gamma reshapes Muon's update; it needs optimizer='muon'"
+    if samuon_gamma != 1.0:
+        tag.append(f'sam{samuon_gamma:g}'
+                   + (f'w{samuon_warmup_frac:g}'
+                      if samuon_warmup_frac != 0.3 else ''))
     if lock_mode != 'none': tag.append(lock_mode)
     tag = '+'.join(tag)
 
@@ -597,8 +637,26 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
                                    fold_bistable=fold_bistable,
                                    bist_rank=bist_rank,
                                    fold_relax=fold_relax,
+                                   fold_grade=fold_grade,
                                    level_grad_balance=level_grad_balance,
-                                   level_cond_rank=level_cond_rank
+                                   level_cond_rank=level_cond_rank,
+                                   head_mode=head_mode,
+                                   resid_mode=resid_mode,
+                                   fold_gate=fold_gate,
+                                   fold_h0=fold_h0,
+                                   state_mult=state_mult,
+                                   state_tie=state_tie,
+                                   node_mix_rank=node_mix_rank,
+                                   fold_innov_rank=fold_innov_rank,
+                                   tree_disent_rank=tree_disent_rank,
+                                   fold_impl=fold_impl,
+                                   lowrank_gain=lowrank_gain,
+                                   fold_dir=fold_dir,
+                                   future_bag=future_bag,
+                                   resid_init_scale=resid_init_scale,
+                                   hmem_nb=hmem_nb,
+                                   hmem_decay=hmem_decay,
+                                   hmem_conv=hmem_conv
                                    ).to(torch_device)
     npar = count_params(model)
     if is_main:
@@ -712,7 +770,12 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
         groups = [
             {'params': [p for _, p in muon_np],
              'names': [n for n, _ in muon_np],
-             'use_muon': True, 'lr': muon_lr, 'weight_decay': muon_wd},
+             'use_muon': True, 'lr': muon_lr, 'weight_decay': muon_wd,
+             # SAMuon-lite (arXiv 2608.25990): gamma 1.0 = plain Muon,
+             # byte-identical; warmup = cosine ramp over the first
+             # samuon_warmup_frac of training (paper: 30%).
+             'sa_gamma': float(samuon_gamma),
+             'sa_warmup': int(round(samuon_warmup_frac * steps))},
             {'params': [p for _, p in adam_np], 'use_muon': False,
              'lr': max_lr},
         ]
@@ -732,6 +795,9 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
                   f"params (lr {muon_lr}"
                   + (f", include {list(include)}" if include else "")
                   + (f", wd {muon_wd}" if muon_wd else "")
+                  + (f", SAMuon-lite gamma {samuon_gamma:g} warmup "
+                     f"{int(round(samuon_warmup_frac * steps))} steps"
+                     if samuon_gamma != 1.0 else "")
                   + f") + AdamW: {sum(p.numel() for _, p in adam_np):,} "
                   f"(lr {max_lr})", flush=True)
     elif use_foreach:
@@ -894,17 +960,42 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
         boundary = ((step + 1) % accum == 0) or (step == steps - 1)
         sync_ctx = (model_c.no_sync() if (ddp and not boundary)
                     else contextlib.nullcontext())
+        # BYTE DROPOUT (the posterior-collapse fix, Bowman et al. 2016
+        # word dropout): a fraction of INPUT tokens (never targets, never
+        # padding) is replaced by mask_id (EOS, unused in the byte corpus
+        # -> a learnable mask embedding), so exact recent bytes stop being
+        # sufficient and redundant / far context has to carry the load.
+        # Training only; eval and inference see clean inputs.
+        inp_ids = token_ids
+        if byte_dropout > 0:
+            pos_ = torch.arange(token_ids.shape[1], device=token_ids.device)
+            drop = ((torch.rand(token_ids.shape, device=token_ids.device)
+                     < byte_dropout) & (pos_[None, :] < lengths[:, None]))
+            inp_ids = token_ids.masked_fill(drop, mask_id)
+        # FAR-REPEAT WEIGHTING (gradient starvation): the final-layer loss
+        # upweights targets that complete an n-gram seen only > far_d
+        # tokens back (weights 1 + far_weight, renormalized to mean 1).
+        tw = None
+        if far_weight > 0:
+            tw = 1.0 + far_weight * far_repeat_mask(
+                token_ids, lengths, far_n, far_d).float()
         with sync_ctx, amp_ctx():
             if msup:
-                out = model_c(token_ids, lengths, return_levels=True)
-                loss, _, _ = lm_loss(out.logits, token_ids, lengths)
+                out = model_c(inp_ids, lengths, return_levels=True,
+                              return_states=bool(future_bag))
+                loss, _, _ = lm_loss(out.logits, token_ids, lengths,
+                                     aux_weight=aux_weight,
+                                     target_weights=tw)
                 loss = loss + msup_weight * msup_loss(
                     model, out.levels, token_ids, lengths, aux_frac=aux_frac)
+                if future_bag:
+                    loss = loss + future_weight * future_bag_loss(
+                        model, out.states[-1], token_ids, lengths)
             else:
                 # OPT: final-layer head inside the compiled graph; aux
                 # layers' head computed on aux_frac of positions only.
                 out = model_c(
-                    token_ids, lengths, return_states=True, head_last_only=True)
+                    inp_ids, lengths, return_states=True, head_last_only=True)
                 all_logits, states = out.logits, out.states
                 # train_lm_loss calls apply_head(), a custom method, not
                 # forward() -- DDP's wrapper only proxies forward()/
@@ -922,7 +1013,12 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
                 head_model = model if ddp else model_c
                 loss, _, _ = train_lm_loss(
                     head_model, states, token_ids, lengths,
-                    aux_frac=aux_frac, final_logits=all_logits[0])
+                    aux_weight=aux_weight,
+                    aux_frac=aux_frac, final_logits=all_logits[0],
+                    target_weights=tw)
+                if future_bag:
+                    loss = loss + future_weight * future_bag_loss(
+                        model, states[-1], token_ids, lengths)
 
         # DIVERGENCE GUARD (added after the 2026-08-23 Kaggle 2xT4 run
         # NaN'd at ~step 7000 and the save branch then overwrote the last
@@ -1089,9 +1185,25 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
         'fold_bistable': fold_bistable,
         'bist_rank': bist_rank,
         'fold_relax': fold_relax,
+        'fold_grade': (list(fold_grade) if fold_grade is not None else None),
         'level_grad_balance': level_grad_balance,
         'muon_include': muon_include, 'muon_wd': muon_wd,
         'lo_muon': lo_muon, 'level_cond_rank': level_cond_rank,
+        'head_mode': head_mode, 'resid_mode': resid_mode,
+        'fold_gate': fold_gate, 'fold_h0': bool(fold_h0),
+        'state_mult': state_mult, 'aux_weight': aux_weight,
+        'state_tie': bool(state_tie), 'node_mix_rank': node_mix_rank,
+        'fold_innov_rank': fold_innov_rank,
+        'tree_disent_rank': tree_disent_rank, 'fold_impl': fold_impl,
+        'lowrank_gain': bool(lowrank_gain), 'fold_dir': fold_dir,
+        'future_bag': (list(future_bag) if future_bag else None),
+        'future_weight': future_weight,
+        'far_weight': far_weight, 'far_n': far_n, 'far_d': far_d,
+        'byte_dropout': byte_dropout,
+        'resid_init_scale': resid_init_scale, 'hmem_nb': hmem_nb,
+        'hmem_decay': hmem_decay, 'hmem_conv': hmem_conv,
+        'samuon_gamma': samuon_gamma,
+        'samuon_warmup_frac': samuon_warmup_frac,
         'vocab_size': actual_vocab_size, 'max_len': max_len,
         'eval_max_len': eval_max_len, 'steps': steps,
         'final_loss': loss.item(),

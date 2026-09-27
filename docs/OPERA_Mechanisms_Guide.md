@@ -239,7 +239,43 @@ like a tree. Four consecutive readout-side nulls plus the probe verdict
   186.45 PPL vs AdamW 224.88 (**+38.4**); lr 0.05: 221.99; lr 0.10:
   diverges. Single seed; adopted at lr 0.02 for the opera-chat run.
 
-## 7. Standing advice for new arms
+## 7. Stream and tree-width arms (2026-09-24, exploratory)
+
+From the 2026-09-24 architecture review; draft prereg
+`OPERA_Stream_prereg.md` (not yet registered). All flags default to the
+incumbent, bitwise.
+
+- **`head_mode='stream'`** — the head reads the normalized residual
+  stream after each layer, not the fold output. Under the fold head the
+  last layer's `cross_mlp`/`blend_gate` feed nothing: 33.9% of the
+  byte-d512/L2 incumbent's parameters get no gradient.
+- **`resid_mode='add'`** — additive pre-norm residual in place of the
+  convex scalar blend (G1: the blend's highway closes at depth).
+- **`aux_weight`** (train) — the per-layer aux loss weight; at 0.5 the
+  final layer carries only 22% of the loss at L=8.
+- **`fold_gate='separate'`** — the fold's own fusion gate, copy-init
+  (interior incumbent, like over-relaxation's γ=1).
+- **`fold_h0`** — a learned fold start state: no zero-fold readouts
+  (F6), and a trained neutral element for graded groups.
+- **`state_mult`** — the tree/fold run k× wider than the stream. The
+  node never moves values between quaternion slots, so the per-prefix
+  state width is the capacity knob (Jacobian: 54–77% of the node's
+  energy is block-diagonal).
+- **`state_tie`** — with `state_mult=k`, the k copies of each slot share
+  its gates and rotors: the cheap form of state expansion (M²RNN: state
+  size, not non-linearity, is the capacity knob).
+- **`node_mix_rank`** — identity-initialized low-rank cross-slot value
+  mixing on the node output, `parent += (parent V) Uᵀ`, U zero-init:
+  bitwise incumbent at init, interior (MLP-LDRU: gated-sum operators
+  67.1% vs 100% with identity-init value projections).
+- **`samuon_gamma`** (train) — SAMuon-lite: Muon's update with the
+  leading singular direction held at unit scale and the rest boosted by
+  γ after a cosine warmup (13–22% fewer tokens than Muon at 124M–1B in
+  the paper; untested at our batch size).
+
+All three follow the no-attention rule (literature scan §4).
+
+## 8. Standing advice for new arms
 
 1. One variable per run. 2. Same-session incumbent. 3. Pre-register the
 gate before the run. 4. Zero-init or deterministic-init new parameters so

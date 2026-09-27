@@ -143,7 +143,21 @@ ids, lengths = ids[:, :T], lengths.clamp(max=T)
 | `lock_mode` | `'none'` | `'interference'` modulates fusion gates by children's geometric alignment (diagnostic lineage) |
 | `tree_drop` | `0.0` | randomly force fold gates to identity during training (revolving fold) |
 | `grad_checkpoint` | `''` | `'level'` (recompute tree nodes) or `'layer'` (whole layers) for activation memory |
-| `use_metal` | `False` | fused Metal kernels on Apple Silicon (requires `rot_mode='so3'`) |
+| `use_metal` | `False` | fused Metal compose kernel on Apple Silicon (works with `rot_mode='free'` too); ~2× faster training steps, same model (selftested) |
+
+### Stream, tree-width and optimizer knobs (exploratory; `docs/OPERA_Literature_Scan_2026-09-24.md`)
+
+| parameter | default | meaning |
+|---|---|---|
+| `head_mode` | `'fold'` | `'stream'`: the head reads `LN(current)` after each layer's update. With `'fold'` the last layer's `cross_mlp`/`blend_gate` receive no gradient (34% of a d512/L2 model) |
+| `resid_mode` | `'blend'` | `'add'`: additive pre-norm residual instead of the convex scalar blend (needs `head_mode='stream'`) |
+| `fold_gate` | `'shared'` | `'separate'`: the left fold gets its own fusion gate, copy-initialized (bitwise incumbent at init) |
+| `fold_h0` | `False` | every prefix folds from a learned per-layer start state (no raw-tree-node readouts) |
+| `state_mult` | `1` | tree/fold width = `state_mult·d` behind per-layer in/out projections (left fold) |
+| `state_tie` | `False` | with `state_mult=k`: the k copies of each slot share its gates and rotors (state grows k×, gate output width unchanged) |
+| `node_mix_rank` | `0` | `r>0`: identity-initialized rank-r cross-slot value mixing inside the compose node (bitwise incumbent at init) |
+| `aux_weight` (in `train()`) | `0.5` | loss weight of each non-final layer's head |
+| `samuon_gamma` (in `train()`) | `1.0` | SAMuon-lite tail boost on Muon's update (arXiv 2608.25990); `1.0` is plain Muon, byte-identical; cosine warmup over `samuon_warmup_frac` (0.3) of training |
 
 ### The full research pipeline
 

@@ -36,6 +36,8 @@ def main():
     p.add_argument('--out-dir', default='assets')
     p.add_argument('--eval-mult', type=int, default=4,
                    help='eval_max_len = eval_mult * max_len')
+    p.add_argument('--modes', nargs='+', default=['bytes', 'bpe'],
+                   choices=['bytes', 'bpe'])
     args = p.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -43,6 +45,7 @@ def main():
         'bytes': args.ctx_bytes,
         'bpe': int(round(args.ctx_bytes / BYTES_PER_BPE)),
     }
+    plan = {m: T for m, T in plan.items() if m in args.modes}
     print(f"context target: {args.ctx_bytes} raw bytes")
     for m, T in plan.items():
         print(f"  {m:<6} max_len={T}")

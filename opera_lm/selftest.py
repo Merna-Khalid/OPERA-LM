@@ -27,7 +27,7 @@ from .model import (OperaSpinorFenwickTree, count_params, fenwick_blocks,
                     level_sin_enc, fold_work_counts, quat_to_rotmat,
                     quat_sandwich, affine_compose, associative_scan,
                     rotor_pos_tables, apply_rotor_pe, inject_geometry)
-from .losses import lm_loss, msup_loss
+from .losses import lm_loss, msup_loss, future_bag_loss, far_repeat_mask, train_lm_loss
 from .data import doc_chunks, doc_chunk_sizes
 from .train import (curriculum_len, GpuBatchSource, extrapolation_eval,
                     rmt_states_diagnostic, train, get_lr)
@@ -38,6 +38,1192 @@ from .muon import Muon, zeropower_via_newtonschulz5, split_muon_params
 # ============================================================================
 # SELF-TEST -- one function per arm
 # ============================================================================
+
+def test_fold_grade():
+    # SCALE-GRADED READOUT (docs/OPERA_ScaleGraded_prereg.md, SG-H4 guards)
+    torch.manual_seed(0)
+    # (a) routing only: zero param delta AND byte-identical init (the
+    #     constructor consumes no randomness for fold_grade)
+    torch.manual_seed(11)
+    m_inc = OperaSpinorFenwickTree(vocab_size=101, d=64, nb=16, num_layers=2,
+                                   pe_mode='none', fold_mode='left')
+    torch.manual_seed(11)
+    m_gr = OperaSpinorFenwickTree(vocab_size=101, d=64, nb=16, num_layers=2,
+                                  pe_mode='none', fold_mode='left',
+                                  fold_grade=(4, 4))
+    dpar = count_params(m_gr) - count_params(m_inc)
+    sd_i, sd_g = m_inc.state_dict(), m_gr.state_dict()
+    assert set(sd_i) == set(sd_g)
+    init_err = max((sd_i[k] - sd_g[k]).abs().max().item() for k in sd_i)
+    print(f"  grade: param delta {dpar} (expected 0), init err {init_err:.2e}")
+    assert dpar == 0 and init_err == 0.0
+
+    # (b) ROUTING UNIT-TEST (SG-H4): a level-l block perturbation must not
+    #     move other groups' slots. Strict isolation needs value flow that
+    #     is block-diagonal per quaternion slot, so the TEST-ONLY config
+    #     freezes the node's cross-slot couplings: norm_mode='blockrms'
+    #     (per-slot RMS) and zeroed fusion-gate weights (g = sigmoid(bias),
+    #     input-independent). The registered production config keeps the
+    #     incumbent node untouched (layer norm, live gates); this test
+    #     therefore verifies the ROUTING TOPOLOGY, not the node.
+    R_g, G_g, T = 4, 4, 33
+    w_g = (16 - R_g) // G_g
+    torch.manual_seed(3)
+    m = OperaSpinorFenwickTree(vocab_size=101, d=64, nb=16, num_layers=1,
+                               pe_mode='none', fold_mode='left',
+                               norm_mode='blockrms', fold_grade=(R_g, G_g))
+    with torch.no_grad():
+        for fg in m.fusion_gate:
+            fg.weight.zero_()
+    m.eval()
+    m._need_locks = False
+
+    def readout(tokv):
+        with torch.no_grad():
+            emb = m.word_emb(tokv)
+            R_L, R_R, R_O = m.get_rotations(0)
+            lv, _, _ = m.build_tree(emb, 0, R_L, R_R, R_O)
+            return m.prefix_states(lv, T, 0, R_L, R_R, R_O)[0]   # [T, d]
+
+    tok = torch.randint(1, 101, (1, T))
+    p = T - 3                                   # the perturbed byte
+    tok2 = tok.clone()
+    tok2[0, p] = (tok2[0, p] + 7) % 100 + 1
+    p0, p1 = readout(tok), readout(tok2)
+    table, _ = fenwick_blocks(T)
+    iso_err = moved = 0.0
+    n_iso = 0
+    for t in range(T):
+        diff_t = (p1[t] - p0[t]).abs().reshape(16, 4).amax(-1)   # [nb]
+        if t < p:                                # prefix excludes byte p
+            assert diff_t.max().item() == 0.0, \
+                f"t={t} (< p) changed: causality"
+            continue
+        # the unique path block of prefix t containing byte p
+        off, lvl_p = 0, None
+        for (lv, _node) in table[t]:
+            if off <= p < off + (1 << lv):
+                lvl_p = lv
+                break
+            off += 1 << lv
+        assert lvl_p is not None
+        grp = min(lvl_p, G_g - 1)
+        others = [j for j in range(R_g, 16) if (j - R_g) // w_g != grp]
+        iso_err = max(iso_err, diff_t[others].max().item())
+        moved = max(moved, diff_t[:R_g].max().item(),
+                    diff_t[[j for j in range(R_g, 16)
+                            if (j - R_g) // w_g == grp]].max().item())
+        n_iso += len(others)
+    print(f"  grade routing: isolation err {iso_err:.2e} over {n_iso} "
+          f"non-routed slots; routed-slot movement {moved:.2e}")
+    assert iso_err == 0.0 and moved > 1e-6
+
+    # (c) causality + forward/backward on the PRODUCTION config (layer
+    #     norm, live gates) for both dose SHAPES (hybrid R>0 and radical
+    #     R=0; the registered nb=128 doses are (24,8)/(0,8), scaled here
+    #     to the test model's nb=16)
+    for fgd in ((4, 4), (0, 4)):
+        torch.manual_seed(5)
+        mp = OperaSpinorFenwickTree(vocab_size=101, d=64, nb=16,
+                                    num_layers=2, pe_mode='none',
+                                    fold_mode='left', fold_grade=fgd)
+        tok = torch.randint(1, 101, (3, 13))
+        lens = torch.tensor([13, 7, 5])
+        loss, _, _ = lm_loss(mp(tok, lens).logits, tok, lens)
+        loss.backward()
+        assert torch.isfinite(loss)
+        mp.eval()
+        tok = torch.randint(1, 101, (1, 12))
+        lens = torch.tensor([12])
+        with torch.no_grad():
+            a = mp(tok, lens).logits[-1][0, :8].clone()
+            tok2 = tok.clone(); tok2[0, 10] = (tok2[0, 10] + 5) % 100 + 1
+            b = mp(tok2, lens).logits[-1][0, :8]
+        err = (a - b).abs().max().item()
+        print(f"  grade {fgd}: loss {loss.item():.3f}, causality err {err:.2e}")
+        assert err < 1e-5
+
+    # (d) NOT bitwise-incumbent at init (prereg §1): identical weights,
+    #     but the graded readout differs wherever routing does. At
+    #     count==1 positions the GLOBAL slots (dims [0, 4R)) match the
+    #     incumbent bit-for-bit while graded slots differ (unrouted
+    #     groups zero-seeded vs seed values); full-model logits differ.
+    torch.manual_seed(21)
+    m1i = OperaSpinorFenwickTree(vocab_size=101, d=64, nb=16, num_layers=1,
+                                 pe_mode='none', fold_mode='left')
+    torch.manual_seed(21)
+    m1g = OperaSpinorFenwickTree(vocab_size=101, d=64, nb=16, num_layers=1,
+                                 pe_mode='none', fold_mode='left',
+                                 fold_grade=(4, 4))
+    m1i.eval(); m1g.eval()
+    m1i._need_locks = False; m1g._need_locks = False
+
+    def ro(mm, tokv):
+        with torch.no_grad():
+            emb = mm.word_emb(tokv)
+            R_L, R_R, R_O = mm.get_rotations(0)
+            lv, _, _ = mm.build_tree(emb, 0, R_L, R_R, R_O)
+            return mm.prefix_states(lv, 12, 0, R_L, R_R, R_O)[0]
+
+    tok = torch.randint(1, 101, (1, 12))
+    r_i, r_g = ro(m1i, tok), ro(m1g, tok)
+    table12, _ = fenwick_blocks(12)
+    single = [t for t in range(12) if len(table12[t]) == 1]     # 0, 1, 3, 7
+    multi = [t for t in range(12) if t not in single]
+    g_same = max((r_i[t, :16] - r_g[t, :16]).abs().max().item()
+                 for t in single)
+    g_diff = max((r_i[t, 16:] - r_g[t, 16:]).abs().max().item()
+                 for t in single)
+    m_diff = max((r_i[t] - r_g[t]).abs().max().item() for t in multi)
+    m_inc.eval(); m_gr.eval()
+    lens = torch.full((1,), 12)
+    with torch.no_grad():
+        li = m_inc(tok, lens).logits[-1]
+        lg = m_gr(tok, lens).logits[-1]
+    e_logit = (li - lg).abs().max().item()
+    print(f"  grade-vs-incumbent at init: single-block global-slot err "
+          f"{g_same:.2e}, graded-slot diff {g_diff:.2e}; multi-block "
+          f"diff {m_diff:.2e}; logits diff {e_logit:.2e}")
+    assert g_same == 0.0 and g_diff > 0 and m_diff > 1e-4 and e_logit > 1e-4
+
+
+def test_stream_arms():
+    # STREAM / TREE-WIDTH ARMS (architecture review 2026-09-24; draft
+    # prereg docs/OPERA_Stream_prereg.md): head_mode, resid_mode,
+    # fold_gate, fold_h0, state_mult.
+    torch.manual_seed(0)
+    base = dict(vocab_size=101, d=64, nb=16, num_layers=2, pe_mode='none',
+                rot_mode='free', fold_mode='left')
+
+    def build(seed=31, **kw):
+        torch.manual_seed(seed)
+        return OperaSpinorFenwickTree(**{**base, **kw})
+
+    def dead_params(mm):
+        tok = torch.randint(1, 101, (3, 21))
+        lens = torch.tensor([21, 14, 9])
+        mm.zero_grad(set_to_none=True)
+        loss, _, _ = lm_loss(mm(tok, lens).logits, tok, lens)
+        loss.backward()
+        assert torch.isfinite(loss)
+        return sorted(n for n, p in mm.named_parameters()
+                      if p.grad is None or p.grad.abs().max() == 0)
+
+    def causality(mm):
+        mm.eval()
+        tok = torch.randint(1, 101, (1, 23))
+        lens = torch.tensor([23])
+        tok2 = tok.clone()
+        tok2[0, 17] = (tok2[0, 17] + 5) % 100 + 1
+        with torch.no_grad():
+            a = mm(tok, lens).logits[-1][0]
+            b = mm(tok2, lens).logits[-1][0]
+        mm.train()
+        return ((a[:17] - b[:17]).abs().max().item(),
+                (a[17:] - b[17:]).abs().max().item())
+
+    def decoder_err(mm):
+        mm.eval()
+        T = 33                        # odd + crosses power-of-2 boundaries
+        tok = torch.randint(1, 100, (1, T))
+        with torch.no_grad():
+            full = mm(tok, torch.tensor([T]), head_last_only=True).logits[-1][0]
+            dec = OperaDecoder(mm)
+            inc = torch.stack([dec.append(int(t)) for t in tok[0]])
+        mm.train()
+        return (full - inc).abs().max().item()
+
+    # (a) flags-off: the last layer's cross_mlp/blend_gate are dead (the
+    #     review finding this arm set exists to fix) -- documented here so
+    #     a silent change to either side is caught.
+    dead0 = dead_params(build())
+    assert dead0 == sorted(['mod_depth'] + [
+        n for n, _ in build().named_parameters()
+        if n.startswith(('cross_mlp.1.', 'blend_gate.1.'))]), dead0
+    print(f"  stream a: flags-off dead params = mod_depth + last layer's "
+          f"cross_mlp/blend_gate ({len(dead0)} tensors), as documented")
+
+    # (b) every arm: exact causality, incremental decoder exact vs full
+    #     forward; dead params = mod_depth (lock_mode='none') only under
+    #     head_mode='stream', else also the fold-head's dead last layer.
+    arms = [
+        ('stream', dict(head_mode='stream')),
+        ('stream+add', dict(head_mode='stream', resid_mode='add')),
+        ('fold_gate', dict(fold_gate='separate')),
+        ('h0', dict(fold_h0=True)),
+        ('mult2', dict(state_mult=2)),
+        ('mult2+gb+tie', dict(state_mult=2, tie=True,
+                              fold_gate_bias=(2.0, 0.0, -2.0))),
+        ('all', dict(head_mode='stream', resid_mode='add',
+                     fold_gate='separate', fold_h0=True, state_mult=2,
+                     pe_mode='sin')),
+    ]
+    for tag, kw in arms:
+        mm = build(**kw)
+        dead = dead_params(mm)
+        exp = (['mod_depth'] if kw.get('head_mode') == 'stream' else dead0)
+        assert dead == exp, (tag, dead)
+        before, after = causality(mm)
+        assert before == 0.0 and after > 1e-6, (tag, before, after)
+        derr = decoder_err(mm)
+        assert derr < 1e-5, (tag, derr)
+        print(f"  stream b [{tag}]: {count_params(mm):,} params, "
+              f"{len(dead) - 1} dead tensors; causality {before:.0e}; "
+              f"decoder err {derr:.1e}")
+
+    # (c) resid_mode='add' creates no blend gate; requires head 'stream'.
+    assert build(head_mode='stream', resid_mode='add').blend_gate is None
+    try:
+        build(resid_mode='add')
+        raise AssertionError("resid_mode='add' without 'stream' accepted")
+    except AssertionError as e:
+        assert 'stream' in str(e)
+
+    # (d) fold_gate='separate': a COPY of the tree gate -> every shared
+    #     param bitwise the incumbent and forward bitwise at init; after
+    #     one step the two gates receive different gradients.
+    m_i, m_f = build(), build(fold_gate='separate')
+    sd_i, sd_f = m_i.state_dict(), m_f.state_dict()
+    extra = sorted(set(sd_f) - set(sd_i))
+    assert all(k.startswith('fusion_gate_fold.') for k in extra) and extra
+    assert all(torch.equal(sd_i[k], sd_f[k]) for k in sd_i)
+    tok = torch.randint(1, 101, (2, 19))
+    lens = torch.tensor([19, 12])
+    m_i.eval(); m_f.eval()
+    with torch.no_grad():
+        e = max((x - y).abs().max().item() for x, y in
+                zip(m_i(tok, lens).logits, m_f(tok, lens).logits))
+    m_f.train()
+    loss, _, _ = lm_loss(m_f(tok, lens).logits, tok, lens)
+    loss.backward()
+    gt = m_f.fusion_gate[0].weight.grad
+    gf = m_f.fusion_gate_fold[0].weight.grad
+    gdiff = (gt - gf).abs().max().item()
+    print(f"  stream d: fold_gate copy -> logits err {e:.1e} at init; "
+          f"tree/fold gate grads differ by {gdiff:.2e}")
+    assert e == 0.0 and gdiff > 1e-8
+
+    # (e) fold_h0: zero-init, receives gradient; composes with fold_grade
+    #     (causal, finite); the decoder refuses fold_grade explicitly.
+    m_h = build(fold_h0=True)
+    assert all(p.abs().max() == 0 for p in m_h.fold_h0)
+    dead_params(m_h)
+    gh = m_h.fold_h0[0].grad.abs().max().item()
+    m_hg = build(fold_h0=True, fold_grade=(4, 4))
+    assert dead_params(m_hg) == dead0
+    before, after = causality(m_hg)
+    assert before == 0.0 and after > 1e-6
+    try:
+        OperaDecoder(m_hg)
+        raise AssertionError("decoder accepted fold_grade")
+    except NotImplementedError:
+        pass
+    print(f"  stream e: h0 grad {gh:.2e}; h0+grade causality {before:.0e}; "
+          f"decoder refuses fold_grade")
+    assert gh > 0
+
+    # (f) state_mult=2: exact param delta (tree modules at 2x width + the
+    #     two projections); msup reads nodes through tree_out.
+    m1, m2 = build(), build(state_mult=2)
+    d, nb, L = 64, 16, 2
+    tree1 = sum(p.numel() for n, p in m1.named_parameters()
+                if n.startswith(('fusion_gate', 'rot_free', 'comp_norm')))
+    tree2 = sum(p.numel() for n, p in m2.named_parameters()
+                if n.startswith(('fusion_gate', 'rot_free', 'comp_norm')))
+    exp_tree2 = L * ((4 * d) * (6 * nb) + 6 * nb   # fusion gate, 2x width
+                     + 3 * (2 * nb) * 9            # rot_free
+                     + 2 * (2 * d))                # comp_norm
+    proj = sum(p.numel() for n, p in m2.named_parameters()
+               if n.startswith(('tree_in', 'tree_out')))
+    assert tree2 == exp_tree2 and proj == L * 2 * d * (2 * d)
+    assert count_params(m2) - count_params(m1) == (tree2 - tree1) + proj
+    out = m2(tok, lens, return_levels=True)
+    assert out.levels[0][0].shape[-1] == 2 * d
+    ms = msup_loss(m2, out.levels, tok, lens)
+    assert torch.isfinite(ms)
+    ms.backward()
+    assert m2.tree_out[0].weight.grad is not None
+    print(f"  stream f: state_mult=2 tree params {tree1:,} -> {tree2:,} "
+          f"(+{proj:,} projections); msup {ms.item():.3f} via tree_out")
+
+    # (g) optimizer routing: h0 (1-D per layer) and norms -> AdamW;
+    #     projections -> Muon; the fold gate follows the tree gate's
+    #     routing (in Muon exactly when 'fusion_gate' is included).
+    m_all = build(head_mode='stream', resid_mode='add',
+                  fold_gate='separate', fold_h0=True, state_mult=2)
+    mu, ad = split_muon_params(m_all, include=('fusion_gate',))
+    mu_n, ad_n = {n for n, _ in mu}, {n for n, _ in ad}
+    assert {'fold_h0.0', 'fold_h0.1'} <= ad_n
+    assert not any(n.startswith(('stream_norm', 'tree_in_norm'))
+                   for n in mu_n)
+    assert {'tree_in.0.weight', 'tree_out.1.weight',
+            'fusion_gate_fold.0.weight'} <= mu_n
+    mu0, _ = split_muon_params(m_all)
+    assert 'fusion_gate_fold.0.weight' not in {n for n, _ in mu0}
+    print("  stream g: Muon/AdamW routing correct for all new tensors")
+
+
+def test_node_mix_and_state_tie():
+    # node_mix_rank (identity-init cross-slot mixing, MLP-LDRU evidence)
+    # and state_tie (gates/rotors shared across state_mult copies, M2RNN
+    # evidence) -- docs/OPERA_Literature_Scan_2026-09-24.md §5.
+    torch.manual_seed(0)
+    base = dict(vocab_size=101, d=64, nb=16, num_layers=2, pe_mode='none',
+                rot_mode='free', fold_mode='left')
+    tok = torch.randint(1, 101, (3, 21))
+    lens = torch.tensor([21, 14, 9])
+
+    def build(seed=41, **kw):
+        torch.manual_seed(seed)
+        return OperaSpinorFenwickTree(**{**base, **kw})
+
+    def causal_and_decoder(mm):
+        mm.eval()
+        t1 = torch.randint(1, 100, (1, 33))
+        t2 = t1.clone()
+        t2[0, 20] = (t2[0, 20] + 5) % 99 + 1
+        L1 = torch.tensor([33])
+        with torch.no_grad():
+            a = mm(t1, L1, head_last_only=True).logits[-1][0]
+            b = mm(t2, L1, head_last_only=True).logits[-1][0]
+            dec = OperaDecoder(mm)
+            inc = torch.stack([dec.append(int(t)) for t in t1[0]])
+        mm.train()
+        return ((a[:20] - b[:20]).abs().max().item(),
+                (a[20:] - b[20:]).abs().max().item(),
+                (a - inc).abs().max().item())
+
+    # (a) node_mix: shared params + forward bitwise the incumbent at init
+    #     (U = 0), U receives gradient, causal, decoder-exact, Muon-routed.
+    m_i, m_n = build(), build(node_mix_rank=8)
+    sd_i, sd_n = m_i.state_dict(), m_n.state_dict()
+    assert sorted(set(sd_n) - set(sd_i)) == [
+        'node_mix_down.0', 'node_mix_down.1', 'node_mix_up.0', 'node_mix_up.1']
+    assert all(torch.equal(sd_i[k], sd_n[k]) for k in sd_i)
+    m_i.eval(); m_n.eval()
+    with torch.no_grad():
+        e = max((x - y).abs().max().item() for x, y in
+                zip(m_i(tok, lens).logits, m_n(tok, lens).logits))
+    m_n.train()
+    loss, _, _ = lm_loss(m_n(tok, lens).logits, tok, lens)
+    loss.backward()
+    gU = m_n.node_mix_up[0].grad.abs().max().item()
+    before, after, derr = causal_and_decoder(m_n)
+    mu, _ = split_muon_params(m_n)
+    assert {'node_mix_up.0', 'node_mix_down.1'} <= {n for n, _ in mu}
+    print(f"  node-mix: bitwise at init (logits err {e:.0e}); dL/dU {gU:.2e}; "
+          f"causality {before:.0e}; decoder err {derr:.1e}")
+    assert e == 0.0 and gU > 0 and before == 0.0 and after > 1e-6
+    assert derr < 1e-5
+
+    # (b) state_tie: exact param shapes (gates/rotors at nb, state at k*nb).
+    k, d, nb, L = 2, 64, 16, 2
+    m_t = build(state_mult=k, state_tie=True)
+    assert m_t.fusion_gate[0].weight.shape == (3 * nb, 2 * k * d)
+    assert m_t.rot_free.shape == (L, 3, nb, 3, 3)
+    R_L, _, _ = m_t.get_rotations(0)
+    assert R_L.shape == (k * nb, 3, 3) and torch.equal(R_L[:nb], R_L[nb:])
+    # tying is real: children whose two copies are identical produce a
+    # parent whose two copies are identical (same gates, rotors, product;
+    # LayerNorm's affine is ones/zeros at init). Untied state_mult is
+    # the negative control.
+    def copy_gap(mm):
+        mm.eval()
+        with torch.no_grad():
+            hl = torch.randn(4, d).repeat(1, k)   # copy-major: [c0 | c1]
+            hr = torch.randn(4, d).repeat(1, k)
+            p = mm._compose(hl, hr, 0, *mm.get_rotations(0))[0]
+        mm.train()
+        return (p[:, :d] - p[:, d:]).abs().max().item()
+    gap_t, gap_u = copy_gap(m_t), copy_gap(build(state_mult=k))
+    print(f"  state-tie: copy gap tied {gap_t:.1e} vs untied {gap_u:.2e}")
+    assert gap_t < 1e-6 and gap_u > 1e-3
+    for tag, kw in (('tie', dict(state_mult=k, state_tie=True)),
+                    ('tie+stream+mix+h0+gb',
+                     dict(state_mult=k, state_tie=True, head_mode='stream',
+                          node_mix_rank=8, fold_h0=True,
+                          fold_gate_bias=(2.0, 0.0, -2.0)))):
+        mm = build(**kw)
+        mm.zero_grad(set_to_none=True)
+        loss, _, _ = lm_loss(mm(tok, lens).logits, tok, lens)
+        loss.backward()
+        dead = sorted(n for n, p in mm.named_parameters()
+                      if p.grad is None or p.grad.abs().max() == 0)
+        before, after, derr = causal_and_decoder(mm)
+        print(f"  state-tie [{tag}]: {count_params(mm):,} params, "
+              f"{len(dead)} dead tensors; causality {before:.0e}; "
+              f"decoder err {derr:.1e}")
+        assert before == 0.0 and after > 1e-6 and derr < 1e-5
+        if kw.get('head_mode') == 'stream':
+            # node_mix_down's gradient is proportional to node_mix_up = 0
+            # at init (LoRA convention: only the first step is blind)
+            assert [n for n in dead if not n.startswith('node_mix_down')] \
+                == ['mod_depth'], dead
+    try:
+        build(state_tie=True)
+        raise AssertionError("state_tie without state_mult accepted")
+    except AssertionError as e2:
+        assert 'state_mult' in str(e2)
+
+
+def test_innov_and_disent():
+    # INNOVATION FOLD (fold_innov_rank) and CAUSAL DISENTANGLER
+    # (tree_disent_rank) -- docs/OPERA_Redundancy_Research_2026-09-24.md
+    # §4 2a/2b.
+    torch.manual_seed(0)
+    base = dict(vocab_size=101, d=64, nb=16, num_layers=2, pe_mode='none',
+                rot_mode='free', fold_mode='left')
+    tok = torch.randint(1, 101, (3, 21))
+    lens = torch.tensor([21, 14, 9])
+
+    def build(seed=51, **kw):
+        torch.manual_seed(seed)
+        return OperaSpinorFenwickTree(**{**base, **kw})
+
+    for flag, up in (('fold_innov_rank', 'fold_innov_up'),
+                     ('tree_disent_rank', 'tree_disent_up')):
+        m_i, m_x = build(), build(**{flag: 8})
+        sd_i, sd_x = m_i.state_dict(), m_x.state_dict()
+        assert all(torch.equal(sd_i[k], sd_x[k]) for k in sd_i)
+        m_i.eval(); m_x.eval()
+        with torch.no_grad():
+            e = max((a - b).abs().max().item() for a, b in
+                    zip(m_i(tok, lens).logits, m_x(tok, lens).logits))
+        m_x.train()
+        loss, _, _ = lm_loss(m_x(tok, lens).logits, tok, lens)
+        loss.backward()
+        gU = getattr(m_x, up)[0].grad.abs().max().item()
+        # make the map live, then causality + decoder exactness
+        with torch.no_grad():
+            for P in getattr(m_x, up):
+                P.normal_(0.0, 0.05)
+        m_x.eval()
+        t1 = torch.randint(1, 100, (1, 33))
+        t2 = t1.clone()
+        t2[0, 20] = (t2[0, 20] + 5) % 99 + 1
+        L1 = torch.tensor([33])
+        with torch.no_grad():
+            a = m_x(t1, L1, head_last_only=True).logits[-1][0]
+            b = m_x(t2, L1, head_last_only=True).logits[-1][0]
+            dec = OperaDecoder(m_x)
+            inc = torch.stack([dec.append(int(t)) for t in t1[0]])
+        before = (a[:20] - b[:20]).abs().max().item()
+        after = (a[20:] - b[20:]).abs().max().item()
+        derr = (a - inc).abs().max().item()
+        mu, _ = split_muon_params(m_x)
+        assert f'{up}.0' in {n for n, _ in mu}
+        print(f"  {flag}: bitwise at init (err {e:.0e}); dL/dU {gU:.2e}; "
+              f"live: causality {before:.0e}, decoder err {derr:.1e}")
+        assert e == 0.0 and gU > 0 and before == 0.0 and after > 1e-6
+        assert derr < 1e-5
+
+    # the disentangler reads the LEFT neighbour only: perturbing leaf j
+    # moves node j+1 of level 0 (its right neighbour) and never node j-1
+    m = build(tree_disent_rank=8)
+    with torch.no_grad():
+        for P in m.tree_disent_up:
+            P.normal_(0.0, 0.05)
+        x = torch.randn(1, 8, 64)
+        x2 = x.clone()
+        x2[0, 4] += 1.0
+        l0a = m._disentangle(x, 0)
+        l0b = m._disentangle(x2, 0)
+    moved = (l0a - l0b).abs().amax(-1)[0]
+    assert moved[3] == 0 and moved[4] > 0 and moved[5] > 0 and moved[6] == 0
+    print("  tree_disent: node j+1 reads node j; nodes < j and > j+1 untouched")
+
+
+def test_lowrank_gain():
+    # lowrank_gain: gain * (x V) U^T / (|U||V|) for node_mix / fold_innov /
+    # tree_disent. Bitwise incumbent at init (gain = 0), gradient reaches
+    # the gain at init (no dead-lock), |correction| <= |gain| |x|, gains
+    # on AdamW and U/V on Muon, causal + decoder-exact once live.
+    torch.manual_seed(0)
+    base = dict(vocab_size=101, d=64, nb=16, num_layers=2, pe_mode='none',
+                rot_mode='free', fold_mode='left')
+    tok = torch.randint(1, 101, (3, 21))
+    lens = torch.tensor([21, 14, 9])
+    for flag, name in (('node_mix_rank', 'node_mix'),
+                       ('fold_innov_rank', 'fold_innov'),
+                       ('tree_disent_rank', 'tree_disent')):
+        torch.manual_seed(61)
+        m_i = OperaSpinorFenwickTree(**base)
+        torch.manual_seed(61)
+        m_g = OperaSpinorFenwickTree(**base, lowrank_gain=True, **{flag: 8})
+        sd_i, sd_g = m_i.state_dict(), m_g.state_dict()
+        assert all(torch.equal(sd_i[k], sd_g[k]) for k in sd_i)
+        m_i.eval(); m_g.eval()
+        with torch.no_grad():
+            e = max((a - b).abs().max().item() for a, b in
+                    zip(m_i(tok, lens).logits, m_g(tok, lens).logits))
+        m_g.train()
+        loss, _, _ = lm_loss(m_g(tok, lens).logits, tok, lens)
+        loss.backward()
+        gg = getattr(m_g, name + '_gain')[0].grad.abs().item()
+        mu, ad = split_muon_params(m_g)
+        assert f'{name}_gain.0' in {n for n, _ in ad}
+        assert {f'{name}_up.0', f'{name}_down.0'} <= {n for n, _ in mu}
+        # calibration: for isotropic x the TYPICAL |corr|/|x| equals gain
+        # (rms over samples), whatever the norms of U and V
+        with torch.no_grad():
+            getattr(m_g, name + '_gain')[0].fill_(0.5)
+            getattr(m_g, name + '_up')[0].mul_(7.0)       # norms cancel
+            x = torch.randn(4096, 64) * 3.0
+            c = m_g._lowrank_corr(x, name, 0)
+            ratio = ((c.norm(dim=-1) ** 2).mean()
+                     / (x.norm(dim=-1) ** 2).mean()).sqrt().item()
+            for gpar in getattr(m_g, name + '_gain'):
+                gpar.fill_(0.3)
+        m_g.eval()
+        t1 = torch.randint(1, 100, (1, 33))
+        t2 = t1.clone()
+        t2[0, 20] = (t2[0, 20] + 5) % 99 + 1
+        L1 = torch.tensor([33])
+        with torch.no_grad():
+            a = m_g(t1, L1, head_last_only=True).logits[-1][0]
+            b = m_g(t2, L1, head_last_only=True).logits[-1][0]
+            dec = OperaDecoder(m_g)
+            inc = torch.stack([dec.append(int(t)) for t in t1[0]])
+        before = (a[:20] - b[:20]).abs().max().item()
+        derr = (a - inc).abs().max().item()
+        print(f"  lowrank_gain [{name}]: bitwise at init (err {e:.0e}); "
+              f"dL/dgain {gg:.2e}; rms |corr|/|x| {ratio:.3f} (gain 0.5); "
+              f"causality {before:.0e}; decoder err {derr:.1e}")
+        assert e == 0.0 and gg > 0 and abs(ratio - 0.5) < 0.05
+        assert before == 0.0 and derr < 1e-5
+
+
+def test_counterclockwise_fold():
+    # fold_dir='both': right-nested (counterclockwise) fold joined to the
+    # left fold by a zero-init per-slot gain.
+    torch.manual_seed(0)
+    base = dict(vocab_size=101, d=64, nb=16, num_layers=2, pe_mode='none',
+                rot_mode='free', fold_mode='left')
+    tok = torch.randint(1, 101, (3, 21))
+    lens = torch.tensor([21, 14, 9])
+    for impl in ('compact', 'downsweep'):
+        torch.manual_seed(71)
+        m_i = OperaSpinorFenwickTree(**base, fold_impl=impl)
+        torch.manual_seed(71)
+        m_b = OperaSpinorFenwickTree(**base, fold_impl=impl, fold_dir='both')
+        sd_i, sd_b = m_i.state_dict(), m_b.state_dict()
+        assert sorted(set(sd_b) - set(sd_i)) == ['fold_join_gain.0',
+                                                  'fold_join_gain.1']
+        assert all(torch.equal(sd_i[k], sd_b[k]) for k in sd_i)
+        m_i.eval(); m_b.eval()
+        with torch.no_grad():
+            e = max((a - b).abs().max().item() for a, b in
+                    zip(m_i(tok, lens).logits, m_b(tok, lens).logits))
+        m_b.train()
+        loss, _, _ = lm_loss(m_b(tok, lens).logits, tok, lens)
+        loss.backward()
+        gg = m_b.fold_join_gain[0].grad.abs().max().item()
+        _, ad = split_muon_params(m_b)
+        assert 'fold_join_gain.0' in {n for n, _ in ad}
+        # the right fold equals a naive per-position right-nested fold
+        with torch.no_grad():
+            T = 23
+            x = m_b.word_emb(torch.randint(1, 101, (2, T)))
+            R = m_b.get_rotations(0)
+            lv, _, _ = m_b.build_tree(x, 0, *R)
+            offs, off = [], 0
+            for lvl_ in lv:
+                offs.append(off)
+                off += lvl_.shape[1]
+            idx, count, S, lvl, _ = m_b._fenwick_indices(T, len(lv), offs,
+                                                         x.device)
+            gathered = torch.cat(lv, 1)[:, idx.reshape(-1)].reshape(2, T, S, -1)
+            fast = m_b._right_fold(gathered, count, S, 0, *R)
+            table, _ = fenwick_blocks(T)
+            werr = 0.0
+            for t in range(T):
+                blocks = [lv[k][:, j] for (k, j) in table[t]]
+                acc = blocks[-1]
+                for b in reversed(blocks[:-1]):
+                    acc = m_b._compose(b, acc, 0, *R, fold=True)[0]
+                werr = max(werr, (acc - fast[:, t]).abs().max().item())
+            for gpar in m_b.fold_join_gain:
+                gpar.fill_(0.4)
+        m_b.eval()
+        t1 = torch.randint(1, 100, (1, 33))
+        t2 = t1.clone()
+        t2[0, 20] = (t2[0, 20] + 5) % 99 + 1
+        L1 = torch.tensor([33])
+        with torch.no_grad():
+            a = m_b(t1, L1, head_last_only=True).logits[-1][0]
+            b = m_b(t2, L1, head_last_only=True).logits[-1][0]
+            dec = OperaDecoder(m_b)
+            inc = torch.stack([dec.append(int(t)) for t in t1[0]])
+        before = (a[:20] - b[:20]).abs().max().item()
+        after = (a[20:] - b[20:]).abs().max().item()
+        derr = (a - inc).abs().max().item()
+        print(f"  ccw fold [{impl}]: bitwise at init (err {e:.0e}); "
+              f"dL/dgain {gg:.2e}; right fold vs naive {werr:.1e}; "
+              f"causality {before:.0e}; decoder err {derr:.1e}")
+        assert e == 0.0 and gg > 0 and werr < 1e-5
+        assert before == 0.0 and after > 1e-6 and derr < 1e-5
+
+
+def test_future_bag():
+    # future_bag=(W, K): training-only head predicting hashed trigrams of
+    # the next W tokens. Forward is untouched (bitwise), targets match a
+    # brute-force count, the loss reaches the fold's parameters.
+    torch.manual_seed(0)
+    base = dict(vocab_size=101, d=64, nb=16, num_layers=2, pe_mode='none',
+                rot_mode='free', fold_mode='left', head_mode='stream')
+    torch.manual_seed(81)
+    m_i = OperaSpinorFenwickTree(**base)
+    torch.manual_seed(81)
+    m_f = OperaSpinorFenwickTree(**base, future_bag=(8, 32))
+    sd_i, sd_f = m_i.state_dict(), m_f.state_dict()
+    assert sorted(set(sd_f) - set(sd_i)) == ['future_head.bias',
+                                              'future_head.weight']
+    assert all(torch.equal(sd_i[k], sd_f[k]) for k in sd_i)
+    tok = torch.randint(1, 101, (2, 40))
+    lens = torch.tensor([40, 30])
+    m_i.eval(); m_f.eval()
+    with torch.no_grad():
+        e = max((a - b).abs().max().item() for a, b in
+                zip(m_i(tok, lens).logits, m_f(tok, lens).logits))
+    # brute-force target check through a capturing head
+    W, K = 8, 32
+    cap = {}
+    orig = m_f.future_head.forward
+    def spy(hh):
+        cap['n'] = hh.shape
+        return orig(hh)
+    m_f.future_head.forward = spy
+    m_f.train()
+    out = m_f(tok, lens, return_states=True)
+    loss = future_bag_loss(m_f, out.states[-1], tok, lens, n_pos=16)
+    m_f.future_head.forward = orig
+    x = tok
+    x1 = torch.nn.functional.pad(x, (1, 0))[:, :40]
+    x2 = torch.nn.functional.pad(x, (2, 0))[:, :40]
+    hsh = (x * 1000003 + x1 * 10007 + x2 * 101) % K
+    g = torch.Generator(device='cpu').manual_seed(40)
+    t = torch.randint(0, 40 - W, (2, 16), generator=g)
+    ok = True
+    for b in range(2):
+        for j in range(16):
+            tt = int(t[b, j])
+            brute = torch.bincount(hsh[b, tt + 1:tt + W + 1], minlength=K)
+            ok &= int(brute.sum()) == W
+    loss.backward()
+    gfold = m_f.fusion_gate[0].weight.grad.abs().max().item()
+    print(f"  future_bag: forward bitwise (err {e:.0e}); aux loss "
+          f"{loss.item():.3f} (ln K = {math.log(K):.3f}); head input "
+          f"{tuple(cap['n'])}; window counts = W: {ok}; grad at fold "
+          f"{gfold:.2e}")
+    assert e == 0.0 and ok and gfold > 0 and torch.isfinite(loss)
+
+
+def test_far_repeat_and_byte_dropout():
+    # far_repeat_mask vs brute force; weighting keeps the loss scale;
+    # train() runs with far weighting and byte dropout.
+    torch.manual_seed(0)
+    rng = random.Random(5)
+    T, n, D = 300, 4, 20
+    seq = [rng.randrange(3, 12) for _ in range(T)]      # small alphabet -> repeats
+    x = torch.tensor([seq, seq[::-1]])
+    lens = torch.tensor([T, T - 37])
+    fast = far_repeat_mask(x, lens, n, D)
+    brute = torch.zeros(2, T - 1, dtype=torch.bool)
+    for b in range(2):
+        xs = x[b].tolist()
+        for i in range(n - 1, int(lens[b])):
+            g = tuple(xs[i - n + 1:i + 1])
+            prev = [j for j in range(n - 1, i) if tuple(xs[j - n + 1:j + 1]) == g]
+            if prev and i - prev[-1] > D and i >= 1:
+                brute[b, i - 1] = True
+    assert torch.equal(fast, brute), (fast ^ brute).sum()
+    # weighting redistributes, does not rescale: uniform weights == plain
+    m = OperaSpinorFenwickTree(vocab_size=20, d=64, nb=16, num_layers=2,
+                               pe_mode='none', rot_mode='free')
+    tok = torch.randint(3, 20, (2, 40))
+    ll = torch.tensor([40, 31])
+    out = m(tok, ll, return_states=True, head_last_only=True)
+    a, _, _ = train_lm_loss(m, out.states, tok, ll, final_logits=out.logits[0])
+    b, _, _ = train_lm_loss(m, out.states, tok, ll, final_logits=out.logits[0],
+                            target_weights=torch.full((2, 39), 3.0))
+    assert abs(a.item() - b.item()) < 1e-5
+    print(f"  far-repeat mask == brute force ({int(fast.sum())} marked of "
+          f"{int((torch.arange(T - 1)[None] < lens[:, None] - 1).sum())}); "
+          f"uniform weights leave the loss unchanged ({a.item():.4f})")
+    import tempfile as _tf
+    rng2 = random.Random(12)
+    V = 64
+    mk = lambda k, lo, hi: [[rng2.randrange(3, V) for _ in range(rng2.randrange(lo, hi))]
+                            for _ in range(k)]
+    data = (mk(80, 20, 33), mk(30, 20, 33), mk(16, 33, 65), V)
+    with _tf.TemporaryDirectory() as tmp:
+        res = train(steps=4, batch=8, max_len=32, vocab_size=V, d=64, nb=16,
+                    num_layers=2, eval_max_len=64, device='cpu',
+                    pe_mode='none', fold_mode='left', rot_mode='free',
+                    data=data, idx2word=None, out_dir=tmp,
+                    compile_mode='off', use_amp=False, gpu_data=False,
+                    warmup_steps=2, seed=3, optimizer='muon',
+                    far_weight=4.0, far_n=4, far_d=8, byte_dropout=0.15)
+    assert math.isfinite(res['final_loss'])
+    print(f"  train() with far weighting + byte dropout: loss "
+          f"{res['final_loss']:.3f}")
+
+
+def test_metal_equivalence():
+    # use_metal=True (fused compose kernel, MPS only): same model as the
+    # eager path -- loss, logits and gradients -- for the configurations
+    # in use (stream head + downsweep, bounded node mixing, fold gate
+    # bias). Skipped where MPS is unavailable.
+    torch.manual_seed(0)
+    if not torch.backends.mps.is_available():
+        print("  metal: MPS unavailable -- skipped")
+        return
+    from .losses import train_lm_loss as _tll
+    dev = 'mps'
+    ids = torch.randint(3, 101, (2, 97), device=dev)
+    lens = torch.tensor([97, 60], device=dev)
+    for kw in (dict(head_mode='stream', fold_impl='downsweep'),
+               dict(head_mode='stream', fold_impl='downsweep',
+                    node_mix_rank=16, lowrank_gain=True),
+               dict(fold_gate_bias=(2.0, 0.0, -2.0))):
+        outs = []
+        for metal in (False, True):
+            torch.manual_seed(0)
+            m = OperaSpinorFenwickTree(vocab_size=101, d=64, nb=16,
+                                       num_layers=2, pe_mode='none',
+                                       rot_mode='free', use_metal=metal,
+                                       **kw).to(dev)
+            if kw.get('node_mix_rank'):
+                with torch.no_grad():
+                    for g in m.node_mix_gain:
+                        g.fill_(0.3)
+            out = m(ids, lens, return_states=True, head_last_only=True)
+            loss, _, _ = _tll(m, out.states, ids, lens,
+                              final_logits=out.logits[0])
+            loss.backward()
+            outs.append((loss.item(), out.logits[0].detach().cpu(),
+                         {n: p.grad.cpu() for n, p in m.named_parameters()
+                          if p.grad is not None}))
+        (l0, lg0, g0), (l1, lg1, g1) = outs
+        gerr = max(((g0[n] - g1[n]).norm() / (g0[n].norm() + 1e-12)).item()
+                   for n in g0)
+        lerr = (lg0 - lg1).abs().max().item()
+        print(f"  metal {kw}: loss diff {abs(l0 - l1):.1e}, logit diff "
+              f"{lerr:.1e}, worst grad rel diff {gerr:.1e}")
+        assert abs(l0 - l1) < 1e-4 and lerr < 1e-3 and gerr < 1e-2
+
+
+def test_resid_init_scale():
+    # resid_init_scale: in-place scaling of cross_mlp output projections
+    # (no RNG) -> all other params bitwise; 'auto' = 1/sqrt(2L); with the
+    # additive residual the L=8 stack is near-isometric at init.
+    torch.manual_seed(0)
+    base = dict(vocab_size=101, d=64, nb=16, num_layers=8, pe_mode='none',
+                rot_mode='free', head_mode='stream', resid_mode='add')
+    torch.manual_seed(91)
+    m0 = OperaSpinorFenwickTree(**base)
+    torch.manual_seed(91)
+    m1 = OperaSpinorFenwickTree(**base, resid_init_scale='auto')
+    sd0, sd1 = m0.state_dict(), m1.state_dict()
+    for k in sd0:
+        if k.startswith('cross_mlp.') and k.endswith('.2.weight'):
+            assert torch.allclose(sd1[k], sd0[k] / 4.0)
+        elif k.startswith('cross_mlp.') and k.endswith('.2.bias'):
+            assert sd1[k].abs().max() == 0
+        else:
+            assert torch.equal(sd0[k], sd1[k]), k
+    def growth(m):
+        m = m.double().eval()
+        tok = torch.randint(3, 101, (2, 64))
+        ln = torch.full((2,), 64)
+        with torch.no_grad():
+            a = m(tok, ln, return_states=True).states
+            m.word_emb.weight.add_(1e-9 * torch.randn_like(m.word_emb.weight))
+            b = m(tok, ln, return_states=True).states
+        d = [(x - y).abs().max().item() for x, y in zip(a, b)]
+        return (d[-1] / d[0]) ** (1 / 7)
+    g0, g1 = growth(m0), growth(m1)
+    print(f"  resid_init_scale: only cross_mlp out-proj changed; perturbation "
+          f"growth/layer at L=8: default {g0:.2f}x, auto {g1:.2f}x")
+    assert g1 < g0 and g1 < 1.2
+
+
+def test_holographic_memory():
+    # hmem_nb: quaternion holographic memory. (a) the algebra recalls:
+    # with unit keys, conj(k_j) (x) sum_i k_i (x) v_i returns v_j exactly
+    # for one pair and with high cosine for several; (b) flags-off bitwise
+    # and gain=0 bitwise at init; (c) live: causal, decoder-exact; (d)
+    # routing: gate/gain on AdamW.
+    from .model import quat_mul, quat_conj
+    torch.manual_seed(0)
+    n = 256
+    keys = torch.nn.functional.normalize(torch.randn(32, n, 4), dim=-1)
+    vals = torch.randn(32, n, 4)
+    one = quat_mul(quat_conj(keys[0]), quat_mul(keys[0], vals[0]))
+    e1 = (one - vals[0]).abs().max().item()
+    cos = []
+    for npairs in (4, 16, 32):
+        M = quat_mul(keys[:npairs], vals[:npairs]).sum(0)
+        r = quat_mul(quat_conj(keys[1]), M)
+        cos.append(torch.nn.functional.cosine_similarity(
+            r.flatten(), vals[1].flatten(), dim=0).item())
+    print(f"  hmem algebra: 1 pair exact (err {e1:.1e}); retrieval cosine "
+          f"with 4/16/32 stored pairs (n={n} slots): "
+          + " / ".join(f"{c:.2f}" for c in cos))
+    assert e1 < 1e-5 and cos[0] > 0.4 and cos[0] > cos[-1] > 0.1
+    base = dict(vocab_size=101, d=64, nb=16, num_layers=2, pe_mode='none',
+                rot_mode='free', head_mode='stream', fold_impl='downsweep')
+    torch.manual_seed(97)
+    m0 = OperaSpinorFenwickTree(**base)
+    torch.manual_seed(97)
+    m1 = OperaSpinorFenwickTree(**base, hmem_nb=32)
+    sd0, sd1 = m0.state_dict(), m1.state_dict()
+    assert all(torch.equal(sd0[k], sd1[k]) for k in sd0)
+    tok = torch.randint(1, 101, (2, 37))
+    ln = torch.tensor([37, 30])
+    m0.eval(); m1.eval()
+    with torch.no_grad():
+        e = max((a - b).abs().max().item() for a, b in
+                zip(m0(tok, ln).logits, m1(tok, ln).logits))
+    m1.train()
+    loss, _, _ = lm_loss(m1(tok, ln).logits, tok, ln)
+    loss.backward()
+    gg = m1.hmem_gain[0].grad.abs().item()
+    mu, ad = split_muon_params(m1, ('fusion_gate',))
+    ad_n = {k for k, _ in ad}
+    assert {'hmem_gain.0', 'hmem_write_gate.0.weight'} <= ad_n
+    with torch.no_grad():
+        for g in m1.hmem_gain:
+            g.fill_(0.5)
+    m1.eval()
+    t1 = torch.randint(1, 100, (1, 33))
+    t2 = t1.clone()
+    t2[0, 20] = (t2[0, 20] + 5) % 99 + 1
+    L1 = torch.tensor([33])
+    with torch.no_grad():
+        a = m1(t1, L1, head_last_only=True).logits[-1][0]
+        b = m1(t2, L1, head_last_only=True).logits[-1][0]
+        dec = OperaDecoder(m1)
+        inc = torch.stack([dec.append(int(t)) for t in t1[0]])
+    before = (a[:20] - b[:20]).abs().max().item()
+    after = (a[20:] - b[20:]).abs().max().item()
+    derr = (a - inc).abs().max().item()
+    print(f"  hmem model: bitwise at init (err {e:.0e}); dL/dgain {gg:.2e}; "
+          f"live: causality {before:.0e}, decoder err {derr:.1e}; "
+          f"gate/gain on AdamW")
+    assert e == 0.0 and gg > 0 and before == 0.0 and after > 1e-6
+    assert derr < 1e-4
+
+
+def test_hmem_decay():
+    # hmem_decay: the parallel decay scan equals the naive recurrence; the
+    # 'gated' arm equals 'fixed' at init; flags-off unchanged; decoder
+    # exact; decay params and forget gate on AdamW; half-lives 8..4096.
+    from .model import _decay_scan
+    torch.manual_seed(0)
+    a = torch.rand(2, 37, 5, 1) * 0.5 + 0.5
+    b = torch.randn(2, 37, 5, 4)
+    fast = _decay_scan(a, b)
+    ref = torch.zeros_like(b)
+    Mr = torch.zeros(2, 5, 4)
+    for t in range(37):
+        Mr = a[:, t] * Mr + b[:, t]
+        ref[:, t] = Mr
+    serr = (fast - ref).abs().max().item()
+    base = dict(vocab_size=101, d=64, nb=16, num_layers=2, pe_mode='none',
+                rot_mode='free', head_mode='stream', fold_impl='downsweep',
+                hmem_nb=16)
+    torch.manual_seed(5)
+    m0 = OperaSpinorFenwickTree(**base)
+    torch.manual_seed(5)
+    mf = OperaSpinorFenwickTree(**base, hmem_decay='fixed')
+    torch.manual_seed(5)
+    mg = OperaSpinorFenwickTree(**base, hmem_decay='gated')
+    sd0, sdf = m0.state_dict(), mf.state_dict()
+    assert all(torch.equal(sd0[k], sdf[k]) for k in sd0)
+    lam = torch.sigmoid(mf.hmem_decay_logit[0])
+    hl = torch.log(torch.tensor(0.5)) / torch.log(lam)
+    tok = torch.randint(1, 101, (2, 29))
+    ln = torch.tensor([29, 20])
+    for mm in (mf, mg):
+        with torch.no_grad():
+            for g in mm.hmem_gain:
+                g.fill_(0.5)
+        mm.eval()
+    with torch.no_grad():
+        ef = max((x - y).abs().max().item() for x, y in
+                 zip(mf(tok, ln).logits, mg(tok, ln).logits))
+    derr = 0.0
+    for mm in (mf, mg):
+        t1 = torch.randint(1, 100, (1, 33))
+        with torch.no_grad():
+            full = mm(t1, torch.tensor([33]), head_last_only=True).logits[-1][0]
+            dec = OperaDecoder(mm)
+            inc = torch.stack([dec.append(int(t)) for t in t1[0]])
+        derr = max(derr, (full - inc).abs().max().item())
+    _, ad = split_muon_params(mg, ('fusion_gate',))
+    ad_n = {k for k, _ in ad}
+    assert {'hmem_decay_logit.0', 'hmem_forget_gate.0.weight'} <= ad_n
+    print(f"  hmem_decay: scan vs recurrence {serr:.1e}; half-lives "
+          f"{hl.min():.1f}..{hl.max():.0f}; gated == fixed at init "
+          f"(err {ef:.0e}); decoder err {derr:.1e}")
+    assert serr < 1e-5 and ef < 1e-6 and derr < 1e-4
+    assert 7 < hl.min() < 9 and 4000 < hl.max() < 4200
+
+
+def test_hmem_conv():
+    # hmem_conv: zero-init taps -> same model as without (float-level);
+    # with live taps: causal, decoder-exact, taps on AdamW; on MPS the
+    # Metal path equals the eager path.
+    from .muon import split_muon_params
+    base = dict(vocab_size=101, d=64, nb=16, num_layers=2, pe_mode='none',
+                rot_mode='free', head_mode='stream', fold_impl='downsweep',
+                hmem_nb=16, hmem_decay='gated')
+    torch.manual_seed(5)
+    m0 = OperaSpinorFenwickTree(**base)
+    torch.manual_seed(5)
+    mc = OperaSpinorFenwickTree(**base, hmem_conv=4)
+    for mm in (m0, mc):
+        with torch.no_grad():
+            for g in mm.hmem_gain:
+                g.fill_(0.5)
+        mm.eval()
+    tok = torch.randint(1, 101, (2, 29))
+    ln = torch.tensor([29, 29])
+    with torch.no_grad():
+        e0 = max((x - y).abs().max().item() for x, y in
+                 zip(m0(tok, ln).logits, mc(tok, ln).logits))
+        for c in mc.hmem_conv_w:
+            c.normal_(0, 0.3)
+        a = mc(tok, ln).logits[-1]
+        tok2 = tok.clone()
+        tok2[:, 15:] = torch.randint(1, 101, (2, 14))
+        b = mc(tok2, ln).logits[-1]
+        caus = (a[:, :15] - b[:, :15]).abs().max().item()
+        live = (a[:, 15:] - b[:, 15:]).abs().max().item()
+        t1 = torch.randint(1, 100, (1, 33))
+        full = mc(t1, torch.tensor([33]), head_last_only=True).logits[-1][0]
+        dec = OperaDecoder(mc)
+        inc = torch.stack([dec.append(int(t)) for t in t1[0]])
+        derr = (full - inc).abs().max().item()
+    mu, ad = split_muon_params(mc)
+    assert not any('hmem_conv' in n for n, _ in mu)
+    merr = 0.0
+    if torch.backends.mps.is_available():
+        outs = []
+        for metal in (False, True):
+            torch.manual_seed(3)
+            m = OperaSpinorFenwickTree(**base, hmem_conv=4, use_metal=metal).to('mps')
+            with torch.no_grad():
+                for g in m.hmem_gain:
+                    g.fill_(0.5)
+                for c in m.hmem_conv_w:
+                    c.normal_(0, 0.3, generator=torch.Generator('mps').manual_seed(1))
+            tk = torch.randint(1, 101, (2, 41), device='mps')
+            lk = torch.tensor([41, 30], device='mps')
+            loss, _, _ = lm_loss(m(tk, lk).logits, tk, lk)
+            loss.backward()
+            outs.append((loss.item(), m.hmem_conv_w[0].grad.cpu().clone(),
+                         m.hmem_k[1].weight.grad.cpu().clone()))
+        merr = max(abs(outs[0][0] - outs[1][0]),
+                   *[((p - q).abs().max() / p.abs().max()).item()
+                     for p, q in zip(outs[0][1:], outs[1][1:])])
+    print(f"  hmem_conv: zero taps == no conv (err {e0:.1e}); live taps: causality "
+          f"{caus:.0e} (future changes output {live:.2f}), decoder err {derr:.1e}; "
+          f"metal vs eager {merr:.1e}; taps on AdamW")
+    assert e0 < 1e-5 and caus == 0 and live > 0 and derr < 1e-4 and merr < 1e-3
+
+
+def test_hmem_kernel():
+    # fused Metal holographic-memory core: forward and all four gradients
+    # equal PyTorch autograd of the reference; the model's metal path
+    # equals its eager path. Skipped where MPS is unavailable.
+    torch.manual_seed(0)
+    if not torch.backends.mps.is_available():
+        print("  hmem kernel: MPS unavailable -- skipped")
+        return
+    from .hmem_kernel import HmemCore, hmem_core_reference
+    dev = 'mps'
+    B, T, n = 2, 37, 5
+    k = torch.nn.functional.normalize(torch.randn(B, T, n, 4, device=dev), dim=-1)
+    v = torch.randn(B, T, n, 4, device=dev)
+    w = torch.rand(B, T, device=dev)
+    a = torch.rand(B, T, n, device=dev) * 0.5 + 0.5
+    g = torch.randn(B, T, n, 4, device=dev)
+    ref_in = [x.clone().requires_grad_() for x in (k, v, w, a)]
+    ker_in = [x.clone().requires_grad_() for x in (k, v, w, a)]
+    (hmem_core_reference(*ref_in) * g).sum().backward()
+    (HmemCore.apply(*ker_in) * g).sum().backward()
+    gerr = max(((x.grad - y.grad).abs().max() / (x.grad.abs().max() + 1e-12)).item()
+               for x, y in zip(ref_in, ker_in))
+    # fused v2 (raw projection in: normalization, sigmoids, decay inside)
+    from .hmem_kernel import HmemFused, hmem_fused_reference
+    ferr = 0.0
+    for mode in ('none', 'fixed', 'gated'):
+        C = 8 * n + 1 + (n if mode == 'gated' else 0)
+        y = torch.randn(B, T, C, device=dev)
+        L = torch.randn(n, device=dev)
+        ya, La = y.clone().requires_grad_(), L.clone().requires_grad_()
+        yb, Lb = y.clone().requires_grad_(), L.clone().requires_grad_()
+        (hmem_fused_reference(ya, La, n, mode) * g).sum().backward()
+        (HmemFused.apply(yb, Lb, n, mode) * g).sum().backward()
+        pairs = [(ya.grad, yb.grad)] + ([(La.grad, Lb.grad)] if mode != 'none' else [])
+        ferr = max([ferr] + [((p - q).abs().max() / (p.abs().max() + 1e-12)).item()
+                             for p, q in pairs])
+    base = dict(vocab_size=101, d=64, nb=16, num_layers=2, pe_mode='none',
+                rot_mode='free', head_mode='stream', fold_impl='downsweep',
+                hmem_nb=16, hmem_decay='gated')
+    outs = []
+    for metal in (False, True):
+        torch.manual_seed(3)
+        m = OperaSpinorFenwickTree(**base, use_metal=metal).to(dev)
+        with torch.no_grad():
+            for gg in m.hmem_gain:
+                gg.fill_(0.5)
+        tok = torch.randint(1, 101, (2, 41), device=dev)
+        ln = torch.tensor([41, 30], device=dev)
+        loss, _, _ = lm_loss(m(tok, ln).logits, tok, ln)
+        loss.backward()
+        outs.append((loss.item(), [q.grad.cpu().clone() for q in (
+            m.hmem_k[0].weight, m.hmem_v[1].weight, m.hmem_write_gate[0].weight,
+            m.hmem_forget_gate[1].weight, m.hmem_decay_logit[0])]))
+    mdiff = abs(outs[0][0] - outs[1][0])
+    mg = max(((p - q).abs().max() / p.abs().max()).item()
+             for p, q in zip(outs[0][1], outs[1][1]))
+    print(f"  hmem kernel: grads vs autograd rel {gerr:.1e}; fused-v2 vs "
+          f"reference (3 decay modes) {ferr:.1e}; model metal vs eager: loss "
+          f"diff {mdiff:.1e}, memory grads rel {mg:.1e}")
+    assert gerr < 1e-5 and ferr < 1e-5 and mdiff < 1e-4 and mg < 1e-3
+
+
+def test_downsweep_fold():
+    # fold_impl='downsweep': the same all-prefix left fold, top-down over
+    # the tree (~T composes/layer instead of sum(popcount-1)). Must equal
+    # the compacted fold (float reassociation only), in forward and in
+    # gradients, for every supported flag combination, and stay causal
+    # and decoder-exact.
+    torch.manual_seed(0)
+    base = dict(vocab_size=101, d=64, nb=16, num_layers=2, pe_mode='none',
+                rot_mode='free', fold_mode='left')
+    for kw in (dict(), dict(fold_gate_bias=(2.0, 0.0, -2.0)),
+               dict(fold_gate='separate', fold_innov_rank=8),
+               dict(head_mode='stream', state_mult=2, state_tie=True)):
+        worst_f = worst_g = 0.0
+        for T in (1, 2, 3, 8, 33, 100):
+            mods = []
+            for impl in ('compact', 'downsweep'):
+                torch.manual_seed(3)
+                mods.append(OperaSpinorFenwickTree(**base, fold_impl=impl, **kw))
+            if kw.get('fold_innov_rank'):
+                for mm in mods:
+                    with torch.no_grad():
+                        for P in mm.fold_innov_up:
+                            P.fill_(0.03)
+            tok = torch.randint(1, 101, (2, T))
+            lens = torch.tensor([T, max(1, T - 3)])
+            outs = [mm(tok, lens).logits for mm in mods]
+            worst_f = max(worst_f, max((a - b).abs().max().item()
+                                       for a, b in zip(*outs)))
+            if T > 1:
+                for mm, o in zip(mods, outs):
+                    lm_loss(o, tok, lens)[0].backward()
+                worst_g = max(worst_g, max(
+                    (pa.grad - pb.grad).abs().max().item()
+                    for pa, pb in zip(mods[0].parameters(),
+                                      mods[1].parameters())
+                    if pa.grad is not None))
+        print(f"  downsweep {kw or 'plain'}: max logit err {worst_f:.1e}, "
+              f"max grad err {worst_g:.1e} vs compact")
+        assert worst_f < 1e-5 and worst_g < 1e-5
+    # work count: ~T composes/layer (vs sum(popcount-1) for compact)
+    torch.manual_seed(3)
+    m = OperaSpinorFenwickTree(**base, fold_impl='downsweep')
+    calls = []
+    orig = m._compose
+    m._compose = lambda hl, *a, **k: (calls.append(hl.shape[0]),
+                                      orig(hl, *a, **k))[1]
+    T = 1024
+    with torch.no_grad():
+        x = m.word_emb(torch.randint(1, 101, (1, T)))
+        R = m.get_rotations(0)
+        lv, _, _ = orig.__self__.build_tree(x, 0, *R)
+        n_tree = sum(calls); calls.clear()
+        m.prefix_states(lv, T, 0, *R)
+    _, compact, _ = fold_work_counts(T)
+    print(f"  downsweep work @T=1024: {sum(calls)} fold composes "
+          f"(compact: {compact}); tree {n_tree}")
+    assert sum(calls) <= T and compact > 3 * sum(calls)
+
+
+def test_samuon():
+    # SAMuon-lite (Wu et al. 2026, arXiv 2608.25990, Alg. 1 variant #2)
+    torch.manual_seed(0)
+    from .muon import samuon_lite_reshape, samuon_warmup_weight
+
+    def run(sa_gamma, steps=4, warmup=0, resume_at=None, seed=3):
+        torch.manual_seed(seed)
+        W = torch.nn.Parameter(torch.randn(24, 16))
+        B = torch.nn.Parameter(torch.randn(5, 3, 3))       # batched 3x3s
+        grp = {'params': [W, B], 'names': ['w', 'b'], 'use_muon': True,
+               'lr': 0.02}
+        if sa_gamma is not None:
+            grp.update(sa_gamma=sa_gamma, sa_warmup=warmup)
+        opt = Muon([grp], lr=1e-3)
+        gens = torch.Generator().manual_seed(7)
+        for s in range(steps):
+            if resume_at is not None and s == resume_at:
+                sd = opt.state_dict()
+                opt = Muon([dict(grp, params=[W, B])], lr=1e-3)
+                opt.load_state_dict(sd)
+            W.grad = torch.randn(24, 16, generator=gens)
+            B.grad = torch.randn(5, 3, 3, generator=gens)
+            opt.step()
+        return W.detach().clone(), B.detach().clone(), opt
+
+    # (a) gamma = 1 is byte-identical to plain Muon (group key present or not)
+    w0, b0, _ = run(None)
+    w1, b1, _ = run(1.0)
+    assert torch.equal(w0, w1) and torch.equal(b0, b1)
+    # (b) warmup: w_0 = 0, so the FIRST step is exactly Muon; w ramps to 1
+    assert samuon_warmup_weight(0, 10) == 0.0
+    assert samuon_warmup_weight(10, 10) == 1.0
+    assert samuon_warmup_weight(0, 0) == 1.0
+    wa, ba, _ = run(None, steps=1)
+    wb, bb, _ = run(5.0, steps=1, warmup=10)
+    assert torch.equal(wa, wb) and torch.equal(ba, bb)
+    # (c) the reshape: power iteration finds the true head (per matrix in a
+    #     batch), the head keeps its NS coefficient, the bulk is boosted.
+    g = torch.Generator().manual_seed(1)
+    d = torch.randn(4, 24, 16, generator=g)
+    d[..., :, :] += 3.0 * torch.randn(4, 24, 1, generator=g) @ \
+        torch.randn(4, 1, 16, generator=g)                  # clear head
+    o = zeropower_via_newtonschulz5(d)
+    st = {}
+    o_sa = samuon_lite_reshape(o, d, 4.0, st, iters=20)
+    U, S, Vh = torch.linalg.svd(d)
+    u1, v1 = U[..., :, 0], Vh[..., 0, :]
+    align = (st['sa_v'] * v1).sum(-1).abs().min().item()
+    head_mu = torch.einsum('bi,bij,bj->b', u1, o.float(), v1)
+    head_sa = torch.einsum('bi,bij,bj->b', u1, o_sa.float(), v1)
+    u2, v2 = U[..., :, 1], Vh[..., 1, :]
+    bulk_mu = torch.einsum('bi,bij,bj->b', u2, o.float(), v2)
+    bulk_sa = torch.einsum('bi,bij,bj->b', u2, o_sa.float(), v2)
+    # head coefficient: gamma*c - (gamma-1) with c ~ NS's (approx-1) head
+    # coefficient -> stays O(1); bulk coefficient: exactly gamma x Muon's
+    hd = (head_sa - (4.0 * head_mu - 3.0)).abs().max().item()
+    br = (bulk_sa / bulk_mu - 4.0).abs().max().item()
+    print(f"  samuon a/b: gamma=1 and warmup step 0 bitwise Muon; "
+          f"c: head alignment {align:.4f}, head formula err {hd:.1e}, "
+          f"bulk ratio err {br:.1e}")
+    assert align > 0.999 and hd < 5e-2 and br < 5e-2
+    # (d) resume: optimizer state_dict round-trip mid-warmup is exact
+    #     (sa_step lives in the param group, sa_v in per-param state)
+    wu, bu, opt_u = run(3.54, steps=6, warmup=4)
+    wr, br_, _ = run(3.54, steps=6, warmup=4, resume_at=3)
+    assert torch.equal(wu, wr) and torch.equal(bu, br_)
+    assert opt_u.param_groups[0]['sa_step'] == 6
+    print("  samuon d: mid-warmup state_dict resume bitwise; sa_step saved")
+
 
 def test_scan_fold():
     # SCAN FOLD (OPERA-Scan arm, v8.5; design: OPERA_Scan_Arm_Design.md)
@@ -2671,6 +3857,22 @@ _ARMS = [
     test_homeo_anchor,
     test_quotient_path,
     test_fold_adapt,
+    test_fold_grade,
+    test_stream_arms,
+    test_node_mix_and_state_tie,
+    test_innov_and_disent,
+    test_downsweep_fold,
+    test_lowrank_gain,
+    test_counterclockwise_fold,
+    test_future_bag,
+    test_far_repeat_and_byte_dropout,
+    test_metal_equivalence,
+    test_resid_init_scale,
+    test_holographic_memory,
+    test_hmem_decay,
+    test_hmem_kernel,
+    test_hmem_conv,
+    test_samuon,
     test_fold_bistable,
     test_fold_relax,
     test_level_grad_balance,

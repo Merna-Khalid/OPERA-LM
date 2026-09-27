@@ -81,6 +81,13 @@ class OperaDecoder:
             raise NotImplementedError(
                 "OperaDecoder runs the eager compose path only; "
                 "set use_metal=False for inference")
+        if getattr(model, 'fold_grade', None) is not None:
+            # The graded fold masks each step's accumulator write per
+            # slot group; this decoder folds unmasked and would silently
+            # decode a different function.
+            raise NotImplementedError(
+                "fold_grade (scale-graded readout) is not supported by "
+                "OperaDecoder yet")
         self.model = model
         self.device = (device if device is not None
                        else next(model.parameters()).device)
@@ -103,6 +110,23 @@ class OperaDecoder:
         # (level 0 = leaves). Append-only; never mutated in place.
         self.nodes = [[self.model.word_emb.weight.new_zeros(0, self.model.d)]
                       for _ in range(self.model.num_layers)]
+        # tree_disent_rank: the RAW (pre-disentangle) nodes, whose left
+        # neighbour feeds the next node's disentangler update.
+        self.raw = [[self.model.word_emb.weight.new_zeros(0, self.model.d)]
+                    for _ in range(self.model.num_layers)]
+        # hmem: per-layer running memory M [n, 4] (fp32) and the previous
+        # position's unit key (zeros before the first token: no binding).
+        if getattr(self.model, 'hmem_nb', 0):
+            n = self.model.hmem_nb
+            self.hmem_M = [torch.zeros(n, 4, device=self.device)
+                           for _ in range(self.model.num_layers)]
+            self.hmem_kprev = [torch.zeros(n, 4, device=self.device)
+                               for _ in range(self.model.num_layers)]
+            # hmem_conv: the last K raw projections (row 0 = newest)
+            self.hmem_yhist = ([None] * self.model.num_layers
+                               if getattr(self.model, 'hmem_conv', 0) else None)
+        else:
+            self.hmem_M = self.hmem_kprev = None
         # T1.4: per-layer delta-rule memory state M (fp32, as in the
         # batched path). None when the arm is off.
         if getattr(self.model, 'mem_mode', 'none') == 'delta':
@@ -125,16 +149,16 @@ class OperaDecoder:
         None means inject here, with an all-True (scalar) mask."""
         m = self.model
         tok = torch.tensor([[token_id]], dtype=torch.long, device=self.device)
-        x = m.word_emb(tok)[0, 0]                                  # [d]
+        x = m.word_emb(tok)[0, 0]                          # [d_model]
         if m.pe_mode == 'sin':
-            x = x + sinusoidal_pos_enc(t + 1, m.d, self.device)[t]
+            x = x + sinusoidal_pos_enc(t + 1, m.d_model, self.device)[t]
         elif m.pe_mode == 'rotor':
-            cos, sin = rotor_pos_tables(t + 1, m.nb, self.device)
+            cos, sin = rotor_pos_tables(t + 1, m.nb_model, self.device)
             x = apply_rotor_pe(x.reshape(1, 1, -1),
-                               cos[t:], sin[t:], m.nb)[0, 0]
+                               cos[t:], sin[t:], m.nb_model)[0, 0]
         if geom is not None:
             mask = torch.ones((), dtype=torch.bool, device=self.device)
-            x = inject_geometry(x, geom, mask, m.nb, geom_block)
+            x = inject_geometry(x, geom, mask, m.nb_model, geom_block)
         return x
 
     def _fold_twist(self, blk, level, layer_idx):
@@ -154,22 +178,39 @@ class OperaDecoder:
     def append(self, token_id, geom=None, geom_block=0):
         m = self.model
         t = self.t
-        d = m.d
+        d = m.d                        # tree width
         x = self._embed_position(int(token_id), t, geom, geom_block)
-        prefix = None
+        head_in = None
         for l in range(m.num_layers):
             R_L, R_R, R_O = self.rots[l]
             levels = self.nodes[l]
 
+            # The layer's leaf: the stream, pre-normed (resid_mode='add')
+            # and lifted to tree width (state_mult) -- as in forward().
+            leaf = x
+            if m.tree_in_norm is not None:
+                leaf = m.tree_in_norm[l](leaf)
+            if m.tree_in is not None:
+                leaf = m.tree_in[l](leaf)
+
             # Insert the new leaf and build its (new) ancestor nodes.
             # Node (k, j) is composed the moment its span completes and
             # never changes afterwards -> append-only cache.
-            ins = x
+            ins = leaf
+            raws = self.raw[l]
             k = 0
             while True:
                 while len(levels) <= k:
-                    levels.append(x.new_zeros(0, d))
+                    levels.append(leaf.new_zeros(0, d))
+                    raws.append(leaf.new_zeros(0, d))
                 n = levels[k].shape[0]
+                raws[k] = torch.cat([raws[k], ins.unsqueeze(0)], 0)
+                if m.tree_disent_up is not None:
+                    # causal disentangler from the RAW left neighbour, as
+                    # in build_tree (node 0 of a level has none)
+                    if n >= 1:
+                        ins = ins + m._lowrank_corr(raws[k][n - 1],
+                                                    'tree_disent', l)
                 levels[k] = torch.cat([levels[k], ins.unsqueeze(0)], 0)
                 if (n + 1) % 2 == 0:
                     left = levels[k][n - 1].unsqueeze(0)
@@ -185,7 +226,11 @@ class OperaDecoder:
             fR_L, fR_R, fR_O = self.fold_rots[l]
             fgb = (m.fold_gate_bias[l]
                    if m.fold_gate_bias is not None else None)
-            acc = None
+            # fold_h0: start from the learned accumulator and compose
+            # every block (the batched fold's step 0), else seed with
+            # the first block.
+            acc = (m.fold_h0[l].to(leaf.dtype) if m.fold_h0 is not None
+                   else None)
             blocks = []            # (level, block state) for the readout
             for (lvl, j) in fenwick_blocks_of(t + 1):
                 blk = levels[lvl][j]
@@ -195,10 +240,22 @@ class OperaDecoder:
                 if acc is None:
                     acc = blk
                 else:
-                    acc = m._compose(acc.unsqueeze(0), blk.unsqueeze(0),
-                                     l, fR_L, fR_R, fR_O,
-                                     gate_bias=fgb)[0][0]
+                    acc = m._compose(
+                        m._fold_innov(acc, blk, l).unsqueeze(0),
+                        blk.unsqueeze(0), l, fR_L, fR_R, fR_O,
+                        gate_bias=fgb, fold=True)[0][0]
             prefix = acc
+            # fold_dir='both': counterclockwise (right-nested) fold over the
+            # same blocks, older block as the LEFT child, joined by the
+            # per-slot gain -- same ops/order as model._right_fold.
+            if getattr(m, 'fold_join_gain', None) is not None:
+                acc_r = blocks[-1][1]
+                for (_lv, blk) in reversed(blocks[:-1]):
+                    acc_r = m._compose(blk.unsqueeze(0), acc_r.unsqueeze(0),
+                                       l, fR_L, fR_R, fR_O, fold=True)[0][0]
+                g = m.fold_join_gain[l].to(acc.dtype)
+                prefix = (prefix.reshape(m.nb, 4)
+                          + g[:, None] * acc_r.reshape(m.nb, 4)).reshape(d)
 
             # T0.4: static multi-state reduction over the same blocks
             # (batched path reads the post-twist `gathered`; so do we).
@@ -215,9 +272,9 @@ class OperaDecoder:
             # T1.4: rank-one delta-rule update of this layer's memory
             # from the new leaf, then content query from the prefix.
             if self.mem is not None:
-                k = F.normalize(m.mem_k[l](x), dim=-1).float()
-                v = m.mem_v[l](x).float()
-                beta = torch.sigmoid(m.mem_beta[l](x)).float()
+                k = F.normalize(m.mem_k[l](leaf), dim=-1).float()
+                v = m.mem_v[l](leaf).float()
+                beta = torch.sigmoid(m.mem_beta[l](leaf)).float()
                 M = self.mem[l]
                 M += beta * ((v - M @ k).unsqueeze(-1) @ k.unsqueeze(0))
                 q = m.mem_q[l](prefix).float()
@@ -226,13 +283,61 @@ class OperaDecoder:
                     torch.cat([prefix, y], dim=-1)))
                 prefix = prefix + g * m.mem_out[l](y)
 
-            # Position-wise cross-layer mixing (model.py:1654-1658).
+            if m.tree_out is not None:
+                prefix = m.tree_out[l](prefix)
+
+            # hmem: bind (previous key, this value), accumulate, unbind with
+            # this position's key -- same ops as model._hmem_read, one row.
+            if self.hmem_M is not None:
+                from .model import quat_mul, quat_conj
+                if self.hmem_yhist is not None:
+                    # short conv: convolve the newest raw projection with
+                    # the K-1 before it, then the same parts as the kernel
+                    y = m._hmem_proj(x, l, conv=False)
+                    K = m.hmem_conv
+                    h = self.hmem_yhist[l]
+                    if h is None:
+                        h = y.new_zeros(K, y.shape[-1])
+                    h = torch.cat([y.unsqueeze(0), h[:K - 1]], 0)
+                    self.hmem_yhist[l] = h
+                    yc = m._hmem_conv_row(h, l).float()
+                    n = m.hmem_nb
+                    k = F.normalize(yc[:4 * n].reshape(n, 4), dim=-1)
+                    v = yc[4 * n:8 * n].reshape(n, 4)
+                    w = torch.sigmoid(yc[8 * n:8 * n + 1])
+                    if m.hmem_decay == 'gated':
+                        lam = torch.sigmoid(yc[8 * n + 1:] + m.hmem_decay_logit[l].float())
+                    elif m.hmem_decay == 'fixed':
+                        lam = torch.sigmoid(m.hmem_decay_logit[l].float())
+                    else:
+                        lam = torch.ones(n, device=yc.device)
+                    lam = lam.unsqueeze(-1)
+                else:
+                    k, v, w = m._hmem_parts(x, l)                # x: stream in
+                    lam = (m._hmem_lambda(x, l).unsqueeze(-1)     # [n, 1]
+                           if getattr(m, 'hmem_decay', 'none') != 'none' else None)
+                upd = quat_mul(self.hmem_kprev[l], v) * w
+                if lam is not None:
+                    self.hmem_M[l] = lam * self.hmem_M[l] + upd
+                else:
+                    self.hmem_M[l] = self.hmem_M[l] + upd
+                from .model import quat_mul_conj_a
+                r = quat_mul_conj_a(k, self.hmem_M[l])
+                prefix = prefix + m._hmem_out(r, l, prefix.dtype)
+                self.hmem_kprev[l] = k
+
+            # Position-wise cross-layer mixing, as in forward().
             mixed = m.cross_mlp[l](prefix)
-            gate = m.blend_gate[l](prefix)
-            x = gate * mixed + (1.0 - gate) * x
+            if m.resid_mode == 'add':
+                x = x + mixed
+            else:
+                gate = m.blend_gate[l](prefix)
+                x = gate * mixed + (1.0 - gate) * x
+            head_in = (m.stream_norm[l](x) if m.head_mode == 'stream'
+                       else prefix)
 
         self.t += 1
-        return m.apply_head(prefix.reshape(1, 1, d))[0, 0]       # [vocab]
+        return m.apply_head(head_in.reshape(1, 1, -1))[0, 0]     # [vocab]
 
     def prefill(self, token_ids):
         """Feed a prompt; returns the logits after its last token."""

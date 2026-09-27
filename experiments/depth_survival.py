@@ -77,11 +77,15 @@ def load_corpus():
         return pickle.load(f)
 
 
-def build_model(layers, ckpt=None, seed=42):
+def build_model(layers, ckpt=None, seed=42, fold_grade=None, arch=None):
+    """arch: extra constructor flags (stream/tree-width arms,
+    docs/OPERA_Stream_prereg.md), e.g. {'head_mode': 'stream'}; they
+    must match the checkpoint's (strict load catches most mismatches)."""
     torch.manual_seed(seed)
     m = OperaSpinorFenwickTree(
         vocab_size=VOCAB, d=D, nb=NB, num_layers=layers,
-        pe_mode='none', fold_mode='left', rot_mode='free')
+        pe_mode='none', fold_mode='left', rot_mode='free',
+        fold_grade=fold_grade, **(arch or {}))
     if ckpt:
         sd = torch.load(ckpt, map_location='cpu', weights_only=False)
         sd = sd.get('model', sd)
@@ -97,9 +101,14 @@ def capture(model, seqs, device, batch=16):
     plus logits-derived CE/argmax. N = len(seqs) padded to full batches.
     """
     L = model.num_layers
+    stream_head = model.head_mode == 'stream'
     streams = {f'S_in_{l}': [] for l in range(L)}
     streams.update({f'P_{l}': [] for l in range(L)})
     streams.update({f'S_out_{l}': [] for l in range(L)})
+    if stream_head:
+        # H_l: the head's actual input, LN(stream) after layer l's
+        # update (for fold-head models the head reads P_l itself).
+        streams.update({f'H_{l}': [] for l in range(L)})
     gates = {l: [] for l in range(L)}
     ces = {l: [] for l in range(L)}
     correct, total = 0, 0
@@ -120,8 +129,15 @@ def capture(model, seqs, device, batch=16):
         for l in range(L):
             streams[f'S_in_{l}'].append(
                 current.detach().to('cpu', torch.float16))
+            # tree input exactly as forward(): pre-norm (resid 'add'),
+            # lift to tree width (state_mult)
+            x = current
+            if model.tree_in_norm is not None:
+                x = model.tree_in_norm[l](x)
+            if model.tree_in is not None:
+                x = model.tree_in[l](x)
             R_L, R_R, R_O = model.get_rotations(l)
-            levels, _, _ = model.build_tree(current, l, R_L, R_R, R_O)
+            levels, _, _ = model.build_tree(x, l, R_L, R_R, R_O)
             if fenwick_count is None:
                 offs, off = [], 0
                 for lv in levels:
@@ -131,9 +147,29 @@ def capture(model, seqs, device, batch=16):
                     Tt, len(levels), offs, device)
                 fenwick_count = count.cpu()
             prefix = model.prefix_states(levels, Tt, l, R_L, R_R, R_O)
+            if model.tree_out is not None:
+                prefix = model.tree_out[l](prefix)
             streams[f'P_{l}'].append(
                 prefix.detach().to('cpu', torch.float16))
-            logits = model.apply_head(prefix)
+            mixed = model.cross_mlp[l](prefix)
+            if model.resid_mode == 'add':
+                # additive residual: the identity carries unattenuated;
+                # recorded as gate 0 so D1's prod(1-g) reads 1.
+                gate = torch.zeros_like(prefix[..., :1])
+                current = current + mixed
+            else:
+                gate = model.blend_gate[l](prefix)
+                current = gate * mixed + (1 - gate) * current
+            gates[l].append(gate.detach().squeeze(-1).cpu())
+            streams[f'S_out_{l}'].append(
+                current.detach().to('cpu', torch.float16))
+            if stream_head:
+                head_in = model.stream_norm[l](current)
+                streams[f'H_{l}'].append(
+                    head_in.detach().to('cpu', torch.float16))
+            else:
+                head_in = prefix
+            logits = model.apply_head(head_in)
             lp = F.log_softmax(logits.float(), dim=-1)
             tgt = token_ids[:, 1:]
             ce = -lp[:, :-1].gather(-1, tgt.unsqueeze(-1)).squeeze(-1)
@@ -145,12 +181,6 @@ def capture(model, seqs, device, batch=16):
                 pred = logits[:, :-1].argmax(-1)
                 correct += ((pred == tgt) & valid).sum().item()
                 total += valid.sum().item()
-            mixed = model.cross_mlp[l](prefix)
-            gate = model.blend_gate[l](prefix)
-            gates[l].append(gate.detach().squeeze(-1).cpu())
-            current = gate * mixed + (1 - gate) * current
-            streams[f'S_out_{l}'].append(
-                current.detach().to('cpu', torch.float16))
 
     out = {k: torch.cat(v) for k, v in streams.items()}
     out['gates'] = {l: torch.cat(v).numpy() for l, v in gates.items()}
@@ -252,8 +282,23 @@ def main():
     p.add_argument('--all-layers', type=int, default=0,
                    help='0: lags on final+layer0 streams only; 1: all '
                         'prefix streams P_l; 2: also all state streams')
+    p.add_argument('--fold-grade', default=None,
+                   help="'R,G' to reconstruct a scale-graded checkpoint's "
+                        'routing (fold_grade adds no parameters, so the '
+                        'state_dict loads either way; without this flag '
+                        'a graded checkpoint is probed as incumbent)')
+    p.add_argument('--arch', default=None,
+                   help='JSON dict of stream/tree-width flags the '
+                        'checkpoint was trained with, e.g. '
+                        '\'{"head_mode": "stream"}\' (repr_study.ARCH)')
+    p.add_argument('--d', type=int, default=None,
+                   help='model width override (width-control arms)')
     p.add_argument('--device', default=None)
     args = p.parse_args()
+    global D, NB
+    if args.d is not None:
+        D, NB = args.d, args.d // 4
+    arch = json.loads(args.arch) if args.arch else None
 
     if args.device is None:
         args.device = ('mps' if torch.backends.mps.is_available()
@@ -269,8 +314,12 @@ def main():
           f"{' (UNTRAINED CONTROL)' if args.control else ''}")
 
     t0 = time.time()
+    fg = None
+    if args.fold_grade:
+        fg = tuple(int(v) for v in args.fold_grade.split(','))
     model = build_model(args.layers,
-                        None if args.control else args.ckpt, seed=42)
+                        None if args.control else args.ckpt, seed=42,
+                        fold_grade=fg, arch=arch)
     model.to(args.device)
     cap = capture(model, seqs, args.device)
     L = model.num_layers
@@ -281,7 +330,11 @@ def main():
     print(f"  forward+capture {time.time() - t0:.0f}s; "
           f"model argmax acc {cap['argmax_acc']:.3f}")
 
+    # the stream the LM head actually consumes ("final readout")
+    head_src = f'H_{L - 1}' if f'H_{L - 1}' in cap else f'P_{L - 1}'
     res = {'tag': args.tag, 'layers': L, 'argmax_acc': cap['argmax_acc'],
+           'fold_grade': (list(fg) if fg else None), 'arch': arch,
+           'd': D, 'head_src': head_src,
            'seqs': len(seqs)}
 
     # D1: gate saturation + identity attenuation
@@ -306,7 +359,8 @@ def main():
     # D2: input-byte identity decode per stream
     ident = {}
     for key in [f'S_in_{l}' for l in range(L)] + \
-               [f'P_{l}' for l in range(L)] + [f'S_out_{l}' for l in range(L)]:
+               [f'P_{l}' for l in range(L)] + [f'S_out_{l}' for l in range(L)] + \
+               [f'H_{l}' for l in range(L) if f'H_{l}' in cap]:
         acc = probe_stream(cap[key], ids, lens, key)
         ident[key] = acc
         print(f"  D2 identity from {key:9s}: {acc:.3f}")
@@ -321,6 +375,8 @@ def main():
         lags = (1, 2, 4, 8, 16)
     else:
         srcs = (f'P_{L - 1}', f'S_out_{L - 1}', 'P_0')
+        if head_src not in srcs:
+            srcs = (head_src,) + srcs
         lags = LAGS
     for src in srcs:
         row = {}
@@ -343,7 +399,8 @@ def main():
     cut = max(1, int(ids.shape[0] * 0.8))
     tr_m = torch.from_numpy(b_idx) < cut
     yb = bins[torch.from_numpy(t_idx)]
-    for src in ('S_in_0', f'P_{L - 1}', f'S_out_{L - 1}'):
+    for src in dict.fromkeys(('S_in_0', f'P_{L - 1}', f'S_out_{L - 1}',
+                              head_src)):
         stream = cap[src]
         X = stream[torch.from_numpy(b_idx), torch.from_numpy(t_idx)]
         tr = Ridge(stream.shape[-1], POS_BINS)
@@ -388,7 +445,7 @@ def main():
     res['per_layer_ce'] = {str(l): float(cap['ces'][l].sum()
                                         / max((lens - 1).sum(), 1))
                            for l in range(L)}
-    nxt = probe_stream(cap[f'P_{L - 1}'], ids, lens, 'next', shift=+1)
+    nxt = probe_stream(cap[head_src], ids, lens, 'next', shift=+1)
     res['next_probe_acc'] = nxt
     print(f"  D7 per-layer CE " + " ".join(
         f"L{l}={res['per_layer_ce'][str(l)]:.3f}" for l in range(L))
