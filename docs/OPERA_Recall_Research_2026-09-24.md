@@ -804,6 +804,49 @@ Mac. Rule of thumb: tokens ≈ 20 × params.
   token budget.
 - Then the single long run.
 
+## 8d. The ladder — design (2026-09-30)
+
+25 A100-hours is roughly 200–600× less compute than SmolLM2-135M used,
+so the run cannot produce a strong model. What it can measure is **how
+OPERA's loss falls with compute**. That slope decides whether more
+compute is worth spending. So the credits go to a compute-optimal
+ladder first (`experiments/ladder.py`).
+
+**Rungs.** The gated-memory model, all with batch 32 × 1,024, seed 42,
+the Muon recipe, and a cosine schedule over each rung's own steps:
+
+| rung | params | training bytes (20/param) |
+|---|---|---|
+| d512 × L2 | 5.0M | 0.10G |
+| d768 × L2 | 11.0M | 0.22G |
+| d1024 × L2 | 19.4M | 0.39G |
+| d1536 × L2 | 43.3M | 0.87G |
+| d2048 × L2 | 76.6M | 1.53G |
+| d1024 × L4 (depth check) | 37.3M | 0.75G |
+
+- The 4 GB FineWeb-Edu pool keeps every rung under one pass.
+- "20 per parameter" is the Chinchilla rule for BPE tokens. Applied to
+  bytes, it is a convention, not a known optimum: each byte carries less
+  information than a token. The ladder uses one ratio throughout, so
+  the slope is measured along a single consistent line.
+- The depth rung sits next to d1536 × L2 in size. It is judged by its
+  residual from the width fit at equal compute.
+
+**Procedure.**
+1. `ladder.py plan` converts rung sizes into steps, and into GPU-hours
+   from the A100 benchmark: the measured (d, L, B), or the nearest
+   measured size scaled by parameter count.
+2. `ladder.py run` trains the rungs in order through `repr_study`,
+   resumable per rung, then scores each one on FineWeb-Edu and the
+   Simple-Wikipedia sets.
+3. `ladder.py fit` fits BPB = E + A·C^−α over the L2 rungs, with
+   C = 6·N·D and D the bytes actually seen (steps × batch × the pool's
+   mean sequence length). It reports the depth check against the fit and
+   saves `ladder_fit.png`.
+
+With five points the three-parameter fit is only indicative. α is the
+number to compare with published byte-level and attention-free curves.
+
 ## 6. Sources
 
 - Khandelwal, He, Qi, Jurafsky — *Sharp Nearby, Fuzzy Far Away: How Neural Language Models Use Context*, ACL 2018 — arxiv.org/abs/1805.04623
