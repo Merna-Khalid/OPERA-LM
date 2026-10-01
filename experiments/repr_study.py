@@ -426,6 +426,16 @@ def main():
                    help='mid-training checkpoint cadence (steps); with '
                         '--resume a restarted run continues exactly')
     p.add_argument('--resume', action='store_true')
+    p.add_argument('--muon-lr-scale', type=float, default=None,
+                   help='multiply the Muon step size by this factor for the '
+                        'rest of training; unlike --muon-lr it never changes '
+                        'the checkpoint tag, so it is safe to vary across a '
+                        '--resume of the same run (Recall research §8f: use '
+                        'this, not a lower base LR, to calm a run that is '
+                        'skipping non-finite gradients often)')
+    p.add_argument('--grad-clip', type=float, default=None,
+                   help='gradient-norm clip threshold (default in train(): '
+                        '1.0); also safe to vary across --resume')
     p.add_argument('--test-pkl', default=None,
                    help='in-training test sets from this .test.pkl '
                         '(build_fineweb_bytes.py) instead of the '
@@ -491,6 +501,11 @@ def main():
         # losing the checkpoint. 2x extrapolation is enough to keep the
         # bucket report meaningful and fits in memory.
         eml = min(T * 4, args.eval_cap)
+        recipe = dict(device_kernels(RECIPE.get(name, {}), args.device))
+        if args.muon_lr_scale is not None:
+            recipe['muon_lr_resume_scale'] = args.muon_lr_scale
+        if args.grad_clip is not None:
+            recipe['grad_clip'] = args.grad_clip
         res = train(
             steps=args.steps, batch=args.batch, max_len=T,
             vocab_size=meta['vocab_size'], d=d, nb=nb,
@@ -507,7 +522,7 @@ def main():
                          if args.packed and not os.path.isabs(args.packed)
                          else args.packed),
             save_every=args.save_every, resume=args.resume,
-            **device_kernels(RECIPE.get(name, {}), args.device))
+            **recipe)
         mins = (time.time() - t0) / 60
 
         ppl = res['test_perplexity_in_length']

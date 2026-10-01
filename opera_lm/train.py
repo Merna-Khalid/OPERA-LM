@@ -404,7 +404,8 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
           mask_id=2, resid_init_scale=None, hmem_nb=0, hmem_decay='none', hmem_conv=0,
           samuon_gamma=1.0, samuon_warmup_frac=0.3,
           packed_data=None, ddp=False,
-          muon_fresh_substr='', muon_fresh_warmup=0):
+          muon_fresh_substr='', muon_fresh_warmup=0,
+          grad_clip=1.0, muon_lr_resume_scale=1.0):
     # DDP (multi-GPU data parallelism, added for the Kaggle 2xT4 tier --
     # a single T4 measured ~8.5x slower than the project's A100, so real
     # multi-GPU throughput matters there in a way it didn't on Colab).
@@ -846,8 +847,12 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
                   f"(lr {max_lr})"
                   + (f" + fresh-Muon: {sum(p.numel() for _, p in fresh_np):,} "
                      f"{list(fresh_substr)} (lr ramp 0->{muon_lr} over "
-                     f"{muon_fresh_warmup} steps)" if fresh_np else ""),
+                     f"{muon_fresh_warmup} steps)" if fresh_np else "")
+                  + (f"  [RESUME SCALE {muon_lr_resume_scale:g}x]"
+                     if muon_lr_resume_scale != 1.0 else ""),
                   flush=True)
+            if grad_clip != 1.0:
+                print(f"  grad_clip={grad_clip:g} (default 1.0)", flush=True)
     elif use_foreach:
         # AdamW(foreach=True): fused multi-tensor step. weight_decay=0.0
         # keeps the math equal to Adam so the recipe is unchanged.
@@ -971,7 +976,14 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
             # Muon groups follow the same warmup/decay schedule, rescaled
             # to their own base lr (muon_lr).
             if optimizer == 'muon' and g.get('use_muon'):
-                base = lr * (muon_lr / max_lr)
+                # muon_lr_resume_scale (NOT in the tag/checkpoint filename --
+                # safe to change across a --resume of the SAME run, unlike
+                # muon_lr itself): a flat multiplier on the effective Muon
+                # step size, for restarting a run that is spiking too often
+                # with a gentler effective lr without losing the checkpoint
+                # (docs/OPERA_Recall_Research_2026-09-24.md, the d3072 demo
+                # run's escalating non-finite-gradient rate, 2026-10-01).
+                base = lr * (muon_lr / max_lr) * muon_lr_resume_scale
                 fw = g.get('fresh_warmup', 0)
                 # muon_fresh_warmup (see the Muon-group setup above): a
                 # LINEAR ramp from 0, independent of the global warmup/
@@ -1121,7 +1133,7 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
             scaler.scale(loss / accum).backward()
             if boundary:
                 scaler.unscale_(opt)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                 scaler.step(opt)
                 scaler.update()
                 opt.zero_grad()
@@ -1129,7 +1141,7 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
         else:
             (loss / accum).backward()
             if boundary:
-                gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                 if torch.isfinite(gnorm):
                     opt.step()
                     nan_run = 0
@@ -1274,6 +1286,7 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
         'muon_include': muon_include, 'muon_wd': muon_wd,
         'muon_fresh_substr': muon_fresh_substr,
         'muon_fresh_warmup': muon_fresh_warmup if muon_fresh_substr else None,
+        'grad_clip': grad_clip, 'muon_lr_resume_scale': muon_lr_resume_scale,
         'lo_muon': lo_muon, 'level_cond_rank': level_cond_rank,
         'head_mode': head_mode, 'resid_mode': resid_mode,
         'fold_gate': fold_gate, 'fold_h0': bool(fold_h0),

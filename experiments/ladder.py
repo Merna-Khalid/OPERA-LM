@@ -130,6 +130,10 @@ def run(args):
             cmd += ['--pool-test', args.pool_test]
         if args.device:
             cmd += ['--device', args.device]
+        if args.muon_lr_scale is not None:
+            cmd += ['--muon-lr-scale', str(args.muon_lr_scale)]
+        if args.grad_clip is not None:
+            cmd += ['--grad-clip', str(args.grad_clip)]
         print(f"\n### rung {r['arm']}: {r['steps']} steps", flush=True)
         log = open(os.path.join(RUNS, r['arm'] + '.log'), 'a')
         p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -253,6 +257,12 @@ def main():
     p.add_argument('--save-every', type=int, default=1000)
     p.add_argument('--seed', type=int, default=42)
     p.add_argument('--device', default=None)
+    p.add_argument('--muon-lr-scale', type=float, default=None,
+                   help='run only: passed through to repr_study.py '
+                        '--muon-lr-scale (safe to vary across --resume)')
+    p.add_argument('--grad-clip', type=float, default=None,
+                   help='run only: passed through to repr_study.py '
+                        '--grad-clip (safe to vary across --resume)')
     p.add_argument('--out', default=None, help='plot path (fit)')
     args = p.parse_args()
     if args.cmd in ('plan', 'run') and not args.pool:
