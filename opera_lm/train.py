@@ -746,6 +746,15 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
                           f"{torch_device} ({batch_source.ids.numel() * 8 / 2**20:.0f} MiB)"
                           + (f", {world_size} ranks" if ddp else ""), flush=True)
         except Exception as e:
+            if packed_data:
+                # The packed pool IS the training set (train_data is then
+                # only an eval-side placeholder, often []): falling back to
+                # CPU sampling would silently train on nothing. Observed on
+                # Colab with a half-copied tokens.npy ("mmap length is
+                # greater than file size").
+                raise RuntimeError(
+                    f"packed pool {packed_data!r} could not be opened ({e}); "
+                    f"is the .tokens.npy file complete?") from e
             if is_main:
                 print(f"  WARNING: gpu_data failed ({e}); CPU sampling", flush=True)
             batch_source = None
