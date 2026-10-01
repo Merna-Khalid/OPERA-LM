@@ -85,16 +85,24 @@ def plan(args):
     for g in args.rungs:
         d, L = (int(x) for x in g.split('x'))
         N = n_params(d, L)
-        D = args.ratio * N
-        steps = math.ceil(D / (args.batch * msl))
         ms, how = est_ms(bench, d, L, args.batch, N)
+        if args.hours:
+            # fixed time budget: as many bytes as the hours allow
+            assert ms, '--hours needs the benchmark (bench.jsonl)'
+            steps = int(args.hours * 3.6e6 / ms)
+            D = steps * args.batch * msl
+            ratio = round(D / N)
+        else:
+            ratio = args.ratio
+            D = ratio * N
+            steps = math.ceil(D / (args.batch * msl))
         h = steps * ms / 3.6e6 if ms else None
         tot_h += h or 0
         tot_bytes += D
-        rows.append(dict(arm=arm_name(d, L, args.ratio), d=d, L=L, params=N,
+        rows.append(dict(arm=arm_name(d, L, ratio), d=d, L=L, params=N,
                          bytes=D, steps=steps, hours=h, est=how))
     print(f"batch {args.batch} x {T}, mean sequence {msl:.0f} bytes, "
-          f"{args.ratio:g} bytes/param")
+          + (f"{args.hours:g} h per rung" if args.hours else f"{args.ratio:g} bytes/param"))
     print(f"{'arm':22s} {'params':>8s} {'bytes':>8s} {'steps':>8s} {'~hours':>7s}  estimate")
     for r in rows:
         hs = f"{r['hours']:7.2f}" if r['hours'] is not None else '      ?'
@@ -174,7 +182,10 @@ def fit(args):
         print(f"{p['arm']:22s} {p['N'] / 1e6:7.1f}M {p['D'] / 1e9:7.2f}G "
               f"{p['C']:10.2e} {p['bpb']:8.4f} "
               + (f"{sw:10.4f}" if sw is not None else f"{'-':>10s}"))
-    width = [p for p in pts if p['L'] == 2]
+    # the width fit uses only the ladder's own ratio (runs at other
+    # bytes/param, e.g. an iso-FLOP check, are listed but not fitted)
+    tag = f"_r{args.ratio:g}"
+    width = [p for p in pts if p['L'] == 2 and p['arm'].endswith(tag)]
     res = {}
     if len(width) >= 3:
         E, A, a, rmse = fit_power_law([p['C'] for p in width], [p['bpb'] for p in width])
@@ -185,9 +196,10 @@ def fit(args):
                   "read alpha as indicative only")
         res = dict(E=E, A=A, alpha=a, rmse=rmse, n=len(width))
         for p in pts:
-            if p['L'] != 2:
+            if p not in width:
                 pred = E + A * p['C'] ** -a
-                print(f"  depth check {p['arm']}: {p['bpb']:.4f} vs width-fit "
+                kind = 'depth check' if p['L'] != 2 else 'off-ratio'
+                print(f"  {kind} {p['arm']}: {p['bpb']:.4f} vs width-fit "
                       f"{pred:.4f} at equal compute ({100 * (p['bpb'] / pred - 1):+.1f}%)")
     json.dump(dict(points=pts, width_fit=res),
               open(os.path.join(RUNS, 'ladder_fit.json'), 'w'), indent=2)
@@ -230,6 +242,10 @@ def main():
     p.add_argument('--pool', help='FineWeb byte pool prefix (build_fineweb_bytes.py)')
     p.add_argument('--rungs', nargs='+', default=DEFAULT_RUNGS, help='dxL entries')
     p.add_argument('--ratio', type=float, default=20.0, help='training bytes per parameter')
+    p.add_argument('--hours', type=float, default=0,
+                   help='instead of --ratio: train each rung for this many '
+                        'hours (steps from the benchmark), i.e. as many bytes '
+                        'as the time allows')
     p.add_argument('--batch', type=int, default=32)
     p.add_argument('--bench', default=os.path.join(RUNS, 'bench.jsonl'))
     p.add_argument('--pool-test', default='assets/packed_bytes_T1024_all',

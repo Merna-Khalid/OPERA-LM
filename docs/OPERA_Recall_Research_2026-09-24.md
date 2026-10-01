@@ -847,6 +847,65 @@ the Muon recipe, and a cosine schedule over each rung's own steps:
 With five points the three-parameter fit is only indicative. α is the
 number to compare with published byte-level and attention-free curves.
 
+## 8e. Ladder results — a clean power law (2026-10-01)
+
+Colab A100 80 GB, all rungs at 20 bytes/param, FineWeb-Edu held-out
+BPB. About 6.6 GPU-hours in total.
+
+| rung | params | bytes | C = 6ND | FineWeb BPB | 1025–2048 B | Simple-Wiki (pool) |
+|---|---|---|---|---|---|---|
+| d512 × L2 | 5.0M | 0.10G | 3.0e15 | 1.7258 | 1.7080 | 2.2271 |
+| d768 × L2 | 11.0M | 0.22G | 1.46e16 | 1.5919 | 1.5659 | 2.0425 |
+| d1024 × L2 | 19.4M | 0.39G | 4.54e16 | 1.5134 | 1.4840 | 1.9524 |
+| d1024 × L4 | 37.3M | 0.75G | 1.67e17 | 1.4624 | 1.4310 | 1.8124 |
+| d1536 × L2 | 43.3M | 0.87G | 2.25e17 | 1.4299 | 1.3962 | 1.8129 |
+| d2048 × L2 | 76.6M | 1.53G | 7.05e17 | 1.3706 | 1.3335 | 1.7421 |
+
+**Fit** (L2 width ladder, five rungs): BPB = 1.084 + 118·C^−0.146, rmse
+0.0025 BPB.
+- Every rung sits on the curve. Each roughly 3–5× of compute buys a
+  steady 0.06–0.08 BPB. There is no sign of the curve flattening early.
+- **Exponent:** α = 0.146 on the reducible loss is in the range of
+  Chinchilla's compute-optimal exponent for transformers on BPE tokens
+  (αβ/(α+β) = 0.154 from α = 0.34, β = 0.28).
+- **Pure power law:** the slope over the ladder is 0.042, against
+  Kaplan's L(C) ∝ C^−0.050 for transformers.
+- **Caveats:** different data, units (bytes vs tokens) and protocols, so
+  this is "same order", not "equal". The fitted E and α trade off
+  against each other with only five points, and the fitted
+  E = 1.08 BPB is the asymptote of this family at this ratio, not the
+  entropy of the text.
+
+**Depth.** d1024 × L4 is +1.5% above the width fit at equal compute.
+- It is also no faster: 78 min, against 77 min for d1536 × L2.
+- Cross-domain (Simple-Wiki pool) the two are equal (1.8124 vs 1.8129).
+- One seed, so +1.5% is inside plausible noise. But depth shows no gain,
+  so width stays the scaling axis.
+
+**Length.** The 1025–2048-byte FineWeb test is 0.98–0.99× in-length at
+every rung. Position-free extrapolation holds with scale.
+
+**Stability.** One non-finite loss in the d2048 run (step 29,224). The
+trainer skipped that batch and the curve was unaffected. It is the first
+NaN in this line, so it is worth watching in larger runs.
+
+**Throughput.** d2048 × L2 runs at 0.213 s per step of 32 × 1,024 bytes:
+139k bytes/s, about 64 TFLOP/s, roughly 20% of A100 bf16 peak. Memory
+use at batch 32 is about 13 GB of 80 GB, so VRAM is not the limit;
+compute is. Larger batches might raise utilization and should be
+benchmarked before the long run.
+
+**Extrapolation (fit, at 20 bytes/param).**
+
+| extra A100 time | C | optimal size | bytes | predicted BPB |
+|---|---|---|---|---|
+| 10 h | 2.3e18 | ~140M | ~2.8G | ~1.33 |
+| 15 h | 3.5e18 | ~170M | ~3.4G | ~1.31 |
+
+Open question before spending that: is 20 bytes/param the right split
+for bytes? An iso-FLOP check (several sizes at one compute budget)
+answers it in ~1.5 GPU-hours.
+
 ## 6. Sources
 
 - Khandelwal, He, Qi, Jurafsky — *Sharp Nearby, Fuzzy Far Away: How Neural Language Models Use Context*, ACL 2018 — arxiv.org/abs/1805.04623
@@ -876,3 +935,4 @@ number to compare with published byte-level and attention-free curves.
 - Hoffmann et al. — *Training Compute-Optimal Large Language Models* (Chinchilla), 2022 — arxiv.org/abs/2203.15556
 - Muennighoff et al. — *Scaling Data-Constrained Language Models*, NeurIPS 2023 — arxiv.org/abs/2305.16264
 - Penedo et al. — *The FineWeb Datasets: Decanting the Web for the Finest Text Data at Scale*, 2024 — arxiv.org/abs/2406.17557
+- Kaplan et al. — *Scaling Laws for Neural Language Models*, 2020 — arxiv.org/abs/2001.08361
