@@ -403,15 +403,115 @@ class FusedActTriton(torch.autograd.Function):
         return gy * (1.0 - th * th + 0.1)
 
 
+# ---------------------------------------------------------------------------
+# torch.compile safety: the two kernels are exposed as torch.library custom
+# ops. Called through autograd.Function directly, dynamo traces INTO the
+# Triton launches and must infer which buffers each kernel writes; on CUDA
+# that inference lost the backward's dv0/dv1/fv buffers, so the compiled
+# model got ZERO gradients for rot_free (and some norms) while the loss
+# matched (experiments/device_check.py, A100, 2026-10-01). A custom op is
+# opaque to the compiler -- explicit inputs, fresh outputs, a fake (shape)
+# implementation and an explicit backward op -- so nothing can be dropped.
+# The op bodies are the unchanged FusedNodeTriton / FusedActTriton code.
+# ---------------------------------------------------------------------------
+class _Ctx:
+    """Stand-in for autograd's ctx so the Function bodies run as plain
+    functions inside the custom ops."""
+    saved_tensors = ()
+
+    def save_for_backward(self, *t):
+        self.saved_tensors = t
+
+
+def _node_fwd_impl(h_l, h_r, R_L, R_R, R_O, g):
+    return FusedNodeTriton.forward(_Ctx(), h_l, h_r, R_L, R_R, R_O, g).to(h_l.dtype)
+
+
+def _node_bwd_impl(h_l, h_r, R_L, R_R, R_O, g, gout):
+    ctx = _Ctx()
+    ctx.saved_tensors = (h_l, h_r, R_L, R_R, R_O,
+                         g.to(h_l.dtype) if g.dtype != h_l.dtype else g)
+    grads = FusedNodeTriton.backward(ctx, gout)
+    return tuple(gr.to(x.dtype) for gr, x in zip(grads, (h_l, h_r, R_L, R_R, R_O, g)))
+
+
+def _act_fwd_impl(x):
+    return FusedActTriton.forward(_Ctx(), x).to(x.dtype)
+
+
+def _act_bwd_impl(x, gy):
+    ctx = _Ctx()
+    ctx.saved_tensors = (x,)
+    return FusedActTriton.backward(ctx, gy).to(x.dtype)
+
+
+if hasattr(torch.library, 'custom_op'):
+    from torch import Tensor
+
+    @torch.library.custom_op("opera::fused_node", mutates_args=())
+    def _fused_node_op(h_l: Tensor, h_r: Tensor, R_L: Tensor, R_R: Tensor,
+                       R_O: Tensor, g: Tensor) -> Tensor:
+        return _node_fwd_impl(h_l, h_r, R_L, R_R, R_O, g)
+
+    @_fused_node_op.register_fake
+    def _(h_l, h_r, R_L, R_R, R_O, g):
+        return torch.empty_like(h_l)
+
+    @torch.library.custom_op("opera::fused_node_bwd", mutates_args=())
+    def _fused_node_bwd_op(h_l: Tensor, h_r: Tensor, R_L: Tensor, R_R: Tensor,
+                           R_O: Tensor, g: Tensor, gout: Tensor
+                           ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+        return _node_bwd_impl(h_l, h_r, R_L, R_R, R_O, g, gout)
+
+    @_fused_node_bwd_op.register_fake
+    def _(h_l, h_r, R_L, R_R, R_O, g, gout):
+        return tuple(torch.empty_like(t) for t in (h_l, h_r, R_L, R_R, R_O, g))
+
+    def _node_setup(ctx, inputs, output):
+        ctx.save_for_backward(*inputs)
+
+    def _node_backward(ctx, gout):
+        return _fused_node_bwd_op(*ctx.saved_tensors, gout.contiguous())
+
+    _fused_node_op.register_autograd(_node_backward, setup_context=_node_setup)
+
+    @torch.library.custom_op("opera::fused_act", mutates_args=())
+    def _fused_act_op(x: Tensor) -> Tensor:
+        return _act_fwd_impl(x)
+
+    @_fused_act_op.register_fake
+    def _(x):
+        return torch.empty_like(x)
+
+    @torch.library.custom_op("opera::fused_act_bwd", mutates_args=())
+    def _fused_act_bwd_op(x: Tensor, gy: Tensor) -> Tensor:
+        return _act_bwd_impl(x, gy)
+
+    @_fused_act_bwd_op.register_fake
+    def _(x, gy):
+        return torch.empty_like(x)
+
+    def _act_setup(ctx, inputs, output):
+        ctx.save_for_backward(inputs[0])
+
+    def _act_backward(ctx, gy):
+        return _fused_act_bwd_op(ctx.saved_tensors[0], gy.contiguous())
+
+    _fused_act_op.register_autograd(_act_backward, setup_context=_act_setup)
+else:                                    # torch < 2.4: plain autograd.Function
+    _fused_node_op = FusedNodeTriton.apply
+    _fused_act_op = FusedActTriton.apply
+
+
 def fused_node_triton(h_l, h_r, R_L, R_R, R_O, g):
     """h_*: [N, nb, 4]; R_*: [nb, 3, 3]; g: [N, 3, nb] (post-sigmoid
     gates). Returns [N, nb, 4]. CUDA+triton port of
     metal_kernel.fused_node; same contract, same fallback math."""
-    return FusedNodeTriton.apply(h_l, h_r, R_L, R_R, R_O, g)
+    return _fused_node_op(h_l, h_r, R_L, R_R, R_O, g)
 
 
 def fused_act_triton(x):
-    return FusedActTriton.apply(x)
+    return _fused_act_op(x)
 
 
 # ---------------------------------------------------------------------------

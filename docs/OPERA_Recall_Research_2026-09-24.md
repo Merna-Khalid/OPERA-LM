@@ -885,6 +885,22 @@ BPB. About 6.6 GPU-hours in total.
 **Length.** The 1025–2048-byte FineWeb test is 0.98–0.99× in-length at
 every rung. Position-free extrapolation holds with scale.
 
+**Caveat found afterwards (2026-10-01): frozen rotations on CUDA.**
+- `experiments/device_check.py` on the A100 showed that the compiled
+  model (`torch.compile` + the Triton compose kernel) produced **zero
+  gradients** for `rot_free`, the per-block 3×3 maps, and for some norm
+  parameters. The loss matched the reference, and eager mode was exact.
+- Cause: the kernel was called through an `autograd.Function`, so dynamo
+  traced into the Triton launches and lost the backward's `dv0/dv1/fv`
+  buffers.
+- So every ladder rung trained with those parameters fixed at their
+  near-identity initialization.
+- The curve above is a valid measurement of *that* model, but not of
+  full OPERA. With trained rotations the loss can only be equal or better.
+- Fix: the kernels are now `torch.library` custom ops, which the
+  compiler cannot see into. The CPU check is exact compiled and eager.
+- The Mac runs (Simple Wikipedia, §5–§8b) ran eager and are unaffected.
+
 **Stability.** One non-finite loss in the d2048 run (step 29,224). The
 trainer skipped that batch and the curve was unaffected. It is the first
 NaN in this line, so it is worth watching in larger runs.

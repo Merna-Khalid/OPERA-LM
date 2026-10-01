@@ -57,15 +57,21 @@ def main():
     ok = True
     for label, m in runs:
         l, gr = loss_and_grads(m, tok.to(dev), lens.to(dev))
-        rel = max(((gr[n] - g_ref[n]).norm() / g_ref[n].norm().clamp_min(1e-12)).item()
-                  for n in g_ref)
-        worst = max(g_ref, key=lambda n: ((gr[n] - g_ref[n]).norm()
-                                          / g_ref[n].norm().clamp_min(1e-12)).item())
-        good = abs(l - l_ref) < 1e-3 and rel < 1e-2
+        err = {n: ((gr[n] - g_ref[n]).norm() / g_ref[n].norm().clamp_min(1e-12)).item()
+               for n in g_ref if n in gr}
+        worst = max(err, key=err.get)
+        rel = err[worst]
+        missing = [n for n in g_ref if n not in gr]
+        bad = missing + [n for n in g_ref if n in gr and
+                         ((gr[n] - g_ref[n]).norm()
+                          / g_ref[n].norm().clamp_min(1e-12)).item() > 1e-2]
+        good = abs(l - l_ref) < 1e-3 and not bad
         ok &= good
         print(f"{dev} {label:8s} loss {l:.6f} vs cpu {l_ref:.6f}  "
               f"max rel grad err {rel:.2e} ({worst})  {'OK' if good else 'FAIL'}",
               flush=True)
+        if bad:
+            print(f"    {len(bad)} parameter(s) off by > 1%: {bad}", flush=True)
     print('DEVICE CHECK ' + ('PASS' if ok else 'FAIL'))
     sys.exit(0 if ok else 1)
 
