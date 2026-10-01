@@ -21,8 +21,9 @@ def loss_and_grads(model, tok, lens):
     model.zero_grad(set_to_none=True)
     loss, _, _ = lm_loss(model(tok, lens).logits, tok, lens)
     loss.backward()
-    return loss.item(), {n: p.grad.float().cpu() for n, p in model.named_parameters()
-                         if p.grad is not None}
+    # a torch.compile'd model prefixes its parameter names with _orig_mod.
+    return loss.item(), {n.removeprefix('_orig_mod.'): p.grad.float().cpu()
+                         for n, p in model.named_parameters() if p.grad is not None}
 
 
 def main():
@@ -31,6 +32,11 @@ def main():
     p.add_argument('--layers', type=int, default=2)
     args = p.parse_args()
     dev = args.device
+    # compare in full fp32: opera_lm.model enables TF32 on CUDA (~1e-3
+    # relative per matmul on Ampere+), which would be measured as error here
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    torch.set_float32_matmul_precision('highest')
     kw = dict(vocab_size=259, d=256, nb=64, num_layers=args.layers, pe_mode='none',
               fold_mode='left', rot_mode='free', head_mode='stream',
               fold_impl='downsweep', hmem_nb=64, hmem_decay='gated')

@@ -417,6 +417,13 @@ def fused_act_triton(x):
 # ---------------------------------------------------------------------------
 
 def _test():
+    # Exactness check: full fp32 on the GPU side too. importing opera_lm's
+    # model enables TF32 matmuls on CUDA (model.py); on Ampere+ that makes
+    # the einsum reductions in the backward (dR_L/dR_R/dR_O) ~1e-3 relative,
+    # which is a precision setting, not a kernel error (T4: no TF32).
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    torch.set_float32_matmul_precision('highest')
     torch.manual_seed(0)
     N, nb = 64, 16
     dev = 'cuda' if triton_available() else 'cpu'
