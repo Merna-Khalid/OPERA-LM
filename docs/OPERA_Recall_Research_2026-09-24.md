@@ -922,6 +922,76 @@ Open question before spending that: is 20 bytes/param the right split
 for bytes? An iso-FLOP check (several sizes at one compute budget)
 answers it in ~1.5 GPU-hours.
 
+## 8f. The rot_free-under-compile fix — diverged once, root-caused, not yet re-verified (2026-10-01)
+
+The demo run (d3072×L2, A100) exposed the §8e caveat directly. Timeline:
+
+1. Section 2's `device_check.py` confirmed on the A100 what §8e only
+   inferred: compiled, `rot_free`'s gradient is **exactly** zero
+   (rel err 1.00 — not approximately wrong, identically absent) for both
+   the 2-layer and 4-layer model. So the ladder and the first ~6,000
+   steps of the demo run trained with those rotations genuinely frozen.
+2. The `torch.library` custom-op fix (§8e) was pushed and enabled. Its
+   first GPU use (the actual 18h run) went non-finite from **every**
+   batch starting at step 147 — a real divergence, not noise.
+3. Reverting to the plain `autograd.Function` path (rot_free frozen
+   again) let the run continue cleanly to step ~6,200, at which point a
+   single step produced a finite loss but a non-finite **gradient**.
+   `clip_grad_norm_` turns `inf` into `nan`, so that one step poisoned
+   every weight; the loss-only NaN guard didn't catch it because the
+   loss itself was fine. `train()` now also skips an update when the
+   clipped gradient norm is non-finite (tested on CPU: one injected
+   `inf` gradient → one skipped update, training finishes; a persistent
+   fault → stops after 25 in a row). The run has continued past several
+   more such spikes since, at well under 1% of steps.
+
+**Root cause hypothesis for step 147.** `rot_free` is Muon-routed by
+default (`opera_lm/muon.py`'s `EXCLUDE_SUBSTR` does not match
+`'rot_free'`). Muon's Newton-Schulz update applies a fixed effective
+step size regardless of gradient history. A parameter that has been
+sitting at near-identity initialization for the whole run so far, given
+its first real gradient at full `muon_lr`, can jump somewhere unstable
+in one step — unlike a parameter that has been training gently from
+step 0. This is a training-stability question, not evidence the custom
+op computes the wrong gradient (its CPU-side wiring re-checks out exactly
+the same as before).
+
+**Mitigation (implemented, NOT GPU-VERIFIED): `muon_fresh_substr` /
+`muon_fresh_warmup` in `train()`.** A named Muon-routed parameter group
+(matched by substring) gets its own linear LR ramp, 0 → `muon_lr`, over
+`muon_fresh_warmup` steps, instead of jumping straight to the main
+group's schedule. Everything else is untouched — with
+`muon_fresh_substr=''` (the default) the code path is identical to
+before, verified bit-for-bit on CPU (same seed, same steps, same final
+loss to 6 decimals). The ramp itself was checked on CPU: the fresh
+group's lr tracks `base_lr / warmup` at step 0 and converges to exactly
+the main group's lr at the end of the warmup window; a checkpoint saved
+mid-ramp and resumed reproduces the continuous run's loss exactly
+(confirms the ramp needs no extra saved state — it is a pure function of
+the already-checkpointed global step).
+
+**Status: this combination (custom op + fresh-group warmup) has never
+run on a GPU.** `experiments/verify_rotfree_fix.py` is the required
+smoke test before it touches a real budget again:
+
+```bash
+OPERA_TRITON_CUSTOM_OP=1 python experiments/verify_rotfree_fix.py --device cuda
+```
+
+It (1) reruns the `device_check.py` gradient comparison with the custom
+op enabled — `rot_free` should now show a small relative error, not
+1.00 — and (2) trains a small model (d1024×L2 by default, synthetic
+data, a few hundred steps, no download) with the warmup on, reporting
+the fraction of steps skipped to the gradient guard. Both must pass, and
+the note it prints at the end — repeating the smoke test at the actual
+target width before committing real budget to it — should be followed,
+since the divergence happened at d3072, not at a toy size.
+
+**This has not been run.** The current 18h demo run is not using the
+custom op or the warmup; it is deliberately left on the proven
+(frozen-`rot_free`, gradient-guarded) path for the rest of this run. The
+fix above is for the *next* long run.
+
 ## 6. Sources
 
 - Khandelwal, He, Qi, Jurafsky — *Sharp Nearby, Fuzzy Far Away: How Neural Language Models Use Context*, ACL 2018 — arxiv.org/abs/1805.04623

@@ -403,7 +403,8 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
           far_weight=0.0, far_n=8, far_d=100, byte_dropout=0.0,
           mask_id=2, resid_init_scale=None, hmem_nb=0, hmem_decay='none', hmem_conv=0,
           samuon_gamma=1.0, samuon_warmup_frac=0.3,
-          packed_data=None, ddp=False):
+          packed_data=None, ddp=False,
+          muon_fresh_substr='', muon_fresh_warmup=0):
     # DDP (multi-GPU data parallelism, added for the Kaggle 2xT4 tier --
     # a single T4 measured ~8.5x slower than the project's A100, so real
     # multi-GPU throughput matters there in a way it didn't on Colab).
@@ -523,6 +524,8 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
         tag.append('mfg' if muon_include == 'fusion_gate' else 'minc')
     if muon_wd:
         tag.append(f'mwd{muon_wd:g}')
+    if muon_fresh_substr:
+        tag.append(f'mfresh-w{muon_fresh_warmup}')
     if lo_muon:
         tag.append('lo' if lo_muon == 'uniform' else 'loder')
     if level_cond_rank:
@@ -776,6 +779,30 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
         from .muon import Muon, LOMuon, split_muon_params
         include = tuple(s for s in muon_include.split(',') if s)
         muon_np, adam_np = split_muon_params(model, include)
+        # muon_fresh_substr/muon_fresh_warmup (Recall research §8f, OFF by
+        # default): a linear-ramp LR group for Muon-routed params whose
+        # gradient has just started flowing after being structurally zero
+        # for the whole run so far (e.g. rot_free under the torch.compile
+        # Triton path before the opera_lm.triton_kernel custom-op fix --
+        # confirmed zero via experiments/device_check.py, A100, rel err
+        # exactly 1.00). Muon's orthogonalized update applies at a fixed
+        # effective step size regardless of gradient history, so handing a
+        # previously-untouched matrix its first real gradient at full
+        # muon_lr risks a destabilizing jump (observed: a d3072 A100 run
+        # with the fix enabled and no warmup went non-finite at step 147).
+        # Ramping that group's lr from 0 to muon_lr over muon_fresh_warmup
+        # steps lets it start training gently instead. UNVERIFIED ON GPU
+        # as of 2026-10-01 -- see docs/OPERA_Recall_Research_2026-09-24.md
+        # §8f for the required smoke test before using this on a real
+        # budget. With muon_fresh_substr='' (the default) this entire
+        # block is skipped and training is byte-for-byte unchanged.
+        fresh_substr = tuple(s for s in muon_fresh_substr.split(',') if s)
+        fresh_np = []
+        if fresh_substr:
+            fresh_np = [(n, p) for n, p in muon_np
+                       if any(s in n for s in fresh_substr)]
+            muon_np = [(n, p) for n, p in muon_np
+                      if not any(s in n for s in fresh_substr)]
         groups = [
             {'params': [p for _, p in muon_np],
              'names': [n for n, _ in muon_np],
@@ -788,6 +815,14 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
             {'params': [p for _, p in adam_np], 'use_muon': False,
              'lr': max_lr},
         ]
+        if fresh_np:
+            groups.append(
+                {'params': [p for _, p in fresh_np],
+                 'names': [n for n, _ in fresh_np],
+                 'use_muon': True, 'lr': muon_lr, 'weight_decay': muon_wd,
+                 'sa_gamma': float(samuon_gamma),
+                 'sa_warmup': int(round(samuon_warmup_frac * steps)),
+                 'fresh_warmup': int(muon_fresh_warmup)})
         if lo_muon:
             lo_names = [n for n, _ in muon_np if n.startswith('fusion_gate')]
             opt = LOMuon(groups, lo_names=lo_names, lo_mode=lo_muon,
@@ -808,7 +843,11 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
                      f"{int(round(samuon_warmup_frac * steps))} steps"
                      if samuon_gamma != 1.0 else "")
                   + f") + AdamW: {sum(p.numel() for _, p in adam_np):,} "
-                  f"(lr {max_lr})", flush=True)
+                  f"(lr {max_lr})"
+                  + (f" + fresh-Muon: {sum(p.numel() for _, p in fresh_np):,} "
+                     f"{list(fresh_substr)} (lr ramp 0->{muon_lr} over "
+                     f"{muon_fresh_warmup} steps)" if fresh_np else ""),
+                  flush=True)
     elif use_foreach:
         # AdamW(foreach=True): fused multi-tensor step. weight_decay=0.0
         # keeps the math equal to Adam so the recipe is unchanged.
@@ -932,7 +971,13 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
             # Muon groups follow the same warmup/decay schedule, rescaled
             # to their own base lr (muon_lr).
             if optimizer == 'muon' and g.get('use_muon'):
-                g['lr'] = lr * (muon_lr / max_lr)
+                base = lr * (muon_lr / max_lr)
+                fw = g.get('fresh_warmup', 0)
+                # muon_fresh_warmup (see the Muon-group setup above): a
+                # LINEAR ramp from 0, independent of the global warmup/
+                # decay schedule `base` already carries -- so a fresh
+                # group's lr is always <= the main Muon group's.
+                g['lr'] = base * min(1.0, (step + 1) / fw) if fw else base
             else:
                 g['lr'] = lr
 
@@ -1227,6 +1272,8 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
         'fold_grade': (list(fold_grade) if fold_grade is not None else None),
         'level_grad_balance': level_grad_balance,
         'muon_include': muon_include, 'muon_wd': muon_wd,
+        'muon_fresh_substr': muon_fresh_substr,
+        'muon_fresh_warmup': muon_fresh_warmup if muon_fresh_substr else None,
         'lo_muon': lo_muon, 'level_cond_rank': level_cond_rank,
         'head_mode': head_mode, 'resid_mode': resid_mode,
         'fold_gate': fold_gate, 'fold_h0': bool(fold_h0),
