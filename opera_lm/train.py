@@ -1071,7 +1071,6 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
             last_loss_finite = False
             continue
         last_loss_finite = True
-        nan_run = 0
 
         if scaler is not None:
             scaler.scale(loss / accum).backward()
@@ -1081,11 +1080,31 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
                 scaler.step(opt)
                 scaler.update()
                 opt.zero_grad()
+                nan_run = 0
         else:
             (loss / accum).backward()
             if boundary:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                opt.step()
+                gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                if torch.isfinite(gnorm):
+                    opt.step()
+                    nan_run = 0
+                else:
+                    # A finite loss with a non-finite gradient (a rare
+                    # overflow spike): clip_grad_norm_ cannot scale inf --
+                    # it turns the gradients into nan -- so stepping would
+                    # poison every weight and every later batch (observed:
+                    # d3072, step ~6201, A100). Skip the update instead;
+                    # DDP all-reduces gradients first, so all ranks agree.
+                    nan_skips += 1
+                    nan_run += 1
+                    if is_main:
+                        print(f"    WARNING: non-finite gradient at step {step} "
+                              f"(update skipped; {nan_skips} skips so far)",
+                              flush=True)
+                    if nan_run >= 25:
+                        raise RuntimeError(
+                            f"{nan_run} consecutive non-finite steps (step "
+                            f"{step}); training diverged -- stopping")
                 opt.zero_grad()
 
         if is_main and (step % 200 == 0 or step == steps - 1):
