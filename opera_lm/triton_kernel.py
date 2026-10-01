@@ -424,7 +424,7 @@ class _Ctx:
 
 
 def _node_fwd_impl(h_l, h_r, R_L, R_R, R_O, g):
-    return FusedNodeTriton.forward(_Ctx(), h_l, h_r, R_L, R_R, R_O, g).to(h_l.dtype)
+    return FusedNodeTriton.forward(_Ctx(), h_l, h_r, R_L, R_R, R_O, g).to(h_l.dtype).contiguous()
 
 
 def _node_bwd_impl(h_l, h_r, R_L, R_R, R_O, g, gout):
@@ -432,20 +432,30 @@ def _node_bwd_impl(h_l, h_r, R_L, R_R, R_O, g, gout):
     ctx.saved_tensors = (h_l, h_r, R_L, R_R, R_O,
                          g.to(h_l.dtype) if g.dtype != h_l.dtype else g)
     grads = FusedNodeTriton.backward(ctx, gout)
-    return tuple(gr.to(x.dtype) for gr, x in zip(grads, (h_l, h_r, R_L, R_R, R_O, g)))
+    return tuple(gr.to(x.dtype).contiguous() for gr, x in zip(grads, (h_l, h_r, R_L, R_R, R_O, g)))
 
 
 def _act_fwd_impl(x):
-    return FusedActTriton.forward(_Ctx(), x).to(x.dtype)
+    return FusedActTriton.forward(_Ctx(), x).to(x.dtype).contiguous()
 
 
 def _act_bwd_impl(x, gy):
     ctx = _Ctx()
     ctx.saved_tensors = (x,)
-    return FusedActTriton.backward(ctx, gy).to(x.dtype)
+    return FusedActTriton.backward(ctx, gy).to(x.dtype).contiguous()
 
 
-if hasattr(torch.library, 'custom_op'):
+# OFF by default (2026-10-01): the custom-op path is CPU-verified only; its
+# first A100 run (d3072) went non-finite from step 147, while the
+# autograd.Function path trained the whole ladder cleanly. Until it is
+# verified on a GPU, training keeps the ladder's path (with which compiled
+# training leaves rot_free at its init -- Recall research §8e).
+# Opt in with OPERA_TRITON_CUSTOM_OP=1.
+import os as _os
+_USE_CUSTOM_OP = (_os.environ.get('OPERA_TRITON_CUSTOM_OP') == '1'
+                  and hasattr(torch.library, 'custom_op'))
+
+if _USE_CUSTOM_OP:
     from torch import Tensor
 
     @torch.library.custom_op("opera::fused_node", mutates_args=())
@@ -455,7 +465,9 @@ if hasattr(torch.library, 'custom_op'):
 
     @_fused_node_op.register_fake
     def _(h_l, h_r, R_L, R_R, R_O, g):
-        return torch.empty_like(h_l)
+        # contiguous, like the real kernel output (empty_like would copy a
+        # strided input's layout and the compiled graph would misread it)
+        return h_l.new_empty(h_l.shape)
 
     @torch.library.custom_op("opera::fused_node_bwd", mutates_args=())
     def _fused_node_bwd_op(h_l: Tensor, h_r: Tensor, R_L: Tensor, R_R: Tensor,
@@ -465,7 +477,7 @@ if hasattr(torch.library, 'custom_op'):
 
     @_fused_node_bwd_op.register_fake
     def _(h_l, h_r, R_L, R_R, R_O, g, gout):
-        return tuple(torch.empty_like(t) for t in (h_l, h_r, R_L, R_R, R_O, g))
+        return tuple(t.new_empty(t.shape) for t in (h_l, h_r, R_L, R_R, R_O, g))
 
     def _node_setup(ctx, inputs, output):
         ctx.save_for_backward(*inputs)
@@ -481,7 +493,7 @@ if hasattr(torch.library, 'custom_op'):
 
     @_fused_act_op.register_fake
     def _(x):
-        return torch.empty_like(x)
+        return x.new_empty(x.shape)
 
     @torch.library.custom_op("opera::fused_act_bwd", mutates_args=())
     def _fused_act_bwd_op(x: Tensor, gy: Tensor) -> Tensor:
@@ -489,7 +501,7 @@ if hasattr(torch.library, 'custom_op'):
 
     @_fused_act_bwd_op.register_fake
     def _(x, gy):
-        return torch.empty_like(x)
+        return x.new_empty(x.shape)
 
     def _act_setup(ctx, inputs, output):
         ctx.save_for_backward(inputs[0])
@@ -498,7 +510,7 @@ if hasattr(torch.library, 'custom_op'):
         return _fused_act_bwd_op(ctx.saved_tensors[0], gy.contiguous())
 
     _fused_act_op.register_autograd(_act_backward, setup_context=_act_setup)
-else:                                    # torch < 2.4: plain autograd.Function
+else:                                    # default: plain autograd.Function
     _fused_node_op = FusedNodeTriton.apply
     _fused_act_op = FusedActTriton.apply
 

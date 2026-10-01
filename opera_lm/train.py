@@ -923,6 +923,7 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
 
     t0 = time.time()
     nan_skips = 0            # batches skipped by the divergence guard
+    nan_run = 0              # consecutive non-finite losses (abort at 25)
     last_loss_finite = True  # gates checkpointing (see guard comment below)
     for step in range(start_step, steps):
         lr = get_lr(step, warmup, steps, max_lr, schedule=lr_schedule,
@@ -1054,6 +1055,15 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
             finite = bool(t_flag.item() > 0.5)
         if not finite:
             nan_skips += 1
+            nan_run += 1
+            if nan_run >= 25:
+                # weights or optimizer state are poisoned: every later batch
+                # would be skipped too -- stop instead of burning the budget
+                # (the last healthy checkpoint is kept: saving is gated on a
+                # finite loss)
+                raise RuntimeError(
+                    f"{nan_run} consecutive non-finite losses (step {step}); "
+                    f"training diverged -- stopping")
             if is_main and (nan_skips == 1 or nan_skips % 50 == 0):
                 print(f"    WARNING: non-finite loss at step {step} "
                       f"(batch skipped, no update; {nan_skips} skips so "
@@ -1061,6 +1071,7 @@ def train(steps, batch, max_len, vocab_size, d, nb, num_layers, eval_max_len,
             last_loss_finite = False
             continue
         last_loss_finite = True
+        nan_run = 0
 
         if scaler is not None:
             scaler.scale(loss / accum).backward()
