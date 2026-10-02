@@ -291,10 +291,17 @@ if triton is not None:
         offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         mask = offs < total
         x = tl.load(x_ptr + offs, mask=mask, other=0.0)
-        # tl.tanh is available in recent triton; exp2-based fallback keeps
-        # this portable across triton versions without a version probe.
-        e = tl.exp(2.0 * x)
-        th = (e - 1.0) / (e + 1.0)
+        # Overflow-safe tanh. The naive (e-1)/(e+1) with e = exp(2x)
+        # overflows fp32 to inf for x > ~44.4, making th = inf/inf = nan
+        # in the FORWARD -- observed as non-finite losses only at d >=
+        # 2048, where sqrt(d) (the worst-case LayerNorm output feeding
+        # this activation, before the affine gain) first crosses that
+        # threshold (Recall research 8e/8f: one nan at d2048 step 29224,
+        # an escalating rate at d3072; d <= 1536 cannot reach it). With
+        # z = exp(-2|x|) in (0, 1] the form below is exact for every
+        # representable x, on every triton version (no tl.tanh needed).
+        z = tl.exp(-2.0 * tl.abs(x))
+        th = tl.where(x >= 0, (1.0 - z) / (1.0 + z), (z - 1.0) / (1.0 + z))
         tl.store(y_ptr + offs, th + 0.1 * x, mask=mask)
 
     @triton.jit
@@ -304,9 +311,13 @@ if triton is not None:
         mask = offs < total
         x = tl.load(x_ptr + offs, mask=mask, other=0.0)
         gy = tl.load(gy_ptr + offs, mask=mask, other=0.0)
-        e = tl.exp(2.0 * x)
-        th = (e - 1.0) / (e + 1.0)
-        tl.store(gx_ptr + offs, gy * (1.0 - th * th + 0.1), mask=mask)
+        # Overflow-safe sech^2: 1 - tanh(x)^2 == 4z/(1+z)^2 with
+        # z = exp(-2|x|) -- same value, no exp overflow and no 1-th^2
+        # cancellation at large |x| (see _act_fwd_kernel).
+        z = tl.exp(-2.0 * tl.abs(x))
+        den = (1.0 + z) * (1.0 + z)
+        tl.store(gx_ptr + offs, gy * (4.0 * z / den + 0.1),
+                 mask=mask)
 
 
 class FusedNodeTriton(torch.autograd.Function):
@@ -645,6 +656,30 @@ def _test():
                  (xc.grad.cpu() - xr.grad).abs().max().item())
         print(f"  (4) fused_act_triton vs eager: err {e7:.2e}")
         assert e7 < 1e-4
+
+        # (4b) EXTREME pre-activations (regression, 2026-10-01): the
+        # LayerNorm output bound sqrt(d) crosses the fp32 exp-overflow
+        # point x ~ 44.4 at d >= ~1937, so at the d2048/d3072 ladder
+        # widths legitimate activations reach it. The old (e-1)/(e+1)
+        # tanh produced nan there in BOTH forward and backward (one nan
+        # loss at d2048 step 29224, an escalating rate at d3072); the
+        # stable z = exp(-2|x|) form must stay finite and exact.
+        xext = torch.tensor([0., 1e-6, -1e-6, 1., -1., 10., -10., 30.,
+                             -30., 43., -43., 44.3, -44.3, 44.5, -44.5,
+                             55.4, -55.4, 100., -100., 1e4, -1e4],
+                            device='cuda', requires_grad=True)
+        yext = fused_act_triton(xext)
+        yext.sum().backward()
+        xr2 = xext.detach().cpu().requires_grad_(True)
+        yr2 = torch.tanh(xr2) + 0.1 * xr2
+        yr2.sum().backward()
+        assert torch.isfinite(yext).all() and torch.isfinite(xext.grad).all(), \
+            "fused_act went non-finite on extreme inputs (overflow regression)"
+        e8 = max((yext.detach().cpu() - yr2.detach()).abs().max().item(),
+                 (xext.grad.cpu() - xr2.grad).abs().max().item())
+        print(f"  (4b) fused_act_triton extreme |x|<=1e4 vs eager: "
+              f"all finite, err {e8:.2e}")
+        assert e8 < 1e-4
     else:
         print("  (3)/(4) SKIPPED: no CUDA+triton on this machine -- "
               "run on your GPU box (e.g. Kaggle)")
