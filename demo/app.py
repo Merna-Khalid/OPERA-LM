@@ -84,7 +84,8 @@ demo = gr.ChatInterface(
     title='OPERA-LM chat — no attention, no tokenizer',
     description=ABOUT,
     additional_inputs=[
-        gr.Slider(32, 600, value=300, step=16, label='Max new bytes'),
+        gr.Slider(32, 1024, value=(512 if DEVICE != 'cpu' else 256), step=16,
+                  label='Max new bytes'),
         gr.Slider(0.0, 1.5, value=0.7, step=0.05, label='Temperature'),
         gr.Slider(0.5, 1.0, value=0.9, step=0.01, label='Top-p'),
     ],
