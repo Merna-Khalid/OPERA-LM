@@ -59,11 +59,22 @@ def _pairs(history):
     return pairs
 
 
+# defaults shared by the UI sliders and respond() itself: gradio 6 caches
+# ChatInterface examples at startup and passes None for additional inputs
+# the examples don't cover (the warning in the Space log), so respond()
+# must be able to run with them missing (demo/app.py, 2026-10-04).
+DEF_MAX_NEW = 512 if DEVICE != 'cpu' else 256
+DEF_TEMP, DEF_TOP_P = 0.7, 0.9
+
+
 def respond(message, history, max_new, temperature, top_p):
-    ids = format_prompt(_pairs(history), _text(message), max_len=MAX_LEN - int(max_new))
+    max_new = DEF_MAX_NEW if max_new is None else int(max_new)
+    temperature = DEF_TEMP if temperature is None else float(temperature)
+    top_p = DEF_TOP_P if top_p is None else float(top_p)
+    ids = format_prompt(_pairs(history), _text(message), max_len=MAX_LEN - max_new)
     text = ''
-    for text in stream_generate(model, ids, max_new=int(max_new),
-                                temperature=float(temperature), top_p=float(top_p)):
+    for text in stream_generate(model, ids, max_new=max_new,
+                                temperature=temperature, top_p=top_p):
         yield text
     if not text.strip():
         yield '…'
@@ -81,13 +92,18 @@ _ci_kw = (dict(type='messages')
 demo = gr.ChatInterface(
     respond,
     **_ci_kw,
+    # never run the model at startup: example caching on a free CPU Space
+    # would both slow the boot for minutes and (gradio 6) call respond()
+    # before the sliders have values
+    **({} if 'cache_examples' not in
+        inspect.signature(gr.ChatInterface.__init__).parameters
+       else dict(cache_examples=False)),
     title='OPERA-LM chat — no attention, no tokenizer',
     description=ABOUT,
     additional_inputs=[
-        gr.Slider(32, 1024, value=(512 if DEVICE != 'cpu' else 256), step=16,
-                  label='Max new bytes'),
-        gr.Slider(0.0, 1.5, value=0.7, step=0.05, label='Temperature'),
-        gr.Slider(0.5, 1.0, value=0.9, step=0.01, label='Top-p'),
+        gr.Slider(32, 1024, value=DEF_MAX_NEW, step=16, label='Max new bytes'),
+        gr.Slider(0.0, 1.5, value=DEF_TEMP, step=0.05, label='Temperature'),
+        gr.Slider(0.5, 1.0, value=DEF_TOP_P, step=0.01, label='Top-p'),
     ],
     examples=[['Hi! Who are you?'],
               ['Give me three tips for staying focused while studying.'],
