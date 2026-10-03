@@ -5,6 +5,10 @@ the MODEL_REPO variable and streams replies byte by byte with the
 Fenwick-incremental decoder (opera_lm.chat).
 """
 import os
+import sys
+
+# runnable from a source checkout without installing opera-lm
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import gradio as gr
 import torch
@@ -12,8 +16,13 @@ import torch
 from opera_lm.chat import format_prompt, load_model, stream_generate
 
 MODEL_REPO = os.environ.get('MODEL_REPO', 'Merna-Khalid/opera-lm-chat')
-torch.set_num_threads(max(1, os.cpu_count() or 1))
-model, cfg = load_model(MODEL_REPO)
+# A local export folder (experiments/export_hf.py --out) works too --
+# load_model reads config.json + model.safetensors from a directory. The
+# notebook's in-browser launch sets MODEL_DEVICE=cuda (the Space stays CPU)
+# and GRADIO_SHARE=1 for a public Colab URL.
+DEVICE = os.environ.get('MODEL_DEVICE', 'cpu')
+torch.set_num_threads(max(1, os.cpu_count() or 1) if DEVICE == 'cpu' else 1)
+model, cfg = load_model(MODEL_REPO, device=DEVICE)
 MAX_LEN = cfg.get('chat_max_len', 2048)
 
 ABOUT = f"""
@@ -24,7 +33,8 @@ in-context recall comes from a gated quaternion holographic memory.
 It reads and writes raw UTF-8 bytes (no tokenizer).
 Small research model: fluent-looking replies, not reliable facts.
 [Code](https://github.com/Merna-Khalid/OPERA-LM) ·
-[Model]({'https://huggingface.co/' + MODEL_REPO})
+[Model]({'https://huggingface.co/' + MODEL_REPO if not os.path.isdir(MODEL_REPO)
+         else 'https://github.com/Merna-Khalid/OPERA-LM'})
 """
 
 
@@ -59,9 +69,18 @@ def respond(message, history, max_new, temperature, top_p):
         yield '…'
 
 
+import inspect
+
+# 'messages' history format: an explicit kwarg in gradio 4/5, the only
+# format (kwarg removed) in gradio 6+. The Space and Colab both get
+# whichever major is current at build time, so pass it only if accepted.
+_ci_kw = (dict(type='messages')
+          if 'type' in inspect.signature(gr.ChatInterface.__init__).parameters
+          else {})
+
 demo = gr.ChatInterface(
     respond,
-    type='messages',
+    **_ci_kw,
     title='OPERA-LM chat — no attention, no tokenizer',
     description=ABOUT,
     additional_inputs=[
@@ -75,4 +94,4 @@ demo = gr.ChatInterface(
 )
 
 if __name__ == '__main__':
-    demo.queue().launch()
+    demo.queue().launch(share=os.environ.get('GRADIO_SHARE') == '1')

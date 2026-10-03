@@ -103,6 +103,24 @@ def main():
                             if ev else '', repo=args.push or args.out))
     print(f"exported {args.arm} ({params:,} params) -> {args.out}")
 
+    # Round-trip gate before anything is pushed: load the exported folder
+    # back exactly the way a downloader will (chat.load_model: config.json
+    # + safetensors) and require identical logits on a fixed prompt. A
+    # constructor flag that changes BEHAVIOR without changing parameter
+    # shapes (hmem_decay, resid_mode, fold_impl, ...) survives a strict
+    # state_dict load but shows up here.
+    from opera_lm.chat import format_prompt, load_model
+    m2, _ = load_model(args.out, device='cpu')
+    ids = format_prompt([], 'Hello! Who are you?')
+    t = torch.tensor([ids]); lens = torch.tensor([len(ids)])
+    with torch.no_grad():
+        l1 = [l.float() for l in model(t, lens).logits]
+        l2 = [l.float() for l in m2(t, lens).logits]
+    diff = max((a - b).abs().max().item() for a, b in zip(l1, l2))
+    assert diff < 1e-4, f'export round-trip FAILED: logits differ by {diff}'
+    print(f'round-trip verified: exported folder reproduces the checkpoint '
+          f'(max |dlogits| {diff:.2e})', flush=True)
+
     if args.push:
         from huggingface_hub import HfApi
         api = HfApi(token=os.environ.get('HF_TOKEN'))
