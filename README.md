@@ -50,6 +50,16 @@ logits = model(ids, lengths).logits[-1] # final-layer logits [2, 1024, 259]
 Add `use_metal=True` on Apple Silicon or `use_triton=True` on CUDA for the
 fused kernels. The math is identical (selftested).
 
+The trained 172M chat model is on the Hub — raw bytes in, raw bytes out,
+no tokenizer at inference either:
+
+```python
+from opera_lm.chat import load_model, format_prompt, stream_generate
+model, cfg = load_model("TheInvestigator/opera-lm-chat")   # or a local export folder
+for text in stream_generate(model, format_prompt([], "Hello! Who are you?")):
+    print(text, end="", flush=True)
+```
+
 ## Install
 
 ```bash
@@ -322,10 +332,61 @@ python experiments/repr_study.py --arms w768_hmem192_gated_full --steps 12000 \
 python experiments/eval_pool.py --arms w768_hmem192_gated_full  # every test set
 ```
 
-**Scaling next:** [`colab/OPERA_Scale.ipynb`](colab/OPERA_Scale.ipynb)
-runs a compute-optimal ladder on FineWeb-Edu bytes on a Colab A100.
-The notebook covers GPU correctness checks, data build, throughput
-benchmark, and resumable training.
+## Results at scale — FineWeb-Edu bytes, 5M to 172M (2026-10)
+
+`colab/OPERA_Scale.ipynb` runs a compute-optimal ladder on FineWeb-Edu
+bytes on a single Colab A100: GPU correctness checks, data build,
+throughput benchmark, resumable training, and the fit. Every rung uses
+the same code, recipe family, and seed discipline as the small-scale
+line. Held-out bits per byte; SimpleWiki is the cross-domain pool
+(no in-family tuning):
+
+| rung | params | bytes | C (FLOPs) | FineWeb BPB | SimpleWiki BPB |
+|---|---|---|---|---|---|
+| d512×L2 | 5.0M | 0.10G | 3.0e15 | 1.7258 | 2.2271 |
+| d768×L2 | 11.0M | 0.22G | 1.5e16 | 1.5919 | 2.0425 |
+| d1024×L2 | 19.4M | 0.39G | 4.5e16 | 1.5134 | 1.9524 |
+| d1024×L4 | 37.3M | 0.75G | 1.7e17 | 1.4624 | 1.8124 |
+| d1536×L2 | 43.3M | 0.87G | 2.3e17 | 1.4299 | 1.8129 |
+| d2048×L2 | 76.6M | 1.53G | 7.1e17 | 1.3706 | 1.7421 |
+| d3072×L2 | 171.6M | 4.80G | 4.9e18 | 1.2728 | 1.6054 |
+
+Fit over the L=2 width ladder: **BPB = 1.084 + 118·C^−0.146** (rmse
+0.003). The reducible exponent sits in the range Chinchilla reports for
+transformers (αβ/(α+β) ≈ 0.154); each ~4× of compute buys 0.06–0.08 BPB
+with no early flattening, and the largest rung — **172M parameters,
+trained in 16 hours on one A100** — landed below the fitted curve.
+
+Length generalization holds up the scale: at 2× the 1024-byte training
+context, held-out BPB is 0.97–0.99× in-length at every rung, with no
+positional encoding anywhere.
+
+**The chat model.** Fine-tuning the 172M rung for one hour on
+smol-smoltalk (as bytes) produces a correctly formatted conversational
+model — role markers, turn-taking, clean stops — served by the
+Fenwick-incremental decoder. Model:
+`https://huggingface.co/TheInvestigator/opera-lm-chat` · demo Space:
+`https://huggingface.co/spaces/TheInvestigator/opera-lm-chat-demo`.
+Expect fluent-looking replies, not reliable facts; it is a 172M
+byte-level model that has seen ~5 GB of text.
+
+**Honesty box.**
+1. Single seed per rung, per house convention; the small-scale seed
+   band is ~3% BPB.
+2. No same-compute transformer baseline in this byte-level line *yet* —
+   that experiment is the next step (the 22M word-level line has one).
+   "Exponent in the Chinchilla range" is a measurement of this curve,
+   not a head-to-head claim.
+3. A torch.compile interaction on CUDA left the per-block 3×3 maps
+   (`rot_free`) frozen near their init during these runs; the fix is in,
+   and trained maps can only help (docs, Recall research §8e–8g).
+4. E = 1.08 BPB is this family's asymptote at ~20–28 bytes/param, not
+   the entropy of the text.
+
+Reproduce: run the notebook top to bottom; the ladder cell resumes
+finished rungs automatically. ~2,200 A100-hours would carry the curve to
+the 1B rung plus the matched baseline
+([compute request](docs/OPERA_Compute_Request.md)).
 
 ## Earlier results — 22M params, word-level 10k vocab (the original matched protocol)
 
@@ -408,9 +469,11 @@ writing (`docs/` contains the pre-registrations):
 
 ## Roadmap
 
-- **Compute-optimal scaling ladder** on FineWeb-Edu bytes (4–5 sizes,
-  ~10M–150M params, Colab A100): fit loss against compute and compare
-  the slope with published byte-level and attention-free models
+- Carry the FineWeb-Edu ladder to the 1B rung and run the matched
+  same-compute transformer baseline — the head-to-head this architecture
+  owes the field (compute request: `docs/OPERA_Compute_Request.md`)
+- Long context at scale: train 8k, evaluate 16k–64k, where O(T log T)
+  and O(T²) actually diverge
 - Depth > 2 at scale (additive residual with 1/√(2L) init; untested so
   far)
 - A Triton kernel for the holographic memory (it runs as the PyTorch
