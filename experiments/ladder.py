@@ -46,8 +46,24 @@ T = 1024
 ARM_PREFIX = {'opera': 'fw_', 'tf_byte': 'tfb_', 'tf_tok': 'tft_'}
 
 
-def arm_name(d, L, ratio, model='opera'):
-    return f"{ARM_PREFIX[model]}d{d}_L{L}_r{ratio:g}"
+def arm_name(d, L, ratio, model='opera', suffix=''):
+    return f"{ARM_PREFIX[model]}d{d}_L{L}_r{ratio:g}{suffix}"
+
+
+def tf_arm_suffix(args):
+    """Distinguishes a qk_norm/attn_logit_cap re-run's arm names from an
+    already-written, unfixed tfb_/tft_ entry in repr_summary.json -- so a
+    controlled before/after comparison (docs/OPERA_Mechanisms_Guide.md §8:
+    one variable per run, same-session incumbent) keeps BOTH rows instead
+    of the fixed run silently overwriting the broken one under the same
+    name."""
+    s = ''
+    if getattr(args, 'qk_norm', False):
+        s += '_qknorm'
+    cap = getattr(args, 'attn_logit_cap', 0.0)
+    if cap:
+        s += f'_cap{cap:g}'
+    return s
 
 
 def n_params(d, L, model='opera', vocab_size=259):
@@ -108,6 +124,7 @@ def plan(args):
     vocab_size = pm.get('vocab_size', 259) if model != 'opera' else 259
     units_per_byte = pm.get('units_per_byte', 1.0) or 1.0
     bench = load_bench(args.bench)
+    suffix = tf_arm_suffix(args) if model != 'opera' else ''
     rows, tot_h, tot_bytes = [], 0.0, 0
     for g in args.rungs:
         d, L = (int(x) for x in g.split('x'))
@@ -126,9 +143,10 @@ def plan(args):
         h = steps * ms / 3.6e6 if ms else None
         tot_h += h or 0
         tot_bytes += D
-        rows.append(dict(arm=arm_name(d, L, ratio, model=model), d=d, L=L,
-                         params=N, bytes=D, steps=steps, hours=h, est=how,
-                         vocab_size=vocab_size, units_per_byte=units_per_byte))
+        rows.append(dict(arm=arm_name(d, L, ratio, model=model, suffix=suffix),
+                         d=d, L=L, params=N, bytes=D, steps=steps, hours=h,
+                         est=how, vocab_size=vocab_size,
+                         units_per_byte=units_per_byte))
     print(f"model={model}  batch {args.batch} x {T}, mean sequence {msl:.0f} bytes, "
           + (f"{args.hours:g} h per rung" if args.hours else f"{args.ratio:g} bytes/param"))
     print(f"{'arm':22s} {'params':>8s} {'bytes':>8s} {'steps':>8s} {'~hours':>7s}  estimate")
@@ -169,6 +187,12 @@ def run(args):
                    '--save-every', str(args.save_every), '--resume',
                    '--seed', str(args.seed),
                    '--summary', os.path.join(RUNS, 'repr_summary.json')]
+            if getattr(args, 'qk_norm', False):
+                cmd += ['--qk-norm']
+            if getattr(args, 'attn_logit_cap', 0.0):
+                cmd += ['--attn-logit-cap', str(args.attn_logit_cap)]
+            if getattr(args, 'log_attn_every', 0):
+                cmd += ['--log-attn-every', str(args.log_attn_every)]
         if args.device:
             cmd += ['--device', args.device]
         if args.muon_lr_scale is not None:
@@ -230,7 +254,7 @@ def fit(args):
               + (f"{sw:10.4f}" if sw is not None else f"{'-':>10s}"))
     # the width fit uses only the ladder's own ratio (runs at other
     # bytes/param, e.g. an iso-FLOP check, are listed but not fitted)
-    tag = f"_r{args.ratio:g}"
+    tag = f"_r{args.ratio:g}{tf_arm_suffix(args) if getattr(args, 'model', 'opera') != 'opera' else ''}"
     width = [p for p in pts if p['L'] == 2 and p['arm'].endswith(tag)]
     res = {}
     if len(width) >= 3:
@@ -248,7 +272,7 @@ def fit(args):
                 print(f"  {kind} {p['arm']}: {p['bpb']:.4f} vs width-fit "
                       f"{pred:.4f} at equal compute ({100 * (p['bpb'] / pred - 1):+.1f}%)")
     model = getattr(args, 'model', 'opera')
-    fit_tag = 'ladder_fit' if model == 'opera' else f'ladder_fit_{model}'
+    fit_tag = 'ladder_fit' if model == 'opera' else f'ladder_fit_{model}{tf_arm_suffix(args)}'
     json.dump(dict(points=pts, width_fit=res),
               open(os.path.join(RUNS, f'{fit_tag}.json'), 'w'), indent=2)
     try:
@@ -317,6 +341,22 @@ def main():
     p.add_argument('--grad-clip', type=float, default=None,
                    help='run only: passed through to repr_study.py '
                         '--grad-clip (safe to vary across --resume)')
+    p.add_argument('--qk-norm', action='store_true',
+                   help='--model tf_byte/tf_tok only: per-head QK-norm '
+                        '(train_tf_pool.py --qk-norm), the fix for the '
+                        'attention-logit collapse observed in the '
+                        'unfixed tfb_ ladder. Appends _qknorm to every '
+                        'arm name in this run so it never collides with '
+                        'an existing unfixed entry (plan/run/fit must all '
+                        'pass the same flags to address the same arms)')
+    p.add_argument('--attn-logit-cap', type=float, default=0.0,
+                   help='--model tf_byte/tf_tok only: Gemma-2-style soft '
+                        'cap on raw attention logits (0 = off); appends '
+                        '_cap<v> to every arm name')
+    p.add_argument('--log-attn-every', type=int, default=0,
+                   help='--model tf_byte/tf_tok, run only: diagnostic -- '
+                        'log max |attention logit| every N steps to '
+                        '<arm>/attn_logits.jsonl (0 = off, no extra cost)')
     p.add_argument('--out', default=None, help='plot path (fit)')
     args = p.parse_args()
     if args.cmd in ('plan', 'run') and not args.pool:

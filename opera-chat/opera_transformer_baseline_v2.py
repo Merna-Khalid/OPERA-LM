@@ -125,12 +125,39 @@ def apply_rope(x, cos, sin):
     return torch.stack([o1, o2], dim=-1).flatten(-2)
 
 
+def _rms_norm_last_dim(x, gain, eps=1e-6):
+    """Per-head RMSNorm over the last (head_dim) axis, fp32 internally
+    regardless of x's dtype. `gain` ([hd]) broadcasts over every head."""
+    xf = x.float()
+    rms = xf.pow(2).mean(dim=-1, keepdim=True).add(eps).rsqrt()
+    return (xf * rms * gain.float()).to(x.dtype)
+
+
 # ============================================================================
 # MODEL
 # ============================================================================
 
 class Block(nn.Module):
-    def __init__(self, d, nheads, ffn_mult, dropout):
+    """qk_norm / attn_logit_cap (both off by default, bitwise unchanged
+    behavior then): the OLMo-2/Gemma-2-style stabilizers added after the
+    FineWeb byte-ladder transformer baseline (tfb_*) was observed to
+    collapse mid-training at every width except the smallest (d512) --
+    loss falls cleanly, then jumps to a permanently worse plateau while
+    the LR is still high, never during warmup or late decay. Diagnosis:
+    unconstrained attention-logit growth under bf16, the standard failure
+    mode QK-norm/soft-capping target (no QK-norm was present before this).
+    Either flag (or want_stats, see forward()) switches this block from
+    the fused F.scaled_dot_product_attention path to an explicit
+    q@k^T / softmax / @v path computed in fp32 regardless of the
+    surrounding autocast dtype -- the fp32-upcast "belt and suspenders"
+    the same diagnosis calls for, and the only way to read out the
+    diagnostic (max |logit|) or apply the soft cap, since SDPA is fused
+    and exposes neither. With both flags off and want_stats=False, the
+    original fused path runs unchanged -- every existing caller (e.g.
+    train_tf_chat.py) is bitwise unaffected."""
+
+    def __init__(self, d, nheads, ffn_mult, dropout, qk_norm=False,
+                attn_logit_cap=0.0):
         super().__init__()
         self.nheads = nheads
         self.hd = d // nheads
@@ -141,23 +168,61 @@ class Block(nn.Module):
         f = int(d * ffn_mult)
         self.ffn = nn.Sequential(nn.Linear(d, f), nn.GELU(), nn.Linear(f, d))
         self.dropout = dropout
+        self.qk_norm = qk_norm
+        self.attn_logit_cap = attn_logit_cap
+        if qk_norm:
+            # one gain vector per head_dim, shared across heads (OLMo-2 /
+            # Qwen2 convention) -- hd extra parameters each, per block.
+            self.q_norm_gain = nn.Parameter(torch.ones(self.hd))
+            self.k_norm_gain = nn.Parameter(torch.ones(self.hd))
+        else:
+            self.q_norm_gain = None
+            self.k_norm_gain = None
 
-    def forward(self, x, rope):
+    def _manual_attn(self, q, k, v, want_stats):
+        """q,k,v: [B,H,T,hd]. Explicit attention in fp32, used whenever
+        qk_norm/attn_logit_cap are active or a diagnostic is requested."""
+        scale = self.hd ** -0.5
+        scores = (q.float() @ k.float().transpose(-2, -1)) * scale  # [B,H,T,T]
+        T = scores.shape[-1]
+        causal = torch.triu(torch.ones(T, T, device=scores.device,
+                                       dtype=torch.bool), diagonal=1)
+        max_abs = None
+        if want_stats:
+            abs_scores = scores.abs().masked_fill(causal, 0.0)
+            max_abs = abs_scores.amax().item()
+        if self.attn_logit_cap and self.attn_logit_cap > 0:
+            cap = self.attn_logit_cap
+            scores = cap * torch.tanh(scores / cap)
+        scores = scores.masked_fill(causal, float('-inf'))
+        attn = torch.softmax(scores, dim=-1)
+        if self.dropout > 0 and self.training:
+            attn = F.dropout(attn, p=self.dropout)
+        return attn.to(v.dtype) @ v, max_abs
+
+    def forward(self, x, rope, want_stats=False):
         B, T, d = x.shape
         h = self.ln1(x)
         qkv = self.qkv(h).reshape(B, T, 3, self.nheads, self.hd)
         q, k, v = [qkv[:, :, i].transpose(1, 2) for i in range(3)]  # [B,H,T,hd]
+        if self.qk_norm:
+            q = _rms_norm_last_dim(q, self.q_norm_gain)
+            k = _rms_norm_last_dim(k, self.k_norm_gain)
         if rope is not None:
             cos, sin = rope
             q = apply_rope(q, cos, sin)
             k = apply_rope(k, cos, sin)
-        att = F.scaled_dot_product_attention(
-            q, k, v, is_causal=True,
-            dropout_p=self.dropout if self.training else 0.0)
+        stat = None
+        if self.qk_norm or self.attn_logit_cap or want_stats:
+            att, stat = self._manual_attn(q, k, v, want_stats)
+        else:
+            att = F.scaled_dot_product_attention(
+                q, k, v, is_causal=True,
+                dropout_p=self.dropout if self.training else 0.0)
         att = att.transpose(1, 2).reshape(B, T, d)
         x = x + self.proj(att)
         x = x + self.ffn(self.ln2(x))
-        return x
+        return x, stat
 
 
 class TransformerBaseline(nn.Module):
@@ -167,7 +232,7 @@ class TransformerBaseline(nn.Module):
 
     def __init__(self, vocab_size, d=512, nheads=8, num_layers=4,
                  pe_mode='rope', max_pe_len=2048, ffn_mult=4.0, dropout=0.0,
-                 tie=False):
+                 tie=False, qk_norm=False, attn_logit_cap=0.0):
         super().__init__()
         assert d % nheads == 0
         assert pe_mode in ('rope', 'nope', 'sin', 'learned')
@@ -181,7 +246,8 @@ class TransformerBaseline(nn.Module):
         else:
             self.pos_emb = None
         self.blocks = nn.ModuleList(
-            [Block(d, nheads, ffn_mult, dropout) for _ in range(num_layers)])
+            [Block(d, nheads, ffn_mult, dropout, qk_norm=qk_norm,
+                  attn_logit_cap=attn_logit_cap) for _ in range(num_layers)])
         self.ln_f = nn.LayerNorm(d)
         self.head = nn.Linear(d, vocab_size)     # untied + bias, like OPERA
         if tie:
@@ -196,7 +262,7 @@ class TransformerBaseline(nn.Module):
         self.dropout = dropout
         self._rope_cache = {}
 
-    def forward(self, token_ids, lengths, **kwargs):
+    def forward(self, token_ids, lengths, return_attn_stats=False, **kwargs):
         B, T = token_ids.shape
         device = token_ids.device
         x = self.word_emb(token_ids)
@@ -215,12 +281,17 @@ class TransformerBaseline(nn.Module):
             if key not in self._rope_cache:
                 self._rope_cache[key] = rope_tables(T, self.hd, device)
             rope = self._rope_cache[key]
+        stats = [] if return_attn_stats else None
         for blk in self.blocks:
-            x = blk(x, rope)
+            x, stat = blk(x, rope, want_stats=return_attn_stats)
+            if return_attn_stats:
+                stats.append(stat)
         x = self.ln_f(x)
         logits = self.head(x)
         if self.logit_scale is not None:
             logits = logits * self.logit_scale
+        if return_attn_stats:
+            return [logits], stats               # per-layer max |attn logit|
         return [logits]                         # list: protocol-compatible
 
 

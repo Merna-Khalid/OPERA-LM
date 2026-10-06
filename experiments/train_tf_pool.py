@@ -141,6 +141,27 @@ def main():
                    help='resume-safe multiplier on the Muon group lr, same '
                         'role as ladder.py/repr_study.py --muon-lr-scale')
     p.add_argument('--grad-clip', type=float, default=1.0)
+    p.add_argument('--qk-norm', action='store_true',
+                   help='per-head RMSNorm on q/k before the attention dot '
+                        'product (OLMo-2/Qwen2-style); off by default, '
+                        'bitwise unchanged model when absent. Added after '
+                        'the tf_byte ladder collapsed mid-training at every '
+                        'width except d512 -- the standard fix for '
+                        'unconstrained attention-logit growth under bf16')
+    p.add_argument('--attn-logit-cap', type=float, default=0.0,
+                   help='Gemma-2-style soft cap on raw attention logits, '
+                        'cap*tanh(logits/cap); 0 = off. Independent of '
+                        '--qk-norm (can combine or run as separate arms, '
+                        'one variable at a time)')
+    p.add_argument('--log-attn-every', type=int, default=0,
+                   help='every N steps (and at step 0), compute the max '
+                        '|attention logit| per layer on that step\'s own '
+                        'training batch and append it to '
+                        '<out-dir>/<arm>/attn_logits.jsonl plus the console '
+                        '-- the diagnostic for the attention-collapse '
+                        'hypothesis. 0 = disabled (no extra cost: the fast '
+                        'fused attention path is used throughout unless '
+                        '--qk-norm/--attn-logit-cap are also set)')
     p.add_argument('--summary', default=None,
                    help='repr_summary.json-shaped file to append this arm '
                         'into (ladder.py fit reads it, filtered by arm prefix)')
@@ -176,11 +197,15 @@ def main():
     model = TransformerBaseline(a.vocab_size, d=a.d, nheads=nheads,
                                 num_layers=a.num_layers, pe_mode=a.pe,
                                 max_pe_len=min(a.max_len * 4, a.eval_cap),
-                                tie=False).to(a.device)
+                                tie=False, qk_norm=a.qk_norm,
+                                attn_logit_cap=a.attn_logit_cap).to(a.device)
     npar = count_params(model)
     print(f"\n{'=' * 70}\n[{a.arm}] transformer pe={a.pe} d={a.d} "
           f"nheads={nheads} L={a.num_layers} V={a.vocab_size}: "
-          f"{npar:,} params", flush=True)
+          f"{npar:,} params  qk_norm={a.qk_norm} attn_logit_cap={a.attn_logit_cap}",
+          flush=True)
+    attn_log_path = os.path.join(arm_dir, 'attn_logits.jsonl')
+    attn_log_f = open(attn_log_path, 'a') if a.log_attn_every > 0 else None
 
     source = PackedBatchSource(a.packed, a.max_len, a.device, a.seed)
 
@@ -230,10 +255,24 @@ def main():
             else:
                 g['lr'] = lr
 
+        want_stats = a.log_attn_every > 0 and step % a.log_attn_every == 0
         token_ids, lengths = source.sample(a.batch)
         with torch.autocast(device_type=a.device, dtype=amp_dtype):
-            all_logits = model(token_ids, lengths)
+            if want_stats:
+                all_logits, attn_stats = model(token_ids, lengths,
+                                               return_attn_stats=True)
+            else:
+                all_logits = model(token_ids, lengths)
             loss, _, _ = lm_loss(all_logits, token_ids, lengths)
+
+        if want_stats:
+            loss_val = loss.item() if torch.isfinite(loss).all() else None
+            row = {'step': step, 'max_logit_per_layer': attn_stats,
+                  'max_logit': max(attn_stats), 'loss': loss_val}
+            attn_log_f.write(json.dumps(row) + '\n')
+            attn_log_f.flush()
+            print(f"    [attn] step {step:6d}  max|logit| {max(attn_stats):8.2f}  "
+                  f"per-layer {['%.1f' % s for s in attn_stats]}", flush=True)
 
         if not bool(torch.isfinite(loss).all().item()):
             nan_skips += 1
@@ -269,6 +308,8 @@ def main():
                        'torch_rng': torch.get_rng_state(),
                        'gpu_rng': source.state_dict()}, train_ckpt)
 
+    if attn_log_f is not None:
+        attn_log_f.close()
     mins = (time.time() - t0) / 60
     ppl = _oom_backstop(
         lambda b: compute_perplexity_tf(model, test_short, a.max_len, b, a.device),
@@ -300,6 +341,8 @@ def main():
             'minutes': mins, 'nan_skips': nan_skips,
             'ckpt_dir': arm_dir, 'packed': a.packed, 'layers': a.num_layers,
             'test_pkl': a.test_pkl, 'model': 'transformer', 'pe': a.pe,
+            'qk_norm': a.qk_norm, 'attn_logit_cap': a.attn_logit_cap,
+            'attn_log': attn_log_path if a.log_attn_every > 0 else None,
             'extrapolation': {k: v[0] for k, v in extrap.items()},
         }
         os.makedirs(os.path.dirname(args_summary) or '.', exist_ok=True)
