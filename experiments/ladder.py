@@ -16,6 +16,20 @@ Default rungs: a width ladder at L=2 (5M, 11M, 19M, 43M, 77M params) and
 a depth check, d1024 x L4 (37M), next to d1536 x L2 (43M). All rungs use
 the same batch, recipe and seed; learning-rate schedules scale with each
 rung's own step count (cosine, 500 warmup steps).
+
+--model selects the architecture trained at each rung:
+  opera    (default) OperaSpinorFenwickTree via experiments/repr_study.py.
+  tf_byte  matched transformer baseline (opera-chat/opera_transformer_baseline_v2.py,
+           pe=nope -- the direct comparison arm for OPERA's pe-none) on the
+           SAME byte --pool as the opera ladder, via experiments/train_tf_pool.py.
+  tf_tok   the same transformer baseline, pe=rope (the standard strong
+           setup), on a BPE token --pool (build_fineweb_tokens.py); vocab_size
+           and the BPB conversion factor are read from that pool's meta.json.
+Each model's rows land in the same repr_summary.json under a model-specific
+arm prefix (fw_ / tfb_ / tft_), so `fit --model <m>` fits/plots that one
+family. The transformer arms are the LADDER ONLY (5M-77M) -- intentionally
+no long run at the OPERA demo model's ~172M scale (fw_d3072_L2), since that
+single rung already costs ~18h and a baseline only needs the ladder's trend.
 """
 import argparse
 import json
@@ -29,22 +43,31 @@ sys.path.insert(0, ROOT)
 RUNS = os.environ.get('OPERA_RUNS', os.path.join(ROOT, 'runs_reprs'))
 DEFAULT_RUNGS = ['512x2', '768x2', '1024x2', '1536x2', '2048x2', '1024x4']
 T = 1024
+ARM_PREFIX = {'opera': 'fw_', 'tf_byte': 'tfb_', 'tf_tok': 'tft_'}
 
 
-def arm_name(d, L, ratio):
-    return f"fw_d{d}_L{L}_r{ratio:g}"
+def arm_name(d, L, ratio, model='opera'):
+    return f"{ARM_PREFIX[model]}d{d}_L{L}_r{ratio:g}"
 
 
-def n_params(d, L):
+def n_params(d, L, model='opera', vocab_size=259):
     import torch
-    from opera_lm import OperaSpinorFenwickTree
-    kw = dict(vocab_size=259, d=d, nb=d // 4, num_layers=L, pe_mode='none',
-              fold_mode='left', rot_mode='free', head_mode='stream',
-              fold_impl='downsweep', hmem_nb=d // 4, hmem_decay='gated')
-    if L > 2:
-        kw.update(resid_mode='add', resid_init_scale='auto')
+    if model == 'opera':
+        from opera_lm import OperaSpinorFenwickTree
+        kw = dict(vocab_size=259, d=d, nb=d // 4, num_layers=L, pe_mode='none',
+                  fold_mode='left', rot_mode='free', head_mode='stream',
+                  fold_impl='downsweep', hmem_nb=d // 4, hmem_decay='gated')
+        if L > 2:
+            kw.update(resid_mode='add', resid_init_scale='auto')
+        with torch.device('meta'):
+            m = OperaSpinorFenwickTree(**kw)
+        return sum(p.numel() for p in m.parameters())
+    sys.path.insert(0, os.path.join(ROOT, 'opera-chat'))
+    from opera_transformer_baseline_v2 import TransformerBaseline
+    nheads = max(1, d // 64)
     with torch.device('meta'):
-        m = OperaSpinorFenwickTree(**kw)
+        m = TransformerBaseline(vocab_size, d=d, nheads=nheads,
+                                num_layers=L, tie=False)
     return sum(p.numel() for p in m.parameters())
 
 
@@ -79,12 +102,16 @@ def est_ms(bench, d, L, B, params):
 
 
 def plan(args):
+    model = getattr(args, 'model', 'opera')
     msl = mean_seq_len(args.pool)
+    pm = json.load(open(args.pool + '.meta.json'))
+    vocab_size = pm.get('vocab_size', 259) if model != 'opera' else 259
+    units_per_byte = pm.get('units_per_byte', 1.0) or 1.0
     bench = load_bench(args.bench)
     rows, tot_h, tot_bytes = [], 0.0, 0
     for g in args.rungs:
         d, L = (int(x) for x in g.split('x'))
-        N = n_params(d, L)
+        N = n_params(d, L, model=model, vocab_size=vocab_size)
         ms, how = est_ms(bench, d, L, args.batch, N)
         if args.hours:
             # fixed time budget: as many bytes as the hours allow
@@ -99,16 +126,16 @@ def plan(args):
         h = steps * ms / 3.6e6 if ms else None
         tot_h += h or 0
         tot_bytes += D
-        rows.append(dict(arm=arm_name(d, L, ratio), d=d, L=L, params=N,
-                         bytes=D, steps=steps, hours=h, est=how))
-    print(f"batch {args.batch} x {T}, mean sequence {msl:.0f} bytes, "
+        rows.append(dict(arm=arm_name(d, L, ratio, model=model), d=d, L=L,
+                         params=N, bytes=D, steps=steps, hours=h, est=how,
+                         vocab_size=vocab_size, units_per_byte=units_per_byte))
+    print(f"model={model}  batch {args.batch} x {T}, mean sequence {msl:.0f} bytes, "
           + (f"{args.hours:g} h per rung" if args.hours else f"{args.ratio:g} bytes/param"))
     print(f"{'arm':22s} {'params':>8s} {'bytes':>8s} {'steps':>8s} {'~hours':>7s}  estimate")
     for r in rows:
         hs = f"{r['hours']:7.2f}" if r['hours'] is not None else '      ?'
         print(f"{r['arm']:22s} {r['params'] / 1e6:7.1f}M {r['bytes'] / 1e9:7.2f}G "
               f"{r['steps']:8d} {hs}  {r['est']}")
-    pm = json.load(open(args.pool + '.meta.json'))
     print(f"total ~{tot_h:.1f} GPU-hours (training only; add ~5 min/rung for "
           f"compile and evaluation), {tot_bytes / 1e9:.2f}G bytes; the pool "
           f"has {pm['total_tokens'] / 1e9:.2f}G, so the largest rung sees "
@@ -117,17 +144,31 @@ def plan(args):
 
 
 def run(args):
+    model = getattr(args, 'model', 'opera')
     rows = plan(args)
     py = sys.executable
     for r in rows:
-        cmd = [py, os.path.join(ROOT, 'experiments', 'repr_study.py'),
-               '--arms', r['arm'], '--steps', str(r['steps']),
-               '--batch', str(args.batch), '--packed', args.pool,
-               '--test-pkl', args.pool + '.test.pkl',
-               '--save-every', str(args.save_every), '--resume',
-               '--seed', str(args.seed)]
-        if args.pool_test:
-            cmd += ['--pool-test', args.pool_test]
+        if model == 'opera':
+            cmd = [py, os.path.join(ROOT, 'experiments', 'repr_study.py'),
+                   '--arms', r['arm'], '--steps', str(r['steps']),
+                   '--batch', str(args.batch), '--packed', args.pool,
+                   '--test-pkl', args.pool + '.test.pkl',
+                   '--save-every', str(args.save_every), '--resume',
+                   '--seed', str(args.seed)]
+            if args.pool_test:
+                cmd += ['--pool-test', args.pool_test]
+        else:
+            pe = 'nope' if model == 'tf_byte' else 'rope'
+            cmd = [py, os.path.join(ROOT, 'experiments', 'train_tf_pool.py'),
+                   '--arm', r['arm'], '--pe', pe,
+                   '--vocab-size', str(r['vocab_size']),
+                   '--units-per-byte', str(r['units_per_byte']),
+                   '--d', str(r['d']), '--num-layers', str(r['L']),
+                   '--steps', str(r['steps']), '--batch', str(args.batch),
+                   '--packed', args.pool, '--test-pkl', args.pool + '.test.pkl',
+                   '--save-every', str(args.save_every), '--resume',
+                   '--seed', str(args.seed),
+                   '--summary', os.path.join(RUNS, 'repr_summary.json')]
         if args.device:
             cmd += ['--device', args.device]
         if args.muon_lr_scale is not None:
@@ -165,10 +206,11 @@ def fit_power_law(C, y):
 
 
 def fit(args):
+    prefix = ARM_PREFIX[getattr(args, 'model', 'opera')]
     summ = json.load(open(os.path.join(RUNS, 'repr_summary.json')))
     pts = []
     for name, v in summ.items():
-        if not name.startswith('fw_') or v.get('test_pkl') is None:
+        if not name.startswith(prefix) or v.get('test_pkl') is None:
             continue
         msl = mean_seq_len(v['packed'])
         D = v['steps'] * v['batch'] * msl
@@ -205,8 +247,10 @@ def fit(args):
                 kind = 'depth check' if p['L'] != 2 else 'off-ratio'
                 print(f"  {kind} {p['arm']}: {p['bpb']:.4f} vs width-fit "
                       f"{pred:.4f} at equal compute ({100 * (p['bpb'] / pred - 1):+.1f}%)")
+    model = getattr(args, 'model', 'opera')
+    fit_tag = 'ladder_fit' if model == 'opera' else f'ladder_fit_{model}'
     json.dump(dict(points=pts, width_fit=res),
-              open(os.path.join(RUNS, 'ladder_fit.json'), 'w'), indent=2)
+              open(os.path.join(RUNS, f'{fit_tag}.json'), 'w'), indent=2)
     try:
         import matplotlib
         matplotlib.use('Agg')
@@ -228,10 +272,13 @@ def fit(args):
         ax.set_xscale('log')
         ax.set_xlabel('training compute C = 6ND (FLOPs)')
         ax.set_ylabel('FineWeb-Edu held-out BPB')
-        ax.set_title('OPERA + holographic memory: compute-optimal ladder')
+        title = {'opera': 'OPERA + holographic memory: compute-optimal ladder',
+                 'tf_byte': 'Transformer baseline (byte, pe=nope): compute-optimal ladder',
+                 'tf_tok': 'Transformer baseline (BPE, pe=rope): compute-optimal ladder'}[model]
+        ax.set_title(title)
         ax.legend()
         ax.grid(alpha=0.3, which='both')
-        out = args.out or os.path.join(RUNS, 'ladder_fit.png')
+        out = args.out or os.path.join(RUNS, f'{fit_tag}.png')
         fig.tight_layout()
         fig.savefig(out, dpi=150)
         print(f"plot -> {out}")
@@ -243,7 +290,14 @@ def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('cmd', choices=['plan', 'run', 'fit'])
-    p.add_argument('--pool', help='FineWeb byte pool prefix (build_fineweb_bytes.py)')
+    p.add_argument('--model', default='opera', choices=['opera', 'tf_byte', 'tf_tok'],
+                   help='opera (default): OperaSpinorFenwickTree via repr_study.py. '
+                        'tf_byte/tf_tok: the matched transformer baseline via '
+                        'train_tf_pool.py (pe=nope/rope respectively) -- see module '
+                        'docstring')
+    p.add_argument('--pool', help='byte pool prefix (build_fineweb_bytes.py) for '
+                        '--model opera/tf_byte, or token pool prefix '
+                        '(build_fineweb_tokens.py) for --model tf_tok')
     p.add_argument('--rungs', nargs='+', default=DEFAULT_RUNGS, help='dxL entries')
     p.add_argument('--ratio', type=float, default=20.0, help='training bytes per parameter')
     p.add_argument('--hours', type=float, default=0,

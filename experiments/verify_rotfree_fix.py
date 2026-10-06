@@ -14,9 +14,11 @@ demo run trained with it structurally frozen. opera_lm.triton_kernel's
 torch.library custom-op path (OPERA_TRITON_CUSTOM_OP=1) fixes that, but
 its first (only) GPU use diverged at step 147 -- plausibly because Muon's
 orthogonalized update hit a never-before-updated rot_free at full
-strength. train()'s muon_fresh_substr/muon_fresh_warmup ramps a named
-group's Muon lr from 0 instead. This script checks both pieces before
-either is trusted again.
+strength (and/or the fp32 tanh overflow that 8g root-caused afterwards --
+that one is fixed in triton_kernel.py and checked by this suite's --test
+case 4b, not by this script). train()'s muon_fresh_substr/muon_fresh_warmup
+ramps a named group's Muon lr from 0 instead. This script checks both
+pieces before either is trusted again.
 """
 import argparse
 import os
