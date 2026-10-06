@@ -146,15 +146,19 @@ class Block(nn.Module):
     the LR is still high, never during warmup or late decay. Diagnosis:
     unconstrained attention-logit growth under bf16, the standard failure
     mode QK-norm/soft-capping target (no QK-norm was present before this).
-    Either flag (or want_stats, see forward()) switches this block from
-    the fused F.scaled_dot_product_attention path to an explicit
-    q@k^T / softmax / @v path computed in fp32 regardless of the
-    surrounding autocast dtype -- the fp32-upcast "belt and suspenders"
-    the same diagnosis calls for, and the only way to read out the
-    diagnostic (max |logit|) or apply the soft cap, since SDPA is fused
-    and exposes neither. With both flags off and want_stats=False, the
-    original fused path runs unchanged -- every existing caller (e.g.
-    train_tf_chat.py) is bitwise unaffected."""
+    qk_norm rides the FUSED F.scaled_dot_product_attention path (normalize
+    q/k, then SDPA as usual): the norm bounds the logits BEFORE softmax,
+    which is all it needs, and the big rungs (d2048: B32 H32 T1024) cannot
+    afford the O(B*H*T^2) fp32 score matrix in memory or step time at
+    every training step -- the same reason every production model runs
+    QK-norm together with flash attention. attn_logit_cap or want_stats
+    (see forward()) switches this block to an explicit q@k^T / softmax /
+    @v path computed in fp32 regardless of the surrounding autocast
+    dtype -- the only way to apply the soft cap or read out the
+    diagnostic (max |logit|), since SDPA is fused and exposes neither.
+    With both flags off and want_stats=False, the original fused path
+    runs unchanged -- every existing caller (e.g. train_tf_chat.py) is
+    bitwise unaffected."""
 
     def __init__(self, d, nheads, ffn_mult, dropout, qk_norm=False,
                 attn_logit_cap=0.0):
@@ -213,9 +217,12 @@ class Block(nn.Module):
             q = apply_rope(q, cos, sin)
             k = apply_rope(k, cos, sin)
         stat = None
-        if self.qk_norm or self.attn_logit_cap or want_stats:
+        if self.attn_logit_cap or want_stats:
             att, stat = self._manual_attn(q, k, v, want_stats)
         else:
+            # qk_norm (if on) has already normalized q/k above; the fused
+            # path is used for it -- only the cap / the diagnostic need
+            # the explicit fp32 attention
             att = F.scaled_dot_product_attention(
                 q, k, v, is_causal=True,
                 dropout_p=self.dropout if self.training else 0.0)
@@ -344,6 +351,31 @@ def selftest():
         err = (a - b).abs().max().item()
         print(f"  pe={pm}: loss {loss.item():.3f}, causality err {err:.2e}")
         assert err < 1e-5
+
+    # stabilizer combinations (added after the tfb_ byte-ladder collapse):
+    # with qk_norm on and the cap off, forward() takes the FUSED path, so
+    # it must agree with the explicit fp32 path (return_attn_stats=True)
+    # to fp tolerance; the cap only exists on the explicit path
+    for qk, cap in ((True, 0.0), (True, 50.0), (False, 50.0)):
+        m = TransformerBaseline(vocab_size=211, d=64, nheads=4, num_layers=2,
+                                pe_mode='nope', qk_norm=qk, attn_logit_cap=cap)
+        tok = torch.randint(1, 211, (3, 13))
+        lens = torch.tensor([13, 7, 5])
+        out = m(tok, lens)
+        loss, _, _ = lm_loss(out, tok, lens)
+        loss.backward()
+        assert torch.isfinite(loss)
+        out_ms, stats = m(tok, lens, return_attn_stats=True)
+        ferr = (out[0] - out_ms[0]).abs().max().item()
+        print(f"  qk_norm={qk} cap={cap}: loss {loss.item():.3f}, "
+              f"fused-vs-explicit err {ferr:.2e}, max|logit| {max(stats):.2f}")
+        assert ferr < 1e-5, "qk_norm fused path diverges from explicit path"
+        m.eval()
+        with torch.no_grad():
+            a = m(tok, lens)[-1][0, :6].clone()
+            tok2 = tok.clone(); tok2[0, 9] = (tok2[0, 9] + 5) % 210 + 1
+            b = m(tok2, lens)[-1][0, :6]
+        assert (a - b).abs().max().item() < 1e-5, "causality broken with stabilizers"
 
     # probe interface compatibility (imports the real probe machinery);
     # SKIPPED gracefully if opera_v8_probe.py is absent (train mode does
