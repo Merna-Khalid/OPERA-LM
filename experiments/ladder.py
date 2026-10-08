@@ -197,6 +197,8 @@ def run(args):
             cmd += ['--device', args.device]
         if args.muon_lr_scale is not None:
             cmd += ['--muon-lr-scale', str(args.muon_lr_scale)]
+        if getattr(args, 'max_lr_scale', None) is not None:
+            cmd += ['--max-lr-scale', str(args.max_lr_scale)]
         if args.grad_clip is not None:
             cmd += ['--grad-clip', str(args.grad_clip)]
         print(f"\n### rung {r['arm']}: {r['steps']} steps", flush=True)
@@ -255,7 +257,9 @@ def fit(args):
     # the width fit uses only the ladder's own ratio (runs at other
     # bytes/param, e.g. an iso-FLOP check, are listed but not fitted)
     tag = f"_r{args.ratio:g}{tf_arm_suffix(args) if getattr(args, 'model', 'opera') != 'opera' else ''}"
-    width = [p for p in pts if p['L'] == 2 and p['arm'].endswith(tag)]
+    excl = set(args.exclude or [])
+    width = [p for p in pts if p['L'] == 2 and p['arm'].endswith(tag)
+             and p['arm'] not in excl]
     res = {}
     if len(width) >= 3:
         E, A, a, rmse = fit_power_law([p['C'] for p in width], [p['bpb'] for p in width])
@@ -268,7 +272,9 @@ def fit(args):
         for p in pts:
             if p not in width:
                 pred = E + A * p['C'] ** -a
-                kind = 'depth check' if p['L'] != 2 else 'off-ratio'
+                kind = ('depth check' if p['L'] != 2 else
+                        'excluded (unstable), not fitted' if p['arm'] in excl
+                        else 'off-ratio')
                 print(f"  {kind} {p['arm']}: {p['bpb']:.4f} vs width-fit "
                       f"{pred:.4f} at equal compute ({100 * (p['bpb'] / pred - 1):+.1f}%)")
     model = getattr(args, 'model', 'opera')
@@ -338,6 +344,11 @@ def main():
     p.add_argument('--muon-lr-scale', type=float, default=None,
                    help='run only: passed through to repr_study.py '
                         '--muon-lr-scale (safe to vary across --resume)')
+    p.add_argument('--max-lr-scale', type=float, default=None,
+                   help='run only: passed through to repr_study.py --max-lr-scale '
+                        '(Adam-group LR; pair with --muon-lr-scale when running '
+                        '--batch above the protocol 32 — keep constant across '
+                        'resumes of the same run)')
     p.add_argument('--grad-clip', type=float, default=None,
                    help='run only: passed through to repr_study.py '
                         '--grad-clip (safe to vary across --resume)')
@@ -357,6 +368,12 @@ def main():
                    help='--model tf_byte/tf_tok, run only: diagnostic -- '
                         'log max |attention logit| every N steps to '
                         '<arm>/attn_logits.jsonl (0 = off, no extra cost)')
+    p.add_argument('--exclude', nargs='+', default=[],
+                   help='fit only: arm names to keep OUT of the width fit '
+                        '(still listed and plotted). Use for rungs that '
+                        'diverged mid-training, e.g. the tfb_ widths whose '
+                        'attention collapsed -- a diverged rung is an '
+                        'instability observation, not a scaling point')
     p.add_argument('--out', default=None, help='plot path (fit)')
     args = p.parse_args()
     if args.cmd in ('plan', 'run') and not args.pool:

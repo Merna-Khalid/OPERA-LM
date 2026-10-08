@@ -433,6 +433,14 @@ def main():
                         '--resume of the same run (Recall research §8f: use '
                         'this, not a lower base LR, to calm a run that is '
                         'skipping non-finite gradients often)')
+    p.add_argument('--max-lr-scale', type=float, default=None,
+                   help='multiply the Adam-group max_lr by this factor '
+                        '(recipe default 1e-3); pair with --muon-lr-scale '
+                        'when raising --batch above the protocol 32 '
+                        '(sqrt(batch/32) scaling). Unlike a raw --max-lr it '
+                        'applies through the recipe, and the value must be '
+                        'kept constant across --resume sessions of the same '
+                        'run (train() puts max_lr in the checkpoint tag)')
     p.add_argument('--grad-clip', type=float, default=None,
                    help='gradient-norm clip threshold (default in train(): '
                         '1.0); also safe to vary across --resume')
@@ -504,6 +512,8 @@ def main():
         recipe = dict(device_kernels(RECIPE.get(name, {}), args.device))
         if args.muon_lr_scale is not None:
             recipe['muon_lr_resume_scale'] = args.muon_lr_scale
+        if args.max_lr_scale is not None:
+            recipe['max_lr'] = recipe.get('max_lr', 1e-3) * args.max_lr_scale
         if args.grad_clip is not None:
             recipe['grad_clip'] = args.grad_clip
         res = train(
