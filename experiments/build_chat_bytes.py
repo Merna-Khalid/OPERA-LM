@@ -89,7 +89,21 @@ def main():
             random.Random(0).shuffle(seqs)
             offsets = np.zeros(len(seqs) + 1, dtype=np.int64)
             offsets[1:] = np.cumsum([len(s) for s in seqs])
-            np.save(prefix + '.tokens.npy', np.concatenate(seqs))
+            # stream-write the token array instead of np.concatenate: the
+            # xl pool is ~4 GB and concatenating doubles the peak RSS --
+            # an OOM kill on a standard (12.7 GB) Colab CPU runtime, mid-
+            # build, leaving the pool in a partial state. open_memmap
+            # writes the .npy to disk progressively; free the per-conv
+            # list right after.
+            tok_mm = np.lib.format.open_memmap(
+                prefix + '.tokens.npy', mode='w+', dtype=np.uint16,
+                shape=(int(offsets[-1]),))
+            pos = 0
+            for s in seqs:
+                tok_mm[pos:pos + len(s)] = s
+                pos += len(s)
+            tok_mm.flush()
+            del tok_mm
             np.save(prefix + '.offsets.npy', offsets)
         else:
             test = random.Random(0).sample(seqs, min(args.n_test, len(seqs)))
