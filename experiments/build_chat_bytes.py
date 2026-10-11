@@ -35,29 +35,55 @@ def main():
     p.add_argument('--out-dir', default='assets')
     p.add_argument('--T', type=int, default=2048)
     p.add_argument('--dataset', default='HuggingFaceTB/smol-smoltalk')
+    p.add_argument('--extra-dataset', action='append', default=[],
+                   help='additional dataset(s) with the same messages '
+                        'schema, concatenated into this pool; exact '
+                        'duplicate conversations are dropped by content '
+                        'hash (the pools share upstream sources), e.g. '
+                        '--extra-dataset HuggingFaceTB/smoltalk')
+    p.add_argument('--name', default='',
+                   help='pool-name suffix: chat_bytes_T{T}_{name} '
+                        '(e.g. --name xl for the combined pool)')
     p.add_argument('--n-test', type=int, default=2000)
     p.add_argument('--limit', type=int, default=0, help='rows per split (testing)')
     args = p.parse_args()
     from datasets import load_dataset
     os.makedirs(args.out_dir, exist_ok=True)
-    prefix = os.path.join(args.out_dir, f'chat_bytes_T{args.T}')
+    prefix = os.path.join(
+        args.out_dir, f'chat_bytes_T{args.T}' +
+        (f'_{args.name}' if args.name else ''))
+    datasets = [args.dataset] + args.extra_dataset
 
+    import hashlib
     stats = {}
     for split in ('train', 'test'):
-        ds = load_dataset(args.dataset, split=split)
-        if args.limit:
-            ds = ds.select(range(min(args.limit, len(ds))))
-        seqs, n_cut, n_drop = [], 0, 0
-        for row in ds:
-            ids, cut = encode_conversation(row['messages'], args.T)
-            if ids is None:
-                n_drop += 1
-                continue
-            n_cut += cut
-            seqs.append(np.asarray(ids, dtype=np.uint16))
-        stats[split] = dict(rows=len(ds), kept=len(seqs), cut=n_cut,
-                            dropped=n_drop,
-                            bytes=int(sum(len(s) for s in seqs)))
+        seqs, n_cut, n_drop, n_dup = [], 0, 0, 0
+        seen = set()
+        per = []
+        for dname in datasets:
+            ds = load_dataset(dname, split=split)
+            if args.limit:
+                ds = ds.select(range(min(args.limit, len(ds))))
+            kept0 = len(seqs)
+            for row in ds:
+                ids, cut = encode_conversation(row['messages'], args.T)
+                if ids is None:
+                    n_drop += 1
+                    continue
+                arr = np.asarray(ids, dtype=np.uint16)
+                h = hashlib.blake2b(arr.tobytes(), digest_size=16).digest()
+                if h in seen:
+                    n_dup += 1
+                    continue
+                seen.add(h)
+                n_cut += cut
+                seqs.append(arr)
+            per.append(dict(dataset=dname, rows=len(ds),
+                            kept=len(seqs) - kept0))
+        stats[split] = dict(kept=len(seqs), cut=n_cut, dropped=n_drop,
+                            duplicates=n_dup,
+                            bytes=int(sum(len(s) for s in seqs)),
+                            per_dataset=per)
         print(split, stats[split], flush=True)
         if split == 'train':
             random.Random(0).shuffle(seqs)
@@ -70,7 +96,7 @@ def main():
             with open(prefix + '.test.pkl', 'wb') as f:
                 pickle.dump({'test_short': [(0, s) for s in test],
                              'test_long': [], 'meta': stats}, f)
-    meta = {'prefix': prefix, 'dataset': args.dataset, 'T': args.T,
+    meta = {'prefix': prefix, 'datasets': datasets, 'T': args.T,
             'n_seqs': stats['train']['kept'],
             'total_tokens': stats['train']['bytes'], 'splits': stats}
     json.dump(meta, open(prefix + '.meta.json', 'w'), indent=2)
