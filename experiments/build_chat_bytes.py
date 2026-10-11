@@ -30,6 +30,30 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'
 from opera_lm.chat import encode_conversation                # noqa: E402
 
 
+def _messages_of(row):
+    """Normalize the two common chat schemas to chat.py's
+    [{'role', 'content'}]:
+      - 'messages' (smoltalk / tulu style: {'role', 'content'})
+      - 'conversations' (ShareGPT / OpenHermes style: {'from': human|gpt|
+        system, 'value': text}); OpenHermes rows may also carry a top-level
+        system_prompt with no corresponding turn -- prepend it as a system
+        turn so it is not silently lost."""
+    if 'messages' in row:
+        return row['messages']
+    if 'conversations' in row:
+        role = {'human': 'user', 'gpt': 'assistant', 'system': 'system',
+                'prompt': 'user', 'response': 'assistant'}
+        turns = [{'role': role.get(t.get('from'), 'user'),
+                  'content': t.get('value', '')}
+                 for t in row['conversations']]
+        sysp = row.get('system_prompt')
+        if sysp:
+            turns = [{'role': 'system', 'content': sysp}] + turns
+        return turns
+    raise KeyError(f"row has neither 'messages' nor 'conversations'; "
+                   f"fields: {list(row)[:6]}")
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--out-dir', default='assets')
@@ -86,7 +110,7 @@ def main():
                 ds = ds.select(range(min(args.limit, len(ds))))
             kept0 = len(seqs)
             for row in ds:
-                ids, cut = encode_conversation(row['messages'], args.T)
+                ids, cut = encode_conversation(_messages_of(row), args.T)
                 if ids is None:
                     n_drop += 1
                     continue
