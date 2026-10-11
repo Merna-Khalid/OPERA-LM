@@ -468,7 +468,25 @@ def main():
 
     for name in args.arms:
         if name in summary:
-            print(f"[skip] {name} already in {summary_path}")
+            if args.pool_test and not summary[name].get('pool_eval'):
+                # training finished and the summary row was written on an
+                # earlier run whose pool eval crashed (observed: missing
+                # Simple-Wiki assets killed score_arm right AFTER the final
+                # checkpoint + FineWeb eval were saved) -- backfill the
+                # missing column instead of skipping the arm entirely
+                scale_arm(name)
+                _, T_back, _, _ = ARMS[name]
+                from eval_pool import score_arm, test_sets
+                pe = score_arm(name, test_sets(args.pool_test, T_back,
+                                               args.test_pkl),
+                               args.device, T_back)
+                summary[name]['pool_eval'] = pe
+                with open(summary_path, 'w') as f:
+                    json.dump(summary, f, indent=2)
+                print(f"  [{name}] pool eval BPB (backfilled): " +
+                      "  ".join(f"{k} {v:.4f}" for k, v in pe.items()))
+            else:
+                print(f"[skip] {name} already in {summary_path}")
             continue
         scale_arm(name)
         repr_mode, T, d, nb = ARMS[name]
@@ -577,8 +595,11 @@ def main():
     print(f"  {'arm':<12} {'repr':<6} {'params':>11} {'ctx bytes':>10} "
           f"{'PPL/unit':>9} {'BPB':>8}")
     for k, v in sorted(summary.items(), key=lambda kv: kv[1]['bpb']):
+        ctx = v.get('context_bytes', v.get('max_len', 0))  # TF rows have
+        # max_len, not context_bytes -- the shared repr_summary.json holds
+        # both families since the transformer baselines landed in it
         print(f"  {k:<12} {v['repr']:<6} {v['params']:>11,} "
-              f"{v['context_bytes']:>10.0f} {v['ppl_in_units']:>9.2f} "
+              f"{ctx:>10.0f} {v['ppl_in_units']:>9.2f} "
               f"{v['bpb']:>8.4f}")
     print(f"\n  wrote {summary_path}")
     print("  NOTE: PPL/unit is NOT comparable across representations "

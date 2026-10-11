@@ -205,9 +205,9 @@ class FusedCompose(torch.autograd.Function):
         if metal_available() and h_l.device.type == 'mps':
             N, nb, _ = h_l.shape
             lib = _get_lib()
-            p0 = torch.empty_like(h_l)
-            p1 = torch.empty_like(h_l)
-            geo = torch.empty_like(h_l)
+            p0 = torch.empty_like(h_l, memory_format=torch.contiguous_format)
+            p1 = torch.empty_like(h_l, memory_format=torch.contiguous_format)
+            geo = torch.empty_like(h_l, memory_format=torch.contiguous_format)
             Rl = R_L.reshape(nb, 9).contiguous()
             Rr = R_R.reshape(nb, 9).contiguous()
             lib.fused_compose_fwd(h_l.contiguous(), h_r.contiguous(),
@@ -223,8 +223,8 @@ class FusedCompose(torch.autograd.Function):
         if metal_available() and h_l.device.type == 'mps':
             N, nb, _ = h_l.shape
             lib = _get_lib()
-            dh_l = torch.empty_like(h_l)
-            dh_r = torch.empty_like(h_r)
+            dh_l = torch.empty_like(h_l, memory_format=torch.contiguous_format)
+            dh_r = torch.empty_like(h_r, memory_format=torch.contiguous_format)
             dv0 = torch.empty(N, nb, 3, device=h_l.device, dtype=h_l.dtype)
             dv1 = torch.empty(N, nb, 3, device=h_l.device, dtype=h_l.dtype)
             Rl = R_L.reshape(nb, 9).contiguous()
@@ -502,7 +502,7 @@ class FusedNode(torch.autograd.Function):
         if metal_available() and h_l.device.type == 'mps':
             N, nb, _ = h_l.shape
             lib = _get_lib_v2()
-            out = torch.empty_like(h_l)
+            out = torch.empty_like(h_l, memory_format=torch.contiguous_format)
             fwd = lib.fused_node_fwd_h if h_l.dtype == torch.float16 else lib.fused_node_fwd
             fwd(h_l.contiguous(), h_r.contiguous(),
                 R_L.reshape(nb, 9).float().contiguous(),
@@ -526,9 +526,9 @@ class FusedNode(torch.autograd.Function):
         if metal_available() and h_l.device.type == 'mps':
             N, nb, _ = h_l.shape
             lib = _get_lib_v2()
-            dh_l = torch.empty_like(h_l)
-            dh_r = torch.empty_like(h_r)
-            dg = torch.empty_like(g)
+            dh_l = torch.empty_like(h_l, memory_format=torch.contiguous_format)
+            dh_r = torch.empty_like(h_r, memory_format=torch.contiguous_format)
+            dg = torch.empty_like(g, memory_format=torch.contiguous_format)
             bwd = lib.fused_node_bwd_h if h_l.dtype == torch.float16 else lib.fused_node_bwd
             if gout.dtype != h_l.dtype:
                 gout = gout.to(h_l.dtype)
@@ -566,7 +566,7 @@ class FusedAct(torch.autograd.Function):
         ctx.save_for_backward(x)
         if metal_available() and x.device.type == 'mps':
             lib = _get_lib_v2()
-            y = torch.empty_like(x)
+            y = torch.empty_like(x, memory_format=torch.contiguous_format)
             fwd = lib.fused_act_fwd_h if x.dtype == torch.float16 else lib.fused_act_fwd
             fwd(x.contiguous(), y, x.numel(), threads=min(x.numel(), GRID_CAP))
             return y
@@ -577,7 +577,7 @@ class FusedAct(torch.autograd.Function):
         (x,) = ctx.saved_tensors
         if metal_available() and x.device.type == 'mps':
             lib = _get_lib_v2()
-            gx = torch.empty_like(x)
+            gx = torch.empty_like(x, memory_format=torch.contiguous_format)
             bwd = lib.fused_act_bwd_h if x.dtype == torch.float16 else lib.fused_act_bwd
             bwd(x.contiguous(), gy.contiguous(), gx, x.numel(),
                 threads=min(x.numel(), GRID_CAP))
@@ -756,6 +756,64 @@ def _test():
         assert e6b_fwd < 1e-4 and e6b_bwd < 1e-3
     else:
         print("  (6b) SKIPPED: non-orthogonal R_O check runs on your Mac")
+
+    # (6c) NON-CONTIGUOUS inputs: regression for the empty_like bug. The
+    # kernels write their outputs LINEARLY (contiguous order), but
+    # torch.empty_like preserves the input's memory format -- a strided
+    # input made the output buffer inherit strides it was never written
+    # with, so the caller read scrambled values (error up to ~2.6,
+    # appeared as batch-size-dependent results on MPS). All kernel output
+    # buffers now force contiguous_format; this test feeds strided views
+    # through every fused path so it cannot come back.
+    if metal_available():
+        h_l_nc = torch.randn(N, nb, 8, device='mps')[..., ::2]
+        h_r_nc = torch.randn(N, nb, 8, device='mps')[..., ::2]
+        g_nc = torch.rand(N, 3, 2 * nb, device='mps')[..., ::2]
+        x_nc = torch.randn(N, nb, 8, device='mps')[..., ::2]
+        assert not h_l_nc.is_contiguous() and not g_nc.is_contiguous()
+        RL32 = R_L.float().to('mps'); RR32 = R_R.float().to('mps')
+
+        e_act = (fused_act(x_nc) - (torch.tanh(x_nc) + 0.1 * x_nc)).abs().max().item()
+        out_nc = fused_node(h_l_nc, h_r_nc, RL32, RR32, RL32, g_nc)
+        out_ref = _node_fwd_reference(h_l_nc.cpu(), h_r_nc.cpu(),
+                                      RL32.cpu(), RR32.cpu(), RL32.cpu(), g_nc.cpu())
+        e_node = (out_nc.cpu() - out_ref).abs().max().item()
+        p0, p1, geo = fused_compose(h_l_nc, h_r_nc, RL32, RR32)
+        r0, r1, rg = _fwd_reference(h_l_nc.cpu(), h_r_nc.cpu(),
+                                    RL32.cpu(), RR32.cpu())
+        e_cmp = max((a.cpu() - b).abs().max().item()
+                    for a, b in zip((p0, p1, geo), (r0, r1, rg)))
+
+        # backward through the strided path: gradients must also be right
+        base = torch.randn(N, nb, 8, device='mps')
+        bk = base.clone().requires_grad_(True)
+        br = base.clone().requires_grad_(True)
+        fused_act(bk[..., ::2]).square().sum().backward()
+        th = torch.tanh(br[..., ::2])
+        ((th + 0.1 * br[..., ::2]).square()).sum().backward()
+        e_gact = (bk.grad - br.grad).abs().max().item()
+
+        hb = torch.randn(N, nb, 8, device='mps')
+        hl = hb[..., ::2].detach().requires_grad_(True)
+        hr = hb[..., 1::2].detach().requires_grad_(True)
+        gb = torch.rand(N, 3, 2 * nb, device='mps')
+        gv = gb[..., ::2].detach().requires_grad_(True)
+        out_m = fused_node(hl, hr, RL32, RR32, RL32, gv)
+        (out_m * 1.7).sum().backward()
+        gm = (hl.grad.cpu().clone(), hr.grad.cpu().clone(), gv.grad.cpu().clone())
+        hl_c = hl.detach().cpu().requires_grad_(True)
+        hr_c = hr.detach().cpu().requires_grad_(True)
+        gv_c = gv.detach().cpu().requires_grad_(True)
+        out_f = _node_fwd_reference(hl_c, hr_c, RL32.cpu(), RR32.cpu(),
+                                    RL32.cpu(), gv_c)
+        (out_f * 1.7).sum().backward()
+        e_gnode = max((a - b.grad).abs().max().item()
+                      for a, b in zip(gm, (hl_c, hr_c, gv_c)))
+        print(f"  (6c) NON-CONTIGUOUS inputs: act {e_act:.2e}, node {e_node:.2e}, "
+              f"compose {e_cmp:.2e}; bwd act {e_gact:.2e}, bwd node {e_gnode:.2e}")
+        assert max(e_act, e_node, e_cmp, e_gact, e_gnode) < 1e-3
+    else:
+        print("  (6c) SKIPPED: non-contiguous check runs on your Mac")
 
     # (7) V3: fused act fwd/bwd vs eager
     x = torch.randn(500, dtype=torch.float64, requires_grad=True)
