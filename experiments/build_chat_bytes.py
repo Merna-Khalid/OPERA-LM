@@ -61,7 +61,18 @@ def main():
         seen = set()
         per = []
         for dname in datasets:
-            ds = load_dataset(dname, split=split)
+            # 'name::config' pins a config explicitly (e.g.
+            # HuggingFaceTB/smoltalk::all); without it a multi-config
+            # dataset resolves to the hub default, which is not always
+            # what you get on every datasets version
+            dname, _, cfg = dname.partition('::')
+            try:
+                ds = (load_dataset(dname, cfg, split=split) if cfg
+                      else load_dataset(dname, split=split))
+            except Exception as e:
+                where = f'{dname} (config {cfg})' if cfg else dname
+                print(f'FAILED loading {where} split={split}: {e!r}', flush=True)
+                raise
             if args.limit:
                 ds = ds.select(range(min(args.limit, len(ds))))
             kept0 = len(seqs)
@@ -110,7 +121,8 @@ def main():
             with open(prefix + '.test.pkl', 'wb') as f:
                 pickle.dump({'test_short': [(0, s) for s in test],
                              'test_long': [], 'meta': stats}, f)
-    meta = {'prefix': prefix, 'datasets': datasets, 'T': args.T,
+    meta = {'prefix': prefix, 'datasets': [d.partition('::')[0] for d in datasets],
+            'load_specs': datasets, 'T': args.T,
             'n_seqs': stats['train']['kept'],
             'total_tokens': stats['train']['bytes'], 'splits': stats}
     json.dump(meta, open(prefix + '.meta.json', 'w'), indent=2)
