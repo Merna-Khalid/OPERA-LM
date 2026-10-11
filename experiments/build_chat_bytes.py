@@ -70,6 +70,15 @@ def main():
                 ds = (load_dataset(dname, cfg, split=split) if cfg
                       else load_dataset(dname, split=split))
             except Exception as e:
+                if split == 'test':
+                    # train-only sources (e.g. OpenHermes-2.5,
+                    # tulu-3-sft-mixture ship no test split): the pool's
+                    # held-out set comes from the sources that have one
+                    print(f'{dname}: no test split -- skipped for test '
+                          f'set (train split unaffected)', flush=True)
+                    per.append(dict(dataset=dname, rows=0, kept=0,
+                                    note='no test split'))
+                    continue
                 where = f'{dname} (config {cfg})' if cfg else dname
                 print(f'FAILED loading {where} split={split}: {e!r}', flush=True)
                 raise
