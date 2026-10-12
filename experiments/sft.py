@@ -71,7 +71,10 @@ def main():
     print(f"SFT {args.arm}: {steps} steps x {args.batch} x <= {args.T} bytes "
           f"(~{epochs:.2f} epochs of {meta['total_tokens'] / 1e6:.0f}M chat bytes)", flush=True)
     tp = pickle.load(open(args.pool + '.test.pkl', 'rb'))
-    data = ([], [c for _, c in tp['test_short']], [], 259)
+    # cap the held-out set: the xl2 pool's test split is 55k conversations
+    # (70 MB) and train()'s periodic evals over all of it would cost tens
+    # of minutes each; 5k is the same eval size the ladder rungs used
+    data = ([], [c for _, c in tp['test_short'][:5000]], [], 259)
     out_dir = os.path.join(rs.OUT, args.arm + '_sft')
     os.makedirs(out_dir, exist_ok=True)
     recipe = rs.device_kernels(rs.RECIPE[args.arm], args.device)
