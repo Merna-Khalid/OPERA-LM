@@ -52,8 +52,9 @@ SAMPLED = ['Write a short story about a robot who learns to whistle.',
            'List three planets and one fact about each.']
 
 
-def load_sft_model(arm, ckpt_dir, device):
-    """Same construction as sft.py's sample block / export_hf.py."""
+def load_sft_model(arm, ckpt_dir, device, ckpt_name=None):
+    """Same construction as sft.py's sample block / export_hf.py.
+    ckpt_name: load that file; default = the directory's only final ckpt."""
     import torch
     import repr_study as rs
     from arm_utils import _model_kwargs
@@ -65,9 +66,12 @@ def load_sft_model(arm, ckpt_dir, device):
               fold_mode='left', rot_mode='free', fold_grade=rs.GRADE.get(arm),
               **_model_kwargs(rs.device_kernels(rs.ARCH.get(arm), 'cpu')))
     m = OperaSpinorFenwickTree(**kw)
-    pts = [f for f in os.listdir(ckpt_dir)
-           if f.endswith('.pt') and not f.endswith('_train_ckpt.pt')]
-    assert len(pts) == 1, f'{ckpt_dir}: expected one final checkpoint, got {pts}'
+    if ckpt_name is not None:
+        pts = [ckpt_name]
+    else:
+        pts = [f for f in os.listdir(ckpt_dir)
+               if f.endswith('.pt') and not f.endswith('_train_ckpt.pt')]
+        assert len(pts) == 1, f'{ckpt_dir}: expected one final checkpoint, got {pts}'
     sd = torch.load(os.path.join(ckpt_dir, pts[0]), map_location='cpu',
                     weights_only=True)
     m.load_state_dict(sd.get('model', sd))      # final ckpts are raw state_dicts
