@@ -171,12 +171,24 @@ def main():
           f'({a.tf_pe}, {a.d // 64} heads): {n_tf / 1e6:.1f}M params; device {a.device}',
           flush=True)
 
+    # Exactness in full fp32: opera_lm.model turns on TF32 matmuls on CUDA,
+    # and the decoder's single-row matmuls round differently from the
+    # batched forward's (~1e-3 under TF32 -- a precision setting, not a
+    # decoder error; device_check.py / triton_kernel --test do the same).
+    # Timing below runs under the restored default.
+    prec = (torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32,
+            torch.get_float32_matmul_precision())
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    torch.set_float32_matmul_precision('highest')
     toks = torch.randint(3, 259, (1, 300))
     with torch.no_grad():
         lo = opera(toks.to(a.device), torch.tensor([300], device=a.device)).logits[-1][0]
         lt = tf(toks.to(a.device), torch.tensor([300], device=a.device))[-1][0]
     check_exact('OPERA', OperaDecoder(opera), lo, toks[0])
     check_exact('transformer', KVDecoder(tf, 300), lt, toks[0])
+    torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32 = prec[:2]
+    torch.set_float32_matmul_precision(prec[2])
 
     ck = sorted({min(a.max_ctx, 2 ** k) for k in range(8, int(math.log2(a.max_ctx)) + 1)}
                 | {a.max_ctx})
