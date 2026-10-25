@@ -12,9 +12,11 @@ pure waste, because the model is exactly causal:
 - Cross-layer mixing (cross_mlp / blend_gate) is position-wise, so the
   next layer's new leaf needs only the new position's prefix state.
 
-`OperaDecoder` caches the per-layer trees and pays O(L log T) compose
-nodes per appended token (~T/x less than re-forwarding; ~100x at
-T=512), which is what makes CPU inference interactive.
+`OperaDecoder` keeps only each layer's Fenwick frontier (at most one
+unpaired node per level, <= log2(T) + 1 per layer, plus the fixed-size
+memories) and pays O(L log T) compose nodes per appended token (~T/x
+less than re-forwarding; ~100x at T=512), which is what makes CPU
+inference interactive. Decoder state grows as log T, not T.
 
 Scope: fold_mode='left' (the incumbent) with shared fold rotors,
 use_metal=False, batch size 1, eval mode. Every compose/gate/norm call
@@ -106,14 +108,22 @@ class OperaDecoder:
     def reset(self):
         """Drop all cached state (new conversation / context truncation)."""
         self.t = 0
-        # nodes[layer][level] = [n_level, d] tensor of completed tree nodes
-        # (level 0 = leaves). Append-only; never mutated in place.
-        self.nodes = [[self.model.word_emb.weight.new_zeros(0, self.model.d)]
-                      for _ in range(self.model.num_layers)]
-        # tree_disent_rank: the RAW (pre-disentangle) nodes, whose left
-        # neighbour feeds the next node's disentangler update.
-        self.raw = [[self.model.word_emb.weight.new_zeros(0, self.model.d)]
-                    for _ in range(self.model.num_layers)]
+        # The Fenwick frontier, not the whole tree. A node is read twice
+        # after it is built: as the left child of its parent (when its
+        # sibling arrives) and as a fold block of the prefixes in between.
+        # Both uses end when its parent is composed, and the fold blocks
+        # of prefix n are exactly the unpaired nodes (one per set bit of
+        # n). So per layer and level we keep:
+        #   pend[layer][level]  the unpaired node, or None
+        #   count[layer][level] nodes built so far at that level
+        # -> state is <= log2(T) + 1 node vectors per layer instead of
+        # ~2T, and append never copies a growing tensor.
+        L = self.model.num_layers
+        self.pend = [[] for _ in range(L)]
+        self.count = [[] for _ in range(L)]
+        # tree_disent_rank: the RAW (pre-disentangle) left neighbour of
+        # the next node at each level feeds its disentangler update.
+        self.last_raw = [[] for _ in range(L)]
         # hmem: per-layer running memory M [n, 4] (fp32) and the previous
         # position's unit key (zeros before the first token: no binding).
         if getattr(self.model, 'hmem_nb', 0):
@@ -183,7 +193,7 @@ class OperaDecoder:
         head_in = None
         for l in range(m.num_layers):
             R_L, R_R, R_O = self.rots[l]
-            levels = self.nodes[l]
+            pend, count, last_raw = self.pend[l], self.count[l], self.last_raw[l]
 
             # The layer's leaf: the stream, pre-normed (resid_mode='add')
             # and lifted to tree width (state_mult) -- as in forward().
@@ -195,34 +205,40 @@ class OperaDecoder:
 
             # Insert the new leaf and build its (new) ancestor nodes.
             # Node (k, j) is composed the moment its span completes and
-            # never changes afterwards -> append-only cache.
+            # never changes afterwards; once composed into its parent it
+            # is dropped (see reset()).
             ins = leaf
-            raws = self.raw[l]
             k = 0
             while True:
-                while len(levels) <= k:
-                    levels.append(leaf.new_zeros(0, d))
-                    raws.append(leaf.new_zeros(0, d))
-                n = levels[k].shape[0]
-                raws[k] = torch.cat([raws[k], ins.unsqueeze(0)], 0)
+                if len(count) <= k:
+                    pend.append(None)
+                    count.append(0)
+                    last_raw.append(None)
+                n = count[k]
+                raw = ins
                 if m.tree_disent_up is not None:
                     # causal disentangler from the RAW left neighbour, as
                     # in build_tree (node 0 of a level has none)
                     if n >= 1:
-                        ins = ins + m._lowrank_corr(raws[k][n - 1],
+                        ins = ins + m._lowrank_corr(last_raw[k],
                                                     'tree_disent', l)
-                levels[k] = torch.cat([levels[k], ins.unsqueeze(0)], 0)
-                if (n + 1) % 2 == 0:
-                    left = levels[k][n - 1].unsqueeze(0)
+                    last_raw[k] = raw
+                count[k] = n + 1
+                if n % 2 == 1:
+                    left = pend[k].unsqueeze(0)
+                    pend[k] = None
                     ins = m._compose(left, ins.unsqueeze(0),
                                      l, R_L, R_R, R_O)[0][0]
                     k += 1
                 else:
+                    pend[k] = ins
                     break
 
             # Fold the Fenwick blocks of prefix length t+1, largest block
             # first, with the fold's own rotations/bias -- the same op
             # sequence as the batched left fold for this one position.
+            # Those blocks are exactly the unpaired nodes, one per set bit
+            # of t+1 (fenwick_blocks_of(t+1) lists the same (level, j)).
             fR_L, fR_R, fR_O = self.fold_rots[l]
             fgb = (m.fold_gate_bias[l]
                    if m.fold_gate_bias is not None else None)
@@ -232,8 +248,10 @@ class OperaDecoder:
             acc = (m.fold_h0[l].to(leaf.dtype) if m.fold_h0 is not None
                    else None)
             blocks = []            # (level, block state) for the readout
-            for (lvl, j) in fenwick_blocks_of(t + 1):
-                blk = levels[lvl][j]
+            for lvl in reversed(range(len(pend))):
+                blk = pend[lvl]
+                if blk is None:
+                    continue
                 if m.fold_theta is not None:
                     blk = self._fold_twist(blk, lvl, l)
                 blocks.append((lvl, blk))
@@ -345,3 +363,17 @@ class OperaDecoder:
         for tid in token_ids:
             logits = self.append(int(tid))
         return logits
+
+    def state_numel(self):
+        """Number of tensor elements the decoder carries between appends
+        (frontier nodes, disentangler neighbours, memories). Grows as
+        log2(t), not t."""
+        n = 0
+        for per_layer in (self.pend, self.last_raw):
+            for levels in per_layer:
+                n += sum(x.numel() for x in levels if x is not None)
+        for per_layer in (self.hmem_M, self.hmem_kprev, self.mem,
+                          getattr(self, 'hmem_yhist', None)):
+            if per_layer is not None:
+                n += sum(x.numel() for x in per_layer if x is not None)
+        return n

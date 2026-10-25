@@ -93,9 +93,9 @@ def gen(model, prompt_ids, max_new=300, temperature=0.0, seed=0):
                 sec=time.time() - t0)
 
 
-def check(model, name, user, expect, history, rows):
+def check(model, name, user, expect, history, rows, max_new=300):
     from opera_lm.chat import format_prompt
-    r = gen(model, format_prompt(history, user))
+    r = gen(model, format_prompt(history, user), max_new=max_new)
     leak = '<|' in r['text']
     ok_stop = r['stopped']
     ok_sub = (expect in r['text'].lower()) if expect else None
@@ -131,12 +131,12 @@ def main():
           f'== single prompts, temperature 0 ==', flush=True)
     rows = []
     for name, q, expect in SINGLE:
-        check(model, name, q, expect, [], rows)
+        check(model, name, q, expect, [], rows, args.max_new)
 
     print('\n== multi-turn memory conversation, temperature 0 ==', flush=True)
     history = []
     for i, (q, expect) in enumerate(MEMORY):
-        a = check(model, f'memory_t{i + 1}', q, expect, history, rows)
+        a = check(model, f'memory_t{i + 1}', q, expect, history, rows, args.max_new)
         history.append((q, a))
 
     print('\n== sampled (temperature 0.7, seed 0) -- eyeball only ==', flush=True)

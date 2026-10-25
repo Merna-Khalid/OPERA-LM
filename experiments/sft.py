@@ -19,7 +19,13 @@ start fresh: rename the old <arm>_sft directory first.
   python experiments/sft.py --arm fw_d3072_L2_r28 \\
       --pool /content/data/chat_bytes_T2048 --epochs 1.5
 
-Writes to $OPERA_RUNS/<arm>_sft; export with
+A second (polish) stage starts from the first stage's weights and writes
+to its own folder:
+  python experiments/sft.py --arm fw_d3072_L2_r28 --pool <cleaner pool> \\
+      --init-from $OPERA_RUNS/fw_d3072_L2_r28_sft --out-tag sft_polish \\
+      --lr-scale 0.1 --epochs 1
+
+Writes to $OPERA_RUNS/<arm>_<out-tag> (default <arm>_sft); export with
   python experiments/export_hf.py --arm <arm> --ckpt-dir $OPERA_RUNS/<arm>_sft ...
 """
 import argparse
@@ -81,6 +87,13 @@ def main():
                         '16 x 2048 bytes, the protocol 32 x 1024 bytes per step')
     p.add_argument('--save-every', type=int, default=500)
     p.add_argument('--device', default='cuda')
+    p.add_argument('--init-from', default=None,
+                   help='start from this checkpoint (.pt) or run folder (its one '
+                        'final .pt) instead of the pretrained arm -- e.g. a short '
+                        'polish stage on a cleaner pool from an <arm>_sft run')
+    p.add_argument('--out-tag', default='sft',
+                   help='writes to $OPERA_RUNS/<arm>_<out-tag> (use a new tag for a '
+                        'second stage, e.g. sft_polish)')
     args = p.parse_args()
 
     # ---- everything below up to train() is a pre-flight: fail in seconds,
@@ -90,15 +103,19 @@ def main():
         sys.exit(f'unknown arm {args.arm!r}')
     _, _, d, nb = rs.ARMS[args.arm]
     layers = rs.LAYERS.get(args.arm, 2)
-    pre_dir = os.path.join(rs.OUT, args.arm)
-    if not os.path.isdir(pre_dir):
-        sys.exit(f'{pre_dir}: no pretraining run for {args.arm}')
-    pts = [f for f in os.listdir(pre_dir)
-           if f.endswith('.pt') and not f.endswith('_train_ckpt.pt')]
-    if len(pts) != 1:
-        sys.exit(f'{pre_dir}: expected exactly one final checkpoint, found '
-                 f'{pts or "none"} (is pretraining finished?)')
-    init_from = os.path.join(pre_dir, pts[0])
+    src = args.init_from or os.path.join(rs.OUT, args.arm)
+    if os.path.isdir(src):
+        pts = [f for f in os.listdir(src)
+               if f.endswith('.pt') and not f.endswith('_train_ckpt.pt')]
+        if len(pts) != 1:
+            sys.exit(f'{src}: expected exactly one final checkpoint, found '
+                     f'{pts or "none"} (is that run finished?)')
+        init_from = os.path.join(src, pts[0])
+    elif os.path.isfile(src) and src.endswith('.pt'):
+        init_from = os.path.abspath(src)
+    else:
+        sys.exit(f'{src}: no such checkpoint or run folder'
+                 + ('' if args.init_from else f' (no pretraining run for {args.arm})'))
 
     for suffix in ('.tokens.npy', '.offsets.npy', '.test.pkl', '.meta.json'):
         if not os.path.exists(args.pool + suffix):
@@ -110,7 +127,10 @@ def main():
                  f'assistant turns and their EOS; rebuild the pool at --T '
                  f'{args.T} or train at --T {meta["T"]}')
 
-    out_dir = os.path.join(rs.OUT, args.arm + '_sft')
+    out_dir = os.path.join(rs.OUT, f'{args.arm}_{args.out_tag}')
+    if os.path.abspath(out_dir) == os.path.dirname(init_from):
+        sys.exit(f'--out-tag {args.out_tag} would write into the folder it starts '
+                 f'from ({out_dir}); pick a new tag, e.g. --out-tag sft_polish')
     os.makedirs(out_dir, exist_ok=True)
     plan_path = os.path.join(out_dir, 'sft_plan.json')
     request = dict(batch=args.batch, T=args.T, lr_scale=args.lr_scale,
