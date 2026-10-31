@@ -64,7 +64,9 @@ def load_transformer(name, row, device):
 def load_model(name, summ, device):
     row = summ.get(name)
     if row is None:
-        sys.exit(f'{name}: not in repr_summary.json (unfinished or misnamed)')
+        if not (name.startswith('fw_') and os.path.isdir(os.path.join(OUT, name))):
+            sys.exit(f'{name}: not in repr_summary.json and no run folder')
+        row = {}                    # OPERA run folder without a summary row
     if row.get('model') == 'transformer':
         return load_transformer(name, row, device), 'transformer'
     m, _ = load_arm(name, device=device)
@@ -140,7 +142,7 @@ def main():
           f'{a.eval_len} bytes, min-alpha {a.min_alpha}), device {a.device}',
           flush=True)
 
-    summ = json.load(open(a.summary))
+    summ = json.load(open(a.summary)) if os.path.exists(a.summary) else {}
     labels = a.labels or a.arms
     assert len(labels) == len(a.arms), '--labels needs one entry per arm'
     LN2 = math.log(2)

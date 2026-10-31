@@ -42,11 +42,20 @@ def load_arm(name, vocab_size=259, device='cpu'):
     model."""
     import repr_study as rs
     rs.scale_arm(name)
-    summ = json.load(open(os.path.join(OUT, 'repr_summary.json')))
-    if name not in summ:
-        raise SystemExit(f"arm {name} has not finished (not in summary)")
-    r = summ[name]
+    path = os.path.join(OUT, 'repr_summary.json')
+    summ = json.load(open(path)) if os.path.exists(path) else {}
     arm_dir = os.path.join(OUT, name)
+    if name in summ:
+        r = summ[name]
+    elif name in rs.ARMS and os.path.isdir(arm_dir):
+        # a finished run whose summary row is missing (the summary was
+        # reset or rewritten): width and blocks follow from the arm name,
+        # layers from the checkpoint below
+        _, _, d_, nb_ = rs.ARMS[name]
+        r = {'d': d_, 'nb': nb_}
+        print(f"  {name}: no summary row, loading from {arm_dir}", flush=True)
+    else:
+        raise SystemExit(f"arm {name} has not finished (not in summary)")
     pts = [f for f in os.listdir(arm_dir)
            if f.endswith('.pt') and not f.endswith('_train_ckpt.pt')]
     if len(pts) != 1:
