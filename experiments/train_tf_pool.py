@@ -141,6 +141,12 @@ def main():
                    help='resume-safe multiplier on the Muon group lr, same '
                         'role as ladder.py/repr_study.py --muon-lr-scale')
     p.add_argument('--grad-clip', type=float, default=1.0)
+    p.add_argument('--weight-decay', type=float, default=0.0,
+                   help='--optimizer adamw: decoupled weight decay on matrix '
+                        'parameters only (nanoGPT convention; biases and norm '
+                        'gains undecayed). 0 = the ladder baselines\' setting')
+    p.add_argument('--beta2', type=float, default=0.999,
+                   help='--optimizer adamw: second-moment decay (GPT recipes use 0.95)')
     p.add_argument('--qk-norm', action='store_true',
                    help='per-head RMSNorm on q/k before the attention dot '
                         'product (OLMo-2/Qwen2-style); off by default, '
@@ -219,8 +225,11 @@ def main():
             {'params': adam_p, 'use_muon': False, 'lr': a.max_lr},
         ], lr=a.max_lr)
     else:
-        opt = torch.optim.AdamW(model.parameters(), lr=a.max_lr,
-                                weight_decay=0.0, foreach=True)
+        decay = [p for p in model.parameters() if p.ndim >= 2]
+        no_decay = [p for p in model.parameters() if p.ndim < 2]
+        opt = torch.optim.AdamW([{'params': decay, 'weight_decay': a.weight_decay},
+                                 {'params': no_decay, 'weight_decay': 0.0}],
+                                lr=a.max_lr, betas=(0.9, a.beta2), foreach=True)
 
     train_ckpt = os.path.join(arm_dir, 'train_ckpt.pt')
     final_path = os.path.join(arm_dir, 'final.pt')
@@ -245,6 +254,7 @@ def main():
 
     t0 = time.time()
     nan_skips = 0
+    grad_skips, grad_run = 0, 0   # non-finite gradients with a finite loss
     last_loss_finite = True
     for step in range(start_step, a.steps):
         lr = get_lr(step, a.warmup_steps, a.steps, a.max_lr,
@@ -292,7 +302,22 @@ def main():
             scaler.update()
         else:
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), a.grad_clip)
+            gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), a.grad_clip)
+            if not torch.isfinite(gnorm):
+                # a finite loss with an inf/nan gradient: clip_grad_norm_ turns
+                # it into nan and one step would poison every weight. Skip the
+                # update, as OPERA's train() does; stop on a persistent fault.
+                opt.zero_grad(set_to_none=True)
+                grad_skips += 1
+                grad_run += 1
+                print(f"    WARNING: non-finite gradient at step {step} "
+                      f"(update skipped; {grad_skips} so far)", flush=True)
+                if grad_run >= 25:
+                    raise RuntimeError(f'{grad_run} consecutive non-finite gradients '
+                                       f'(step {step}); training diverged')
+                last_loss_finite = False
+                continue
+            grad_run = 0
             opt.step()
 
         if step % 200 == 0 or step == a.steps - 1:
@@ -338,7 +363,10 @@ def main():
             'steps': a.steps, 'batch': a.batch,
             'units_per_byte': a.units_per_byte,
             'ppl_in_units': ppl, 'nats_per_unit': nats, 'bpb': bpb,
-            'minutes': mins, 'nan_skips': nan_skips,
+            'minutes': mins, 'nan_skips': nan_skips, 'grad_skips': grad_skips,
+            'optimizer': a.optimizer, 'max_lr': a.max_lr,
+            'weight_decay': a.weight_decay if a.optimizer == 'adamw' else a.muon_wd,
+            'beta2': a.beta2 if a.optimizer == 'adamw' else None,
             'ckpt_dir': arm_dir, 'packed': a.packed, 'layers': a.num_layers,
             'test_pkl': a.test_pkl, 'model': 'transformer', 'pe': a.pe,
             'qk_norm': a.qk_norm, 'attn_logit_cap': a.attn_logit_cap,
