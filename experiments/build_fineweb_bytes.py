@@ -19,9 +19,21 @@
 - Storage: tokens as uint16 (byte ids 3..258), streamed to disk -- RAM
   stays flat at any size. <prefix>.tokens.npy / .offsets.npy /
   .test.pkl / .meta.json.
+- Fresh text after an earlier pool (--skip-docs N): the first N kept
+  documents of the stream -- an earlier pool's meta n_docs -- are passed
+  over, so the new pool shares no document with it (its training text or
+  its held-out set); document ids stay global (the new pool starts at N).
+  --expect-test <earlier .test.pkl> proves the skip lines up: while
+  skipping, the earlier pool's seeded held-out draws are replayed, and
+  every document it held out (> its T bytes) must reappear at the same
+  index with identical bytes. Any mismatch (the stream changed) aborts
+  before a single training byte is written.
 
   python experiments/build_fineweb_bytes.py --max-bytes 4e9 \
       --out-dir /content/data
+  python experiments/build_fineweb_bytes.py --max-bytes 16e9 --T 2048 \
+      --skip-docs <n_docs of the 8 GB pool> \
+      --expect-test /content/data/fineweb_bytes_T1024_8GB.test.pkl --out-dir /content/data
 """
 import argparse
 import json
@@ -54,25 +66,72 @@ def main():
     p.add_argument('--test-frac', type=float, default=0.005)
     p.add_argument('--test-docs', type=int, default=20000)
     p.add_argument('--n-test', type=int, default=5000)
+    p.add_argument('--skip-docs', type=int, default=0,
+                   help='pass over the first N kept documents (an earlier '
+                        'pool\'s meta n_docs) so this pool is fresh text')
+    p.add_argument('--expect-test', default=None,
+                   help='the earlier pool\'s .test.pkl: verify the skipped '
+                        'range is exactly that pool\'s stream (see docstring)')
     args = p.parse_args()
     from datasets import load_dataset
     T, cap, max_bytes = args.T, 4 * args.T, int(args.max_bytes)
+    skip = args.skip_docs
     os.makedirs(args.out_dir, exist_ok=True)
-    tag = f"{max_bytes / 1e9:g}GB"
+    tag = f"{max_bytes / 1e9:g}GB" + (f"_skip{skip}" if skip else '')
     prefix = os.path.join(args.out_dir, f'fineweb_bytes_T{T}_{tag}')
+
+    expect, old_T = None, None
+    if args.expect_test:
+        assert skip, '--expect-test checks a --skip-docs range'
+        et = pickle.load(open(args.expect_test, 'rb'))
+        if et['meta'].get('config', args.config) != args.config:
+            sys.exit(f"--expect-test pool used config {et['meta'].get('config')}, "
+                     f"this build {args.config}")
+        old_T = et['meta']['T']
+        expect = {i: u for i, u in et['test_long'] if i < skip}
 
     ds = load_dataset('HuggingFaceFW/fineweb-edu', name=args.config,
                       split='train', streaming=True)
     split_rng = random.Random(42)
+    replay_rng, replay_test, seen, bad = random.Random(42), 0, set(), 0
     offsets = [0]
     test_short, test_long = [], []
-    pos = n_docs = n_test_docs = 0
+    pos = n_test_docs = 0
+    n_docs = skipped = 0
     t0 = time.time()
     with open(prefix + '.tokens.npy', 'wb') as f:
         f.write(npy_header(0))
         for doc in ds:
             b = doc['text'].encode('utf-8')
             if len(b) < 5:
+                continue
+            if skipped < skip:
+                # replay the earlier pool's split draw for this document
+                # (same rng, same short-circuit) and check its held-out ones
+                if (expect is not None and replay_test < args.test_docs
+                        and replay_rng.random() < args.test_frac):
+                    replay_test += 1
+                    if len(b) > old_T:
+                        seen.add(skipped)
+                        u = np.frombuffer(b, dtype=np.uint8).astype(np.uint16) + BYTE_OFFSET
+                        ref = expect.get(skipped)
+                        bad += ref is None or not np.array_equal(u[:256], ref[:256])
+                skipped += 1
+                n_docs = skipped
+                if skipped % 200000 == 0:
+                    print(f"  skipped {skipped:,} / {skip:,} documents "
+                          f"({time.time() - t0:.0f}s)", flush=True)
+                if skipped == skip and expect is not None:
+                    missing = set(expect) - seen
+                    print(f"  skip check: {len(seen)} held-out documents of the earlier "
+                          f"pool replayed, {bad} mismatched, {len(missing)} not found",
+                          flush=True)
+                    if bad or missing:
+                        f.close()
+                        os.remove(prefix + '.tokens.npy')
+                        sys.exit('the stream no longer matches the earlier pool: the '
+                                 'skipped range would not be the same documents. '
+                                 'Aborted before writing any training data.')
                 continue
             units = np.frombuffer(b, dtype=np.uint8).astype(np.uint16) + BYTE_OFFSET
             if n_test_docs < args.test_docs and split_rng.random() < args.test_frac:
@@ -105,9 +164,13 @@ def main():
     head = np.asarray(tok[:min(pos, 1 << 20)])
     assert head.min() >= BYTE_OFFSET and head.max() < BYTE_OFFSET + 256
 
+    if skipped < skip:
+        sys.exit(f'the stream ended after {skipped:,} documents, before the '
+                 f'{skip:,} to skip')
     n_short = len(test_short)
     test_short = random.Random(0).sample(test_short, min(args.n_test, n_short))
     meta = {'prefix': prefix, 'config': args.config, 'n_docs': n_docs,
+            'skip_docs': skip, 'skip_verified': bool(expect is not None),
             'n_test_docs': n_test_docs, 'n_seqs': len(offsets) - 1,
             'total_tokens': pos, 'T': T, 'dtype': 'uint16',
             'n_test_short_all': n_short, 'n_test_short': len(test_short),

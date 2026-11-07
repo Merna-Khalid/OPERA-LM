@@ -25,6 +25,14 @@ to its own folder:
       --init-from $OPERA_RUNS/fw_d3072_L2_r28_sft --out-tag sft_polish \\
       --lr-scale 0.1 --epochs 1
 
+Continued pretraining is the same machinery on a FineWeb byte pool
+(experiments/build_fineweb_bytes.py) -- weights from the arm, fresh
+optimizer, its own re-warmup and decay -- with a longer warmup and no chat
+samples:
+  python experiments/sft.py --arm fw_d4608_L2_r20 --pool <fresh FineWeb pool> \\
+      --out-tag cpt --T 2048 --batch 48 --lr-scale 0.87 --epochs 1 \\
+      --warmup 2000 --no-samples
+
 Writes to $OPERA_RUNS/<arm>_<out-tag> (default <arm>_sft); export with
   python experiments/export_hf.py --arm <arm> --ckpt-dir $OPERA_RUNS/<arm>_sft ...
 """
@@ -91,6 +99,12 @@ def main():
                    help='start from this checkpoint (.pt) or run folder (its one '
                         'final .pt) instead of the pretrained arm -- e.g. a short '
                         'polish stage on a cleaner pool from an <arm>_sft run')
+    p.add_argument('--warmup', type=int, default=None,
+                   help='learning-rate warmup steps (default min(200, steps/10)); '
+                        'stored in the plan, so a resume keeps it')
+    p.add_argument('--no-samples', action='store_true',
+                   help='skip the chat sample replies at the end (continued '
+                        'pretraining on raw text)')
     p.add_argument('--out-tag', default='sft',
                    help='writes to $OPERA_RUNS/<arm>_<out-tag> (use a new tag for a '
                         'second stage, e.g. sft_polish)')
@@ -147,6 +161,18 @@ def main():
                      f'changed: {[(plan.get(k), request[k]) for k in changed]}). '
                      f'To start a new run, rename that directory first.')
         steps = plan['steps']
+        # plans written before --warmup existed used the default formula
+        warmup = plan.get('warmup', min(200, steps // 10))
+        # a final checkpoint exists only once train() has finished (mid-run
+        # saves end in _train_ckpt.pt); relaunching a finished run would
+        # retrain its tail from the last mid-run save and overwrite the
+        # final weights -- also for runs that predate 'final_ckpt' in the plan
+        finals = [f for f in os.listdir(out_dir)
+                  if f.endswith('.pt') and not f.endswith('_train_ckpt.pt')]
+        if finals:
+            print(f'{out_dir} is finished ({finals[0]}); nothing to do. To train '
+                  f'again, rename that directory first.', flush=True)
+            return
         print(f'resuming the SFT plan in {plan_path}: {steps} steps '
               f'(the length options of this launch are ignored)', flush=True)
     else:
@@ -167,13 +193,15 @@ def main():
             print(f'WARNING: {out_dir} has checkpoints but no plan; adopting '
                   f'them with {steps} steps -- the length options must match '
                   f'the original launch', flush=True)
-        plan = dict(request, steps=steps)
+        warmup = (args.warmup if args.warmup is not None
+                  else min(200, steps // 10))
+        plan = dict(request, steps=steps, warmup=warmup)
         json.dump(plan, open(plan_path, 'w'), indent=2)
 
     epochs = steps * args.batch / meta['n_seqs']
-    print(f"SFT {args.arm}: {steps} steps x {args.batch} x <= {args.T} bytes "
-          f"(~{epochs:.2f} epochs of {meta['n_seqs']:,} conversations, "
-          f"{meta['total_tokens'] / 1e6:.0f}M chat bytes)", flush=True)
+    print(f"{args.arm} -> {os.path.basename(out_dir)}: {steps} steps x {args.batch} "
+          f"x <= {args.T} bytes (~{epochs:.2f} epochs of {meta['n_seqs']:,} "
+          f"sequences, {meta['total_tokens'] / 1e6:.0f}M bytes)", flush=True)
 
     tp = pickle.load(open(args.pool + '.test.pkl', 'rb'))
     # the pool's held-out set is a seeded random sample, so its head is an
@@ -198,12 +226,16 @@ def main():
                 device=args.device, pe_mode='none', fold_mode='left',
                 rot_mode='free', data=data, seed=0, out_dir=out_dir, tie=False,
                 packed_data=args.pool, init_weights_from=init_from,
-                max_lr=1e-3 * args.lr_scale, warmup_steps=min(200, steps // 10),
+                max_lr=1e-3 * args.lr_scale, warmup_steps=warmup,
                 save_every=args.save_every, resume=True, **recipe)
+    plan['final_ckpt'] = f"opera_v8_0_{res['config'].replace('+', '_')}.pt"
+    json.dump(plan, open(plan_path, 'w'), indent=2)
     ppl = res['test_perplexity_in_length']
-    print(f"SFT done: held-out chat BPB {math.log2(ppl):.4f} "
-          f"(whole conversations, first {len(data[1]):,} held-out)", flush=True)
+    print(f"done: held-out BPB {math.log2(ppl):.4f} "
+          f"(first {len(data[1]):,} held-out sequences)", flush=True)
 
+    if args.no_samples:
+        return
     # ---- a few sample replies with the incremental decoder, from the exact
     # checkpoint this run wrote (not whatever else sits in the directory)
     import torch
